@@ -1,0 +1,33 @@
+# ── Credentials & secrets ─────────────────────────────────────────────────────
+.env
+
+# ── Live data (stays on VPS, never in repo) ───────────────────────────────────
+paper_trades.csv
+live_trades.csv
+bot.log
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── OS / editor junk ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
