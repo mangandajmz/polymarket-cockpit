@@ -186,42 +186,89 @@ def fetch_price(condition_id: str, outcome_index: int) -> float | None:
         return None
 
 
-@st.cache_data(ttl=180)
+LEADERBOARD_API = "https://data-api.polymarket.com/v1/leaderboard"
+PUBLIC_PROFILE_API = f"{GAMMA_API}/public-profile"
+
+
+@st.cache_data(ttl=300)
 def fetch_trader_live_stats(username: str) -> dict:
-    """Attempt to pull live stats for a trader from Polymarket APIs."""
+    """
+    Fetch live trader stats from public (no-auth) Polymarket endpoints.
+
+    Flow:
+      1. Hit the leaderboard for MONTH and ALL windows to get PnL, volume, rank.
+      2. Use the proxyWallet from step 1 to fetch the public profile (bio, avatar).
+    """
     defaults = {
-        "roi_30d": None,
-        "win_rate_30d": None,
-        "volume_30d": None,
+        "pnl_30d":      None,
+        "vol_30d":      None,
+        "rank_30d":     None,
+        "pnl_all":      None,
+        "vol_all":      None,
+        "rank_all":     None,
+        "proxy_wallet": None,
+        "bio":          None,
         "profile_found": False,
     }
-    # Try gamma-api profiles endpoint
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/profiles",
-            params={"username": username},
-            timeout=6,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                p = data[0]
-                return {
-                    "roi_30d":       p.get("roi30d") or p.get("pnl30d"),
-                    "win_rate_30d":  p.get("winRate30d") or p.get("winRate"),
-                    "volume_30d":    p.get("volume30d") or p.get("totalVolume"),
-                    "profile_found": True,
-                }
-            elif isinstance(data, dict) and data:
-                return {
-                    "roi_30d":       data.get("roi30d") or data.get("pnl30d"),
-                    "win_rate_30d":  data.get("winRate30d") or data.get("winRate"),
-                    "volume_30d":    data.get("volume30d") or data.get("totalVolume"),
-                    "profile_found": True,
-                }
-    except Exception:
-        pass
-    return defaults
+
+    def _leaderboard(period: str) -> dict | None:
+        try:
+            r = requests.get(
+                LEADERBOARD_API,
+                params={"timePeriod": period, "userName": username, "limit": 1},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                # API may return the full leaderboard; find our trader
+                if isinstance(data, list):
+                    for row in data:
+                        if str(row.get("userName", "")).lower() == username.lower():
+                            return row
+                    # If filtered correctly there may only be one entry
+                    if data:
+                        return data[0]
+        except Exception:
+            pass
+        return None
+
+    month_row = _leaderboard("MONTH")
+    all_row   = _leaderboard("ALL")
+
+    if month_row is None and all_row is None:
+        return defaults
+
+    result = dict(defaults)
+    result["profile_found"] = True
+
+    if month_row:
+        result["pnl_30d"]      = float(month_row.get("pnl", 0) or 0)
+        result["vol_30d"]      = float(month_row.get("vol", 0) or 0)
+        result["rank_30d"]     = int(month_row.get("rank", 0) or 0)
+        result["proxy_wallet"] = month_row.get("proxyWallet")
+
+    if all_row:
+        result["pnl_all"]  = float(all_row.get("pnl", 0) or 0)
+        result["vol_all"]  = float(all_row.get("vol", 0) or 0)
+        result["rank_all"] = int(all_row.get("rank", 0) or 0)
+        if not result["proxy_wallet"]:
+            result["proxy_wallet"] = all_row.get("proxyWallet")
+
+    # Fetch public profile for bio (best-effort)
+    if result["proxy_wallet"]:
+        try:
+            rp = requests.get(
+                PUBLIC_PROFILE_API,
+                params={"address": result["proxy_wallet"]},
+                timeout=6,
+            )
+            if rp.status_code == 200:
+                pd_data = rp.json()
+                result["bio"] = pd_data.get("bio") or pd_data.get("pseudonym")
+        except Exception:
+            pass
+
+    return result
 
 
 def bot_status() -> tuple[str, str]:
@@ -657,15 +704,24 @@ with tab_traders:
                 unsafe_allow_html=True,
             )
 
-            # Live Polymarket API data
+            # ── Live Polymarket data (public leaderboard API) ──────────────
             if live["profile_found"]:
+                if live["bio"]:
+                    st.caption(f"_{live['bio']}_")
+
                 la, lb = st.columns(2)
-                roi_str = f"{live['roi_30d']:.1f}%" if live["roi_30d"] is not None else "N/A"
-                wr_str  = f"{live['win_rate_30d']:.1f}%" if live["win_rate_30d"] is not None else "N/A"
-                la.metric("30d ROI (Live)",      roi_str)
-                lb.metric("30d Win Rate (Live)", wr_str)
+                pnl_30d_str  = f"${live['pnl_30d']:+,.0f}"  if live["pnl_30d"]  is not None else "N/A"
+                vol_30d_str  = f"${live['vol_30d']:,.0f}"    if live["vol_30d"]  is not None else "N/A"
+                rank_30d_str = f"#{live['rank_30d']}"        if live["rank_30d"] else "N/A"
+                rank_all_str = f"#{live['rank_all']}"        if live["rank_all"] else "N/A"
+                la.metric("30d PnL (Global)",    pnl_30d_str)
+                lb.metric("30d Volume (Global)", vol_30d_str)
+
+                lc, ld = st.columns(2)
+                lc.metric("30d Rank",    rank_30d_str)
+                ld.metric("All-Time Rank", rank_all_str)
             else:
-                st.caption("Live Polymarket API data unavailable")
+                st.caption("⚠️ Not found on Polymarket leaderboard")
 
             # Our copy-trade stats
             m1, m2 = st.columns(2)
