@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebSearch",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\Claude\" && python polymarket_backtester.py 2>&1)",
+      "Read(//c/Users/james/anaconda3/**)",
+      "Read(//c/Users/james/AppData/Local/Programs/Python/**)",
+      "Bash(py --version && cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\Claude\" && py polymarket_backtester.py 2>&1)",
+      "WebFetch(domain:data-api.polymarket.com)",
+      "Bash(pip install:*)",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\Claude\" && python -X utf8 polymarket_backtester.py 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\Claude\" && python -X utf8 -c \"\nimport requests, json, time\n\nDATA_API = 'https://data-api.polymarket.com/v1'\nTRADERS  = ['majorexploiter', 'beachboy4']\n\ndata = requests.get\\(f'{DATA_API}/leaderboard', params={'timePeriod':'MONTH','orderBy':'PNL','limit':50}, timeout=10\\).json\\(\\)\nrows = data if isinstance\\(data, list\\) else data.get\\('data', []\\)\nfound = {}\nfor row in rows:\n    name = row.get\\('name'\\) or row.get\\('userName'\\) or ''\n    if name in TRADERS:\n        found[name] = row.get\\('proxyWallet',''\\)\n\nprint\\('Addresses found:'\\)\nfor n,a in found.items\\(\\):\n    print\\(f'  {n}: {a}'\\)\n\nmissing = [t for t in TRADERS if t not in found]\nif missing:\n    print\\(f'NOT on leaderboard: {missing}'\\)\nprint\\('OK'\\)\n\" 2>&1)",
+      "Bash(cd \"/c/Users/james/OneDrive/Documents/Manganda LTD/Trading/Claude\" && python -c \"import ast; ast.parse\\(open\\('dashboard.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(git config:*)",
+      "Bash(winget --version 2>/dev/null || echo \"no winget\" && choco --version 2>/dev/null || echo \"no choco\")",
+      "Bash(cd \"/c/Users/james/OneDrive/Documents/Manganda LTD/Trading/Claude\" && rm -f requirements_dashboard.txt && ls -la)",
+      "Bash(choco install:*)",
+      "Bash(curl -sL \"https://github.com/cli/cli/releases/download/v2.65.0/gh_2.65.0_windows_amd64.zip\" -o /tmp/gh.zip && echo \"Downloaded OK\")",
+      "Bash(export PATH=\"$PATH:/c/Users/james/bin\" && gh --version)",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\polymarket-bot\" && python -c \"import ast; ast.parse\\(open\\('dashboard.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\polymarket-bot\" && python -c \"import ast; ast.parse\\(open\\('dashboard.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\polymarket-bot\" && python -c \"\nlines = open\\('dashboard.py', encoding='utf-8'\\).readlines\\(\\)\nprint\\(f'Total lines: {len\\(lines\\)}'\\)\ntabs = [l.strip\\(\\) for l in lines if 'TAB' in l and '══' in l]\nfor t in tabs: print\\(t[:80]\\)\n\")",
+      "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\polymarket-bot\" && python -c \"\nlines = open\\('dashboard.py', encoding='utf-8'\\).readlines\\(\\)\nprint\\(f'Total lines: {len\\(lines\\)}'\\)\nfor i, l in enumerate\\(lines, 1\\):\n    if '# TAB' in l:\n        print\\(f'L{i}: {l.rstrip\\(\\)}'\\)\n\")"
+    ]
+  }
+}
