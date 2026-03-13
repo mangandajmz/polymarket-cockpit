@@ -550,6 +550,15 @@ def main():
         _plain_loop(bot)
 
 
+LOG_FILE = Path("bot.log")
+
+
+def _write_heartbeat():
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{ts} - heartbeat\n")
+
+
 def _rich_loop(bot: PaperBot):
     console = Console()
     with Live(
@@ -561,6 +570,7 @@ def _rich_loop(bot: PaperBot):
     ) as live:
         while True:
             poll_once(bot)
+            _write_heartbeat()
             # Refresh every second while waiting for next poll
             next_poll = time.time() + POLL_INTERVAL
             while time.time() < next_poll:
@@ -571,6 +581,7 @@ def _rich_loop(bot: PaperBot):
 def _plain_loop(bot: PaperBot):
     while True:
         poll_once(bot)
+        _write_heartbeat()
         print_plain_dashboard(bot)
         time.sleep(POLL_INTERVAL)
 
