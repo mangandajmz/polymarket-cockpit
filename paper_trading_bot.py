@@ -4,7 +4,7 @@ Polymarket Paper Trading Bot
 [PAPER MODE] — Simulated trades only. No real money. No wallet connected.
 
 Copies: majorexploiter, beachboy4
-Ratio:  10:1  |  Daily budget: $50  |  Min whale: $30
+Ratio:  10:1  |  Daily budget: $50  |  Min whale: $200
 Poll:   every 30 seconds
 """
 
@@ -31,12 +31,17 @@ if hasattr(sys.stdout, "reconfigure"):
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
-COPY_RATIO       = 0.10          # 1/10th of whale trade size
-DAILY_BUDGET     = 50.0          # simulated USD per calendar day
-MIN_WHALE_SIZE   = 30.0          # minimum whale USDC size to copy
-MAX_TRADE_AGE    = 300           # 5 minutes in seconds
-POLL_INTERVAL    = 30            # seconds between wallet polls
-RESOLVE_INTERVAL = 60            # seconds between resolution checks
+COPY_RATIO             = 0.10    # 1/10th of whale trade size
+DAILY_BUDGET           = 50.0   # simulated USD per calendar day
+MIN_WHALE_SIZE         = 200.0  # minimum whale USDC size to copy (raised for conviction)
+MAX_TRADE_AGE          = 300    # 5 minutes in seconds
+POLL_INTERVAL          = 30     # seconds between wallet polls
+RESOLVE_INTERVAL       = 60     # seconds between resolution checks
+ADDRESS_REFRESH_HOURS  = 6      # how often to re-resolve trader addresses
+MIN_TRADES_FOR_CUTOFF  = 10     # min resolved trades before applying win-rate gate
+MIN_WIN_RATE           = 40.0   # % — stop copying a trader below this threshold
+STALE_POSITION_DAYS    = 30     # flag positions open longer than this
+MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 
 TRADERS_TO_COPY  = ["majorexploiter", "beachboy4"]
 CSV_FILE         = Path("paper_trades.csv")
@@ -57,18 +62,21 @@ CSV_FIELDS = [
 # ── Bot State ─────────────────────────────────────────────────────────────────
 class PaperBot:
     def __init__(self):
-        self.lock          = threading.Lock()
-        self.trader_addrs  = {}        # name → proxyWallet address
-        self.seen_hashes   = set()     # processed tx hashes
-        self.positions     = {}        # (cond_id, oidx) → position dict
-        self.trade_log     = []        # list of trade record dicts
-        self._daily_used   = 0.0
-        self._budget_date  = date.today()
-        self.closed_pnl    = 0.0      # realised PnL only
-        self.wins          = 0
-        self.losses        = 0
-        self.status_msg    = "Starting up..."
-        self.last_poll     = "Never"
+        self.lock               = threading.Lock()
+        self.trader_addrs       = {}        # name → proxyWallet address
+        self.seen_hashes        = set()     # processed tx hashes
+        self.positions          = {}        # (cond_id, oidx) → position dict
+        self.trade_log          = []        # list of trade record dicts
+        self._daily_used        = 0.0
+        self._budget_date       = date.today()
+        self.closed_pnl         = 0.0      # realised PnL only
+        self.wins               = 0
+        self.losses             = 0
+        self.status_msg         = "Starting up..."
+        self.last_poll          = "Never"
+        self.trader_stats       = {}        # name → {"wins": int, "losses": int}
+        self.api_fail_count     = 0         # consecutive poll cycles with all-None responses
+        self.last_addr_refresh  = time.time()
 
     def _refresh_budget(self):
         today = date.today()
@@ -100,7 +108,7 @@ class PaperBot:
 
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
-def get(url, params=None, timeout=10, retries=2):
+def get(url, params=None, timeout=10, retries=3):
     for i in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout)
@@ -108,7 +116,7 @@ def get(url, params=None, timeout=10, retries=2):
             return r.json()
         except Exception:
             if i < retries - 1:
-                time.sleep(1)
+                time.sleep(2 ** i)   # 1s, 2s backoff
     return None
 
 
@@ -127,6 +135,18 @@ def resolve_addresses():
         if name in TRADERS_TO_COPY:
             out[name] = row.get("proxyWallet", "")
     return out
+
+
+def address_refresh_loop(bot: PaperBot):
+    """Periodically re-resolve trader wallet addresses from the leaderboard."""
+    interval = ADDRESS_REFRESH_HOURS * 3600
+    while True:
+        time.sleep(interval)
+        fresh = resolve_addresses()
+        if fresh:
+            with bot.lock:
+                bot.trader_addrs = fresh
+                bot.last_addr_refresh = time.time()
 
 
 def seed_seen_hashes(bot: PaperBot):
@@ -208,6 +228,17 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     if is_crypto(title):                    return  # no crypto markets
 
     with bot.lock:
+        # Per-trader win-rate gate
+        stats = bot.trader_stats.get(trader_name, {"wins": 0, "losses": 0})
+        resolved = stats["wins"] + stats["losses"]
+        if resolved >= MIN_TRADES_FOR_CUTOFF:
+            wr = stats["wins"] / resolved * 100
+            if wr < MIN_WIN_RATE:
+                bot.status_msg = (
+                    f"Skipped {trader_name} — win rate {wr:.1f}% below {MIN_WIN_RATE}%"
+                )
+                return
+
         bot._refresh_budget()
         remaining = bot.daily_remaining
         if remaining < 0.01:
@@ -225,6 +256,8 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
                 "outcome_index": oidx,
                 "title":         title,
                 "outcome":       outcome,
+                "trader":        trader_name,
+                "opened_at":     time.time(),
                 "total_cost":    0.0,
                 "total_shares":  0.0,
                 "status":        "OPEN",
@@ -307,6 +340,15 @@ def resolution_loop(bot: PaperBot):
                 if not pos or pos["status"] != "OPEN":
                     continue
                 pos["last_price"] = px
+
+                # Flag stale positions
+                age_days = (time.time() - pos.get("opened_at", time.time())) / 86400
+                if age_days > STALE_POSITION_DAYS and not pos.get("stale_flagged"):
+                    pos["stale_flagged"] = True
+                    bot.status_msg = (
+                        f"[STALE] {pos['title'][:35]} open {age_days:.0f} days — market may be stuck"
+                    )
+
                 if resolved:
                     proceeds = pos["total_shares"] * px
                     pnl      = proceeds - pos["total_cost"]
@@ -314,9 +356,16 @@ def resolution_loop(bot: PaperBot):
                     pos["status"] = "WIN" if pnl >= 0 else "LOSS"
                     bot.closed_pnl += pnl
                     if pnl >= 0:
-                        bot.wins   += 1
+                        bot.wins += 1
                     else:
                         bot.losses += 1
+                    # Update per-trader stats
+                    trader_name = pos.get("trader", "unknown")
+                    s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
+                    if pnl >= 0:
+                        s["wins"] += 1
+                    else:
+                        s["losses"] += 1
                     result_tag = "WIN" if pnl >= 0 else "LOSS"
                     bot.status_msg = (
                         f"[RESOLVED] {pos['title'][:30]} | "
@@ -333,6 +382,19 @@ def make_header(bot: PaperBot) -> Panel:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     pnl_col = "green" if bot.total_pnl >= 0 else "red"
     ur_col  = "green" if bot.unrealised_pnl >= 0 else "red"
+    api_warn = (
+        f"  [bold red][WARN] API failures: {bot.api_fail_count}[/bold red]"
+        if bot.api_fail_count >= MAX_API_FAILURES else ""
+    )
+
+    # Per-trader stat summary
+    trader_parts = []
+    for name, s in bot.trader_stats.items():
+        total = s["wins"] + s["losses"]
+        wr = s["wins"] / total * 100 if total else 0.0
+        col = "green" if wr >= MIN_WIN_RATE else "red"
+        trader_parts.append(f"[{col}]{name}: {wr:.0f}% ({total})[/]")
+    trader_line = "  ".join(trader_parts) if trader_parts else "[dim]no resolved trades yet[/dim]"
 
     grid = Table.grid(padding=(0, 3))
     grid.add_column(width=30)
@@ -347,6 +409,11 @@ def make_header(bot: PaperBot) -> Panel:
         f"[{ur_col}]Unrealised   ${bot.unrealised_pnl:+,.2f}[/]",
         f"Open positions: [bold]{len(bot.open_positions)}[/bold]",
         f"[dim]Last poll: {bot.last_poll}[/dim]",
+    )
+    grid.add_row(
+        f"Traders: {trader_line}",
+        api_warn,
+        "",
     )
     return Panel(
         grid,
@@ -440,18 +507,32 @@ def make_dashboard(bot: PaperBot):
 
 # ── Polling ───────────────────────────────────────────────────────────────────
 def poll_once(bot: PaperBot):
-    for name, addr in bot.trader_addrs.items():
+    any_success = False
+    with bot.lock:
+        addrs = dict(bot.trader_addrs)
+    for name, addr in addrs.items():
         data = get(f"{DATA_API}/trades", {
             "user": addr, "limit": 50, "offset": 0, "takerOnly": "false"
         })
         if not data or not isinstance(data, list):
             continue
+        any_success = True
         cutoff = int(time.time()) - 600   # look back 10 min each poll
         for trade in data:
             if int(trade.get("timestamp", 0)) >= cutoff:
                 process_trade(bot, name, trade)
         time.sleep(0.3)
-    bot.last_poll = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    with bot.lock:
+        if any_success:
+            bot.api_fail_count = 0
+        else:
+            bot.api_fail_count += 1
+            if bot.api_fail_count >= MAX_API_FAILURES:
+                bot.status_msg = (
+                    f"[WARN] API unreachable — {bot.api_fail_count} consecutive failures"
+                )
+        bot.last_poll = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
 
 # ── Plain-text fallback dashboard ─────────────────────────────────────────────
@@ -486,6 +567,19 @@ def print_plain_dashboard(bot: PaperBot):
                   f"{r['market'][:34]:<34} | "
                   f"whale ${float(r['whale_size_usdc']):>8,.0f} | "
                   f"copy ${float(r['our_size_usdc']):.2f} | {r['status']}")
+        print()
+
+    if bot.trader_stats:
+        print("  Trader Win Rates:")
+        for name, s in bot.trader_stats.items():
+            total = s["wins"] + s["losses"]
+            wr = s["wins"] / total * 100 if total else 0.0
+            flag = " [BELOW THRESHOLD]" if total >= MIN_TRADES_FOR_CUTOFF and wr < MIN_WIN_RATE else ""
+            print(f"    {name:<20} {wr:.1f}%  ({s['wins']}W / {s['losses']}L){flag}")
+        print()
+
+    if bot.api_fail_count >= MAX_API_FAILURES:
+        print(f"  [WARN] API unreachable — {bot.api_fail_count} consecutive failures")
         print()
 
     print(f"  Status : {bot.status_msg}")
@@ -536,8 +630,9 @@ def main():
     seed_seen_hashes(bot)
     print(f"  {len(bot.seen_hashes)} recent transactions indexed.")
 
-    # Background resolution checker
-    threading.Thread(target=resolution_loop, args=(bot,), daemon=True).start()
+    # Background threads
+    threading.Thread(target=resolution_loop,   args=(bot,), daemon=True).start()
+    threading.Thread(target=address_refresh_loop, args=(bot,), daemon=True).start()
 
     bot.status_msg = "Live — scanning for qualifying BUY trades..."
 
