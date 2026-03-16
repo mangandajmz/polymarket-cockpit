@@ -172,6 +172,45 @@ def init_csv():
             csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
 
 
+def load_positions_from_csv(bot: PaperBot):
+    """Reload open positions from CSV so the resolution loop can close them after a restart."""
+    if not CSV_FILE.exists():
+        return
+    try:
+        with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("status") not in ("PENDING", "OPEN"):
+                    continue
+                cid  = row.get("condition_id", "")
+                oidx = int(row.get("outcome_index", 0))
+                if not cid:
+                    continue
+                pos_key = (cid, oidx)
+                cost    = float(row.get("our_size_usdc", 0) or 0)
+                price   = float(row.get("price", 0.001) or 0.001)
+                shares  = float(row.get("copy_shares", 0) or 0)
+                if pos_key not in bot.positions:
+                    bot.positions[pos_key] = {
+                        "condition_id":  cid,
+                        "outcome_index": oidx,
+                        "title":         row.get("market", cid[:30]),
+                        "outcome":       row.get("outcome", str(oidx)),
+                        "trader":        row.get("trader", "unknown"),
+                        "opened_at":     time.time(),   # approx; exact age not critical
+                        "total_cost":    0.0,
+                        "total_shares":  0.0,
+                        "status":        "OPEN",
+                        "pnl":           0.0,
+                        "last_price":    price,
+                    }
+                pos = bot.positions[pos_key]
+                pos["total_cost"]   += cost
+                pos["total_shares"] += shares
+                bot.trade_log.append(dict(row))
+    except Exception:
+        pass
+
+
 def append_csv(record: dict):
     row = {k: record.get(k, "") for k in CSV_FIELDS}
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
@@ -606,6 +645,9 @@ def main():
 
     bot = PaperBot()
     init_csv()
+    load_positions_from_csv(bot)
+    if bot.positions:
+        print(f"  Reloaded {len(bot.positions)} open position(s) from previous run.")
 
     # Resolve trader addresses from leaderboard
     print("  Resolving trader addresses...")
