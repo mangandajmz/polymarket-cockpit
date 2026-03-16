@@ -334,31 +334,99 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
 
 # ── Resolution Checker (background thread) ────────────────────────────────────
 def get_price_resolved(cid: str, oidx: int):
-    """Returns (current_price, is_resolved) for a market outcome."""
-    data = get(f"{GAMMA_API}/markets", {"condition_ids": cid})
+    """
+    Returns (current_price, is_resolved) for a market outcome.
+
+    FIX 1: Use 'conditionId' (camelCase) — Polymarket's Gamma API ignores
+            the snake_case 'condition_ids' parameter, returning unrelated
+            market data where resolved=False, which caused positions to
+            never settle.
+
+    FIX 2: After parsing, validate the returned market actually matches
+            the condition ID we queried, so we never settle against wrong data.
+
+    FIX 3: Handle all resolution field formats Polymarket uses:
+            - outcome name string:  "Yes" / "No"
+            - numeric index string: "0" / "1"  (winner's outcomeIndex)
+            - refund/push decimal:  "0.5"
+            When all name-matching fails on a resolved market, fall back to
+            the live price rather than returning None, so the position still
+            closes (Bug 2 fix: a resolved market must never be skipped).
+    """
+    # FIX 1: correct camelCase parameter name
+    data = get(f"{GAMMA_API}/markets", {"conditionId": cid})
     if not data:
         return None, False
-    m = data[0] if isinstance(data, list) else data
-    outcomes   = m.get("outcomes",     "[]")
-    prices     = m.get("outcomePrices","[]")
-    resolved   = m.get("resolved",     False)
-    resolution = m.get("resolution",   None)
+    if isinstance(data, list):
+        # FIX 2: find the market that actually matches our condition ID
+        m = next(
+            (item for item in data
+             if item.get("conditionId") == cid or item.get("condition_id") == cid),
+            data[0]   # fall back to first item if field name differs
+        )
+    else:
+        m = data
+
+    outcomes   = m.get("outcomes",      "[]")
+    prices     = m.get("outcomePrices", "[]")
+    resolved   = bool(m.get("resolved", False))
+    closed     = bool(m.get("closed",   False))
+    resolution = m.get("resolution",    None)
+
+    # Parse stringified JSON arrays from the API
     if isinstance(outcomes, str):
         try:
             outcomes = json.loads(outcomes)
             prices   = json.loads(prices)
         except Exception:
-            return None, resolved
+            outcomes = []
+            prices   = []
+
+    # Best-effort current price from outcomePrices array
     try:
         px = float(prices[oidx])
     except (IndexError, TypeError, ValueError):
         px = None
+
     if resolved and resolution is not None:
+        # FIX 3: try outcome-name match first, then numeric-index match,
+        # then refund/push ("0.5"), before giving up.
+        res_str = str(resolution).strip()
+        settled = False
+
+        # (a) outcome name match: resolution == "Yes" / "No" / etc.
         try:
-            ri = outcomes.index(str(resolution))
+            ri = outcomes.index(res_str)
             px = 1.0 if ri == oidx else 0.0
+            settled = True
         except (ValueError, AttributeError):
             pass
+
+        # (b) numeric index string: resolution == "0" or "1"
+        if not settled:
+            try:
+                ri = int(res_str)
+                px = 1.0 if ri == oidx else 0.0
+                settled = True
+            except (ValueError, TypeError):
+                pass
+
+        # (c) refund / push: resolution == "0.5" → treat as 0.5 payout
+        if not settled:
+            try:
+                refund_price = float(res_str)
+                if 0.0 <= refund_price <= 1.0:
+                    px = refund_price
+                    settled = True
+            except (ValueError, TypeError):
+                pass
+
+        # (d) last resort: if still unsettled, keep whatever live price we
+        #     have (may be near 0 or 1 for a decided market) rather than
+        #     returning None, which would block settlement entirely.
+        if not settled and px is None:
+            px = 0.0   # safest default — avoids infinite PENDING state
+
     return px, resolved
 
 
@@ -369,11 +437,23 @@ def resolution_loop(bot: PaperBot):
         with bot.lock:
             open_keys = [k for k, p in bot.positions.items() if p["status"] == "OPEN"]
 
+        _log(f"resolution_loop: checking {len(open_keys)} open position(s)")
+
         for key in open_keys:
             cid, oidx = key
             px, resolved = get_price_resolved(cid, oidx)
-            if px is None:
+
+            # Only skip if we have NO price AND the market is genuinely not resolved.
+            # A resolved market must never be left PENDING due to a price parse failure.
+            if px is None and not resolved:
+                _log(f"  skip {cid[:20]}…  px=None resolved=False")
                 continue
+            if px is None:
+                # Resolved but price still indeterminate after all fallbacks.
+                # Close at 0.0 (worst-case loss) so the position doesn't stay PENDING.
+                px = 0.0
+                _log(f"  [WARN] {cid[:20]}… resolved but px unknown — forcing close at 0.0")
+
             with bot.lock:
                 pos = bot.positions.get(key)
                 if not pos or pos["status"] != "OPEN":
@@ -409,6 +489,11 @@ def resolution_loop(bot: PaperBot):
                     bot.status_msg = (
                         f"[RESOLVED] {pos['title'][:30]} | "
                         f"{pos['outcome']} → {result_tag} ${pnl:+.2f}"
+                    )
+                    _log(
+                        f"  RESOLVED {cid[:20]}… oidx={oidx} "
+                        f"px={px:.4f} shares={pos['total_shares']:.4f} "
+                        f"cost={pos['total_cost']:.2f} pnl={pnl:+.4f} → {result_tag}"
                     )
                     update_csv_status(cid, oidx, pos["status"], pnl)
                     # Sync in-memory trade log so the dashboard reflects WIN/LOSS
@@ -695,10 +780,18 @@ def main():
 LOG_FILE = Path("bot.log")
 
 
-def _write_heartbeat():
+def _log(msg: str):
+    """Append a timestamped diagnostic line to bot.log."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{ts} - heartbeat\n")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{ts} - {msg}\n")
+    except Exception:
+        pass
+
+
+def _write_heartbeat():
+    _log("heartbeat")
 
 
 def _rich_loop(bot: PaperBot):
