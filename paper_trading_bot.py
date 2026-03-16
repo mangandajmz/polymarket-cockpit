@@ -372,6 +372,11 @@ def resolution_loop(bot: PaperBot):
                         f"{pos['outcome']} → {result_tag} ${pnl:+.2f}"
                     )
                     update_csv_status(cid, oidx, pos["status"], pnl)
+                    # Sync in-memory trade log so the dashboard reflects WIN/LOSS
+                    for rec in bot.trade_log:
+                        if rec.get("condition_id") == cid and rec.get("outcome_index") == str(oidx):
+                            rec["status"]       = pos["status"]
+                            rec["resolved_pnl"] = f"{pnl:+.4f}"
                 else:
                     pos["pnl"] = pos["total_shares"] * px - pos["total_cost"]
             time.sleep(0.15)
