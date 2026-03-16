@@ -337,97 +337,69 @@ def get_price_resolved(cid: str, oidx: int):
     """
     Returns (current_price, is_resolved) for a market outcome.
 
-    FIX 1: Use 'conditionId' (camelCase) — Polymarket's Gamma API ignores
-            the snake_case 'condition_ids' parameter, returning unrelated
-            market data where resolved=False, which caused positions to
-            never settle.
+    KEY FINDINGS from live API testing against gamma-api.polymarket.com:
 
-    FIX 2: After parsing, validate the returned market actually matches
-            the condition ID we queried, so we never settle against wrong data.
+    1. The 'resolved' field is always None — never True/False.
+       bool(None) == False, so the original check 'if resolved:' NEVER fired.
+       The correct resolution signal is 'closed: True'.
 
-    FIX 3: Handle all resolution field formats Polymarket uses:
-            - outcome name string:  "Yes" / "No"
-            - numeric index string: "0" / "1"  (winner's outcomeIndex)
-            - refund/push decimal:  "0.5"
-            When all name-matching fails on a resolved market, fall back to
-            the live price rather than returning None, so the position still
-            closes (Bug 2 fix: a resolved market must never be skipped).
+    2. 'condition_ids' (snake_case) IS the correct query parameter — confirmed
+       by comparing the returned conditionId against the queried one.
+
+    3. A closed market is truly SETTLED when at least one outcomePrices entry
+       is >= 0.99 (i.e. a clear winner has emerged). Markets that are closed
+       but still pending resolution show mid-range or all-zero prices.
+
+    4. We find the matching market in the response list by conditionId field
+       rather than blindly taking index 0, guarding against any ordering
+       changes in the API response.
     """
-    # FIX 1: correct camelCase parameter name
-    data = get(f"{GAMMA_API}/markets", {"conditionId": cid})
+    data = get(f"{GAMMA_API}/markets", {"condition_ids": cid})
     if not data:
         return None, False
+
     if isinstance(data, list):
-        # FIX 2: find the market that actually matches our condition ID
+        # Find the market that matches our condition ID exactly
         m = next(
-            (item for item in data
-             if item.get("conditionId") == cid or item.get("condition_id") == cid),
-            data[0]   # fall back to first item if field name differs
+            (item for item in data if item.get("conditionId") == cid),
+            data[0]  # fall back to first item if conditionId field name differs
         )
     else:
         m = data
 
-    outcomes   = m.get("outcomes",      "[]")
-    prices     = m.get("outcomePrices", "[]")
-    resolved   = bool(m.get("resolved", False))
-    closed     = bool(m.get("closed",   False))
-    resolution = m.get("resolution",    None)
+    closed = bool(m.get("closed", False))
+    prices_raw = m.get("outcomePrices", "[]")
 
-    # Parse stringified JSON arrays from the API
-    if isinstance(outcomes, str):
+    # Parse stringified JSON arrays (API returns them as JSON strings)
+    if isinstance(prices_raw, str):
         try:
-            outcomes = json.loads(outcomes)
-            prices   = json.loads(prices)
+            prices = json.loads(prices_raw)
         except Exception:
-            outcomes = []
-            prices   = []
+            prices = []
+    else:
+        prices = prices_raw or []
 
-    # Best-effort current price from outcomePrices array
+    # Get this outcome's current price
     try:
         px = float(prices[oidx])
     except (IndexError, TypeError, ValueError):
         px = None
 
-    if resolved and resolution is not None:
-        # FIX 3: try outcome-name match first, then numeric-index match,
-        # then refund/push ("0.5"), before giving up.
-        res_str = str(resolution).strip()
-        settled = False
-
-        # (a) outcome name match: resolution == "Yes" / "No" / etc.
+    # A market is truly SETTLED when:
+    #   - closed == True  (trading has stopped), AND
+    #   - at least one outcome price >= 0.99  (a clear winner is priced in)
+    # Markets that closed but haven't resolved yet (pending arbitration, etc.)
+    # show mid-range or all-zero prices, which we correctly leave as OPEN.
+    is_resolved = False
+    if closed and prices:
         try:
-            ri = outcomes.index(res_str)
-            px = 1.0 if ri == oidx else 0.0
-            settled = True
-        except (ValueError, AttributeError):
+            float_prices = [float(p) for p in prices]
+            if max(float_prices) >= 0.99:
+                is_resolved = True
+        except (ValueError, TypeError):
             pass
 
-        # (b) numeric index string: resolution == "0" or "1"
-        if not settled:
-            try:
-                ri = int(res_str)
-                px = 1.0 if ri == oidx else 0.0
-                settled = True
-            except (ValueError, TypeError):
-                pass
-
-        # (c) refund / push: resolution == "0.5" → treat as 0.5 payout
-        if not settled:
-            try:
-                refund_price = float(res_str)
-                if 0.0 <= refund_price <= 1.0:
-                    px = refund_price
-                    settled = True
-            except (ValueError, TypeError):
-                pass
-
-        # (d) last resort: if still unsettled, keep whatever live price we
-        #     have (may be near 0 or 1 for a decided market) rather than
-        #     returning None, which would block settlement entirely.
-        if not settled and px is None:
-            px = 0.0   # safest default — avoids infinite PENDING state
-
-    return px, resolved
+    return px, is_resolved
 
 
 def resolution_loop(bot: PaperBot):

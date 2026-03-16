@@ -25,7 +25,9 @@
       "Bash(cd \"C:\\\\Users\\\\james\\\\OneDrive\\\\Documents\\\\Manganda LTD\\\\Trading\\\\polymarket-bot\" && python -c \"\nlines = open\\('dashboard.py', encoding='utf-8'\\).readlines\\(\\)\nprint\\(f'Total lines: {len\\(lines\\)}'\\)\nfor i, l in enumerate\\(lines, 1\\):\n    if '# TAB' in l:\n        print\\(f'L{i}: {l.rstrip\\(\\)}'\\)\n\")",
       "WebFetch(domain:lb.polymarket.com)",
       "WebFetch(domain:polymarket.com)",
-      "Bash(cd \"C:/Users/james/OneDrive/Documents/Manganda LTD/Trading/polymarket-bot\" && python -c \"import ast, sys; ast.parse\\(open\\('paper_trading_bot.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
+      "Bash(cd \"C:/Users/james/OneDrive/Documents/Manganda LTD/Trading/polymarket-bot\" && python -c \"import ast, sys; ast.parse\\(open\\('paper_trading_bot.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(tasklist:*)",
+      "Bash(wmic process:*)"
     ]
   }
 }
