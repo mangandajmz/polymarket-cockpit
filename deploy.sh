@@ -27,7 +27,7 @@ echo "  ✓ Code up to date"
 # ── 2. Install / upgrade dependencies ────────────────────────────────────────
 echo ""
 echo "▶ Installing dependencies..."
-pip install -q --upgrade -r requirements.txt
+pip install -q --no-cache-dir --upgrade -r requirements.txt
 echo "  ✓ Dependencies OK"
 
 # ── 3. Restart bot service ────────────────────────────────────────────────────
