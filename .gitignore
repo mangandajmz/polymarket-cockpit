@@ -1,5 +1,6 @@
 # ── Credentials & secrets ─────────────────────────────────────────────────────
 .env
+.github-secrets.env
 
 # ── Live data (stays on VPS, never in repo) ───────────────────────────────────
 paper_trades.csv
