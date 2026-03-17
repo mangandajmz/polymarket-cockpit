@@ -2,6 +2,7 @@
 Polymarket Paper Trading Bot
 ============================
 [PAPER MODE] — Simulated trades only. No real money. No wallet connected.
+# deploy-test
 
 Copies: majorexploiter, beachboy4
 Ratio:  10:1  |  Daily budget: $50  |  Min whale: $200
