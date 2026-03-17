@@ -647,8 +647,12 @@ with tab_hist:
                 else:             c = "rgba(255,193,7,0.12)"
                 return [f"background-color:{c}"] * len(row)
 
+            try:
+                styled = display.style.apply(_color_status, axis=1)
+            except AttributeError:
+                styled = display
             st.dataframe(
-                display.style.apply(_color_status, axis=1),
+                styled,
                 use_container_width=True,
                 hide_index=True,
             )
