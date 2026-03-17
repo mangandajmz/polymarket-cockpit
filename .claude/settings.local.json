@@ -27,7 +27,10 @@
       "WebFetch(domain:polymarket.com)",
       "Bash(cd \"C:/Users/james/OneDrive/Documents/Manganda LTD/Trading/polymarket-bot\" && python -c \"import ast, sys; ast.parse\\(open\\('paper_trading_bot.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
       "Bash(tasklist:*)",
-      "Bash(wmic process:*)"
+      "Bash(wmic process:*)",
+      "Bash(python backtest_configs.py)",
+      "Bash(python _dry_run_test.py)",
+      "Bash(del:*)"
     ]
   }
 }

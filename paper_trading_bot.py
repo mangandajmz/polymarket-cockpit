@@ -3,9 +3,9 @@ Polymarket Paper Trading Bot
 ============================
 [PAPER MODE] — Simulated trades only. No real money. No wallet connected.
 
-Copies: majorexploiter, beachboy4
-Ratio:  10:1  |  Daily budget: $50  |  Min whale: $200
-Poll:   every 30 seconds
+Watchlist: dynamic — top 5 monthly-PNL traders with min 60% win rate
+Ratio:     10:1  |  Daily budget: $50  |  Min whale: $150
+Poll:      every 30 seconds
 """
 
 import csv, json, os, sys, time, threading
@@ -13,6 +13,7 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 
 import requests
+from dynamic_watchlist import WatchlistManager
 
 try:
     from rich.live import Live
@@ -33,16 +34,28 @@ DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
 COPY_RATIO             = 0.10    # 1/10th of whale trade size
 DAILY_BUDGET           = 50.0   # simulated USD per calendar day
-MIN_WHALE_SIZE         = 200.0  # minimum whale USDC size to copy (raised for conviction)
+MIN_WHALE_SIZE         = 150.0  # minimum whale USDC size to copy
 MAX_TRADE_AGE          = 300    # 5 minutes in seconds
 POLL_INTERVAL          = 30     # seconds between wallet polls
 RESOLVE_INTERVAL       = 60     # seconds between resolution checks
-ADDRESS_REFRESH_HOURS  = 6      # how often to re-resolve trader addresses
+ADDRESS_REFRESH_HOURS  = 6      # how often to re-resolve trader addresses (legacy mode)
 MIN_TRADES_FOR_CUTOFF  = 10     # min resolved trades before applying win-rate gate
 MIN_WIN_RATE           = 40.0   # % — stop copying a trader below this threshold
 STALE_POSITION_DAYS    = 30     # flag positions open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 
+# ── Dynamic watchlist config ───────────────────────────────────────────────────
+USE_DYNAMIC_WATCHLIST     = True   # set False to revert to static TRADERS_TO_COPY
+WATCHLIST_TOP_N           = 5      # traders to watch (top N by monthly PNL after WR filter)
+WATCHLIST_MIN_WR          = 60.0   # % — minimum win rate to enter the dynamic watchlist
+WATCHLIST_REFRESH_H       = 6      # hours between dynamic watchlist refreshes
+
+# Phase 2 threshold: when simulated bankroll exceeds $500, consider upgrading to
+# WATCHLIST_TOP_N=10, WATCHLIST_MIN_WR=40.0, MIN_WHALE_SIZE=100.0 for more
+# trade signals. The current Phase 1 settings are conservative for a small bankroll.
+PHASE2_BANKROLL_THRESHOLD = 500.0
+
+# Legacy static list — only used when USE_DYNAMIC_WATCHLIST = False
 TRADERS_TO_COPY  = ["majorexploiter", "beachboy4"]
 CSV_FILE         = Path("paper_trades.csv")
 
@@ -618,7 +631,7 @@ def poll_once(bot: PaperBot):
         if not data or not isinstance(data, list):
             continue
         any_success = True
-        cutoff = int(time.time()) - 600   # look back 10 min each poll
+        cutoff = int(time.time()) - MAX_TRADE_AGE   # look back exactly MAX_TRADE_AGE (5 min)
         for trade in data:
             if int(trade.get("timestamp", 0)) >= cutoff:
                 process_trade(bot, name, trade)
@@ -694,9 +707,12 @@ def main():
     print("  *** POLYMARKET PAPER TRADING BOT ***")
     print("  *** PAPER MODE — NO REAL MONEY — NO WALLET CONNECTED ***")
     print("=" * 66)
-    print(f"  Copying    : {', '.join(TRADERS_TO_COPY)}")
+    if USE_DYNAMIC_WATCHLIST:
+        print(f"  Watchlist  : dynamic top {WATCHLIST_TOP_N} (min WR {WATCHLIST_MIN_WR:.0f}%, 6h refresh)")
+    else:
+        print(f"  Copying    : {', '.join(TRADERS_TO_COPY)}  [static list]")
     print(f"  Ratio      : 10:1  |  Budget: ${DAILY_BUDGET}/day  |  Min whale: ${MIN_WHALE_SIZE}")
-    print(f"  Poll cycle : every {POLL_INTERVAL}s")
+    print(f"  Poll cycle : every {POLL_INTERVAL}s  |  Max trade age: {MAX_TRADE_AGE}s")
     print(f"  Trade log  : {CSV_FILE.resolve()}")
     print()
 
@@ -706,37 +722,54 @@ def main():
     if bot.positions:
         print(f"  Reloaded {len(bot.positions)} open position(s) from previous run.")
 
-    # Resolve trader addresses from leaderboard
-    print("  Resolving trader addresses...")
-    for attempt in range(3):
-        bot.trader_addrs = resolve_addresses()
-        if bot.trader_addrs:
-            break
-        print(f"  Retry {attempt + 1}/3 in 5s...")
-        time.sleep(5)
+    # ── Resolve / load trader addresses ──────────────────────────────────────
+    if USE_DYNAMIC_WATCHLIST:
+        # Dynamic mode: score leaderboard by PNL, filter by win rate, cache addresses.
+        # WatchlistManager.start() is blocking for the initial load, then spawns
+        # its own daemon thread for 6-hour refreshes — do NOT start address_refresh_loop.
+        print(f"  Starting dynamic watchlist (top {WATCHLIST_TOP_N}, min WR {WATCHLIST_MIN_WR:.0f}%)...")
+        print(f"  (Estimating win rates via Gamma API — may take ~30–90 seconds)")
+        wl_manager = WatchlistManager(
+            top_n=WATCHLIST_TOP_N,
+            min_wr=WATCHLIST_MIN_WR,
+            refresh_hours=WATCHLIST_REFRESH_H,
+            log_fn=print,
+        )
+        wl_manager.start(bot)   # populates bot.trader_addrs; spawns refresh thread
+        if not bot.trader_addrs:
+            sys.exit("[FATAL] Dynamic watchlist found no traders passing the WR filter.")
+    else:
+        # Legacy mode: look up hardcoded TRADERS_TO_COPY names on the leaderboard.
+        print("  Resolving trader addresses (static list)...")
+        for attempt in range(3):
+            bot.trader_addrs = resolve_addresses()
+            if bot.trader_addrs:
+                break
+            print(f"  Retry {attempt + 1}/3 in 5s...")
+            time.sleep(5)
+        if not bot.trader_addrs:
+            sys.exit("[FATAL] Could not connect to Polymarket API.")
+        missing = [n for n in TRADERS_TO_COPY if n not in bot.trader_addrs]
+        if missing:
+            print(f"\n  [WARN] Not on leaderboard this month: {missing}")
+            print("         May have dropped out of top 50 — will copy whoever is found.")
+        # Static mode uses the original address refresh loop
+        threading.Thread(target=address_refresh_loop, args=(bot,), daemon=True).start()
 
-    if not bot.trader_addrs:
-        sys.exit("[FATAL] Could not connect to Polymarket API.")
-
+    print()
     for name, addr in bot.trader_addrs.items():
-        print(f"  Found  : {name} -> {addr}")
-
-    missing = [n for n in TRADERS_TO_COPY if n not in bot.trader_addrs]
-    if missing:
-        print(f"\n  [WARN] Not on leaderboard this month: {missing}")
-        print("         May have dropped out of top 50 — will copy whoever is found.")
+        print(f"  Watching : {name}  ->  {addr}")
 
     if not bot.trader_addrs:
-        sys.exit("[FATAL] No target traders found on leaderboard.")
+        sys.exit("[FATAL] No target traders found.")
 
     # Seed seen hashes to avoid replaying historical trades on startup
     print("\n  Seeding trade history (prevents false triggers on startup)...")
     seed_seen_hashes(bot)
     print(f"  {len(bot.seen_hashes)} recent transactions indexed.")
 
-    # Background threads
-    threading.Thread(target=resolution_loop,   args=(bot,), daemon=True).start()
-    threading.Thread(target=address_refresh_loop, args=(bot,), daemon=True).start()
+    # Background threads (resolution loop always runs; address refresh only in legacy mode)
+    threading.Thread(target=resolution_loop, args=(bot,), daemon=True).start()
 
     bot.status_msg = "Live — scanning for qualifying BUY trades..."
 
