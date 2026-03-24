@@ -69,20 +69,35 @@ class AddressCache:
     def __init__(self, path: Path = CACHE_FILE):
         self.path   = path
         self._data: dict = {}
+        self._meta: dict = {}
         self._load()
 
     def _load(self):
         if self.path.exists():
             try:
-                self._data = json.loads(self.path.read_text(encoding="utf-8"))
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                # Support both old format (flat dict) and new format (with _meta key)
+                self._data = {k: v for k, v in raw.items() if not k.startswith("_")}
+                self._meta = {k: v for k, v in raw.items() if k.startswith("_")}
             except Exception:
                 self._data = {}
+                self._meta = {}
+        else:
+            self._meta = {}
 
     def _save(self):
+        combined = {**self._data, **self._meta}
         self.path.write_text(
-            json.dumps(self._data, indent=2, ensure_ascii=False),
+            json.dumps(combined, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def set_last_successful_refresh(self, ts: str):
+        self._meta["_last_successful_refresh"] = ts
+        self._save()
+
+    def get_last_successful_refresh(self) -> str:
+        return self._meta.get("_last_successful_refresh", "never")
 
     def update(self, entries: dict):
         """Merge new {name: addr} pairs. Existing entries are never overwritten."""
@@ -274,14 +289,26 @@ class WatchlistManager:
             f"  [Watchlist] Refresh at {ts} "
             f"(top {self.top_n} by PNL, min WR {self.min_wr:.0f}%)..."
         )
+        try:
+            self._do_refresh_inner()
+        except Exception as exc:
+            self._log(
+                f"  [Watchlist] ERROR during refresh: {exc!r} — "
+                f"keeping existing list (last successful: "
+                f"{self.cache.get_last_successful_refresh()})"
+            )
 
+    def _do_refresh_inner(self):
         # Fetch leaderboard — 6× headroom so we find top_n even with tight WR filter
         data = _req(_DATA_API + "/leaderboard", {
             "timePeriod": "MONTH", "orderBy": "PNL",
             "limit": self.top_n * 6,
         })
         if not data:
-            self._log("  [Watchlist] Leaderboard fetch failed — keeping existing list.")
+            self._log(
+                f"  [Watchlist] Leaderboard fetch failed — keeping existing list "
+                f"(last successful: {self.cache.get_last_successful_refresh()})"
+            )
             return
 
         rows = data if isinstance(data, list) else data.get("data", [])
@@ -318,14 +345,17 @@ class WatchlistManager:
         if not qualified:
             self._log(
                 f"  [Watchlist] No traders passed {self.min_wr}% WR filter "
-                f"(checked {checked}) — keeping existing list."
+                f"(checked {checked}) — keeping existing list "
+                f"(last successful: {self.cache.get_last_successful_refresh()})"
             )
             return
 
         new_active = {c["name"]: c["addr"] for c in qualified}
 
-        # Permanent cache update (append-only)
+        # Permanent cache update (append-only) + stamp successful refresh time
         self.cache.update(new_active)
+        success_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        self.cache.set_last_successful_refresh(success_ts)
         self._last_refresh = time.time()
 
         # Log changes
@@ -352,5 +382,6 @@ class WatchlistManager:
 
         self._log(
             f"  [Watchlist] Active: {list(new_names)}  "
-            f"| cache total: {len(self.cache)}"
+            f"| cache total: {len(self.cache)}  "
+            f"| last_successful_refresh: {success_ts}"
         )

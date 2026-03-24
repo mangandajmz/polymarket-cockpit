@@ -8,7 +8,7 @@ Ratio:     10:1  |  Daily budget: $50  |  Min whale: $150
 Poll:      every 30 seconds
 """
 
-import csv, json, os, sys, time, threading
+import csv, json, os, sys, time, threading, statistics
 from datetime import datetime, date, timezone
 from pathlib import Path
 
@@ -32,15 +32,17 @@ if hasattr(sys.stdout, "reconfigure"):
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
-COPY_RATIO             = 0.10    # 1/10th of whale trade size
-DAILY_BUDGET           = 50.0   # simulated USD per calendar day
-MIN_WHALE_SIZE         = 150.0  # minimum whale USDC size to copy
+COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used for sizing)
+DAILY_BUDGET           = 50.0   # simulated USD per calendar day (soft guard, not primary sizer)
+BASE_BET               = 25.0   # base bet size in USD
+MAX_BET                = 100.0  # maximum bet size per trade in USD
+MIN_WHALE_SIZE         = 1000.0 # minimum whale USDC size to copy
 MAX_TRADE_AGE          = 300    # 5 minutes in seconds
 POLL_INTERVAL          = 30     # seconds between wallet polls
 RESOLVE_INTERVAL       = 60     # seconds between resolution checks
 ADDRESS_REFRESH_HOURS  = 6      # how often to re-resolve trader addresses (legacy mode)
 MIN_TRADES_FOR_CUTOFF  = 10     # min resolved trades before applying win-rate gate
-MIN_WIN_RATE           = 40.0   # % — stop copying a trader below this threshold
+MIN_WIN_RATE           = 60.0   # % — stop copying a trader below this threshold (matches watchlist qualification threshold)
 STALE_POSITION_DAYS    = 30     # flag positions open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 
@@ -69,7 +71,7 @@ CRYPTO_KW = {
 CSV_FIELDS = [
     "timestamp","trader","market","outcome","whale_side",
     "whale_size_usdc","our_size_usdc","price","copy_shares",
-    "status","resolved_pnl","condition_id","outcome_index",
+    "conviction","status","resolved_pnl","condition_id","outcome_index",
 ]
 
 # ── Bot State ─────────────────────────────────────────────────────────────────
@@ -90,6 +92,7 @@ class PaperBot:
         self.trader_stats       = {}        # name → {"wins": int, "losses": int}
         self.api_fail_count     = 0         # consecutive poll cycles with all-None responses
         self.last_addr_refresh  = time.time()
+        self.whale_sizes        = []        # rolling last-30 whale trade sizes for median
 
     def _refresh_budget(self):
         today = date.today()
@@ -291,13 +294,20 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
                 )
                 return
 
+        # Update rolling whale-size window and compute conviction
+        bot.whale_sizes.append(usdc)
+        if len(bot.whale_sizes) > 30:
+            bot.whale_sizes = bot.whale_sizes[-30:]
+        median_size = statistics.median(bot.whale_sizes)
+        conviction  = round(usdc / max(median_size, 0.01), 4)
+
         bot._refresh_budget()
         remaining = bot.daily_remaining
         if remaining < 0.01:
             bot.status_msg = f"Budget exhausted — skipped: {title[:30]}"
             return
 
-        copy_usdc   = min(usdc * COPY_RATIO, remaining)
+        copy_usdc   = min(BASE_BET * conviction, MAX_BET, remaining)
         copy_shares = copy_usdc / max(px, 0.001)
         bot._daily_used += copy_usdc
 
@@ -331,6 +341,7 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             "our_size_usdc":   f"{copy_usdc:.2f}",
             "price":           f"{px:.4f}",
             "copy_shares":     f"{copy_shares:.4f}",
+            "conviction":      f"{conviction:.4f}",
             "status":          "PENDING",
             "resolved_pnl":    "",
             "condition_id":    cid,
