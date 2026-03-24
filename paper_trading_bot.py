@@ -70,7 +70,7 @@ BANKROLL_SCALE_STEPS = [
 
 # Legacy static list — only used when USE_DYNAMIC_WATCHLIST = False
 TRADERS_TO_COPY  = ["majorexploiter", "beachboy4"]
-CSV_FILE         = Path("paper_trades.csv")
+CSV_FILE         = Path(__file__).parent / "paper_trades.csv"
 
 CRYPTO_KW = {
     "bitcoin","btc","ethereum","eth","crypto","solana","sol","xrp",
