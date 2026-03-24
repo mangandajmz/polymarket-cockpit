@@ -203,13 +203,22 @@ def init_csv():
 
 
 def load_positions_from_csv(bot: PaperBot):
-    """Reload open positions from CSV so the resolution loop can close them after a restart."""
+    """Reload open positions and closed PnL from CSV on restart."""
     if not CSV_FILE.exists():
         return
     try:
         with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                if row.get("status") not in ("PENDING", "OPEN"):
+                status = row.get("status")
+                # Restore closed PnL and win/loss counts from resolved trades
+                if status in ("WIN", "LOSS"):
+                    pnl = float(row.get("resolved_pnl", 0) or 0)
+                    bot.closed_pnl += pnl
+                    if pnl >= 0:
+                        bot.wins += 1
+                    else:
+                        bot.losses += 1
+                if status not in ("PENDING", "OPEN"):
                     continue
                 cid  = row.get("condition_id", "")
                 oidx = int(row.get("outcome_index", 0))
@@ -446,6 +455,26 @@ def get_price_resolved(cid: str, oidx: int):
             pass
 
     return px, is_resolved
+
+
+def _init_milestones(bot: PaperBot):
+    """
+    Pre-populate milestones_reached at startup with every threshold the current
+    bankroll already exceeds, so they are silently skipped and never prompted.
+
+    Called once in main() after load_positions_from_csv() has restored closed_pnl.
+    Without this, every threshold below STARTING_BANKROLL would fire on the first
+    resolved trade of every new session.
+    """
+    bankroll = STARTING_BANKROLL + bot.closed_pnl
+    for threshold, _ in BANKROLL_SCALE_STEPS:
+        if bankroll >= threshold:
+            bot.milestones_reached.add(threshold)
+    if bot.milestones_reached:
+        _log(
+            f"  Startup: pre-seeded milestones {sorted(bot.milestones_reached)} "
+            f"(bankroll ${bankroll:.2f} — these thresholds will not re-prompt)"
+        )
 
 
 def _check_bankroll_scale(bot: PaperBot):
@@ -789,6 +818,7 @@ def main():
     bot = PaperBot()
     init_csv()
     load_positions_from_csv(bot)
+    _init_milestones(bot)   # must come after CSV load so closed_pnl is accurate
     if bot.positions:
         print(f"  Reloaded {len(bot.positions)} open position(s) from previous run.")
 
