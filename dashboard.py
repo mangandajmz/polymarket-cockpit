@@ -591,8 +591,12 @@ with tab_pos:
                 color = "rgba(0,166,81,0.15)" if val >= 0 else "rgba(220,53,69,0.15)"
                 return [f"background-color:{color}"] * len(row)
 
+            try:
+                styled = display.style.apply(_color_row, axis=1)
+            except AttributeError:
+                styled = display
             st.dataframe(
-                display.style.apply(_color_row, axis=1),
+                styled,
                 use_container_width=True,
                 hide_index=True,
             )
