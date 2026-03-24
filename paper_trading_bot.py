@@ -203,13 +203,21 @@ def init_csv():
 
 
 def load_positions_from_csv(bot: PaperBot):
-    """Reload open positions and closed PnL from CSV on restart."""
+    """Reload open positions, closed PnL, and today's spend from CSV on restart."""
     if not CSV_FILE.exists():
         return
+    today_prefix = date.today().isoformat()   # "YYYY-MM-DD" — matches CSV timestamp prefix
     try:
         with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 status = row.get("status")
+
+                # Restore today's cumulative spend so daily cap survives restarts.
+                # Every row whose timestamp starts with today's date counts, regardless
+                # of status — we spent that money whether the trade won, lost, or is open.
+                if row.get("timestamp", "").startswith(today_prefix):
+                    bot._daily_used += float(row.get("our_size_usdc", 0) or 0)
+
                 # Restore closed PnL and win/loss counts from resolved trades
                 if status in ("WIN", "LOSS"):
                     pnl = float(row.get("resolved_pnl", 0) or 0)
