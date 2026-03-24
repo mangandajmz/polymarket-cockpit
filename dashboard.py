@@ -23,10 +23,15 @@ load_dotenv()
 
 # ── Config from .env ──────────────────────────────────────────────────────────
 PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "changeme")
-CSV_PATH     = Path(os.getenv("CSV_PATH", "paper_trades.csv"))
-LOG_PATH     = Path(os.getenv("LOG_PATH", "bot.log"))
+# Default paths are absolute relative to this file so the dashboard works
+# regardless of which directory Streamlit is launched from.
+_HERE        = Path(__file__).parent
+CSV_PATH     = Path(os.getenv("CSV_PATH", str(_HERE / "paper_trades.csv")))
+LOG_PATH     = Path(os.getenv("LOG_PATH", str(_HERE / "bot.log")))
 REFRESH_MS   = int(os.getenv("REFRESH_MS", "30000"))
-DAILY_BUDGET      = float(os.getenv("DAILY_BUDGET", os.getenv("DAILY_CAP", "60.0")))
+# Prefer DAILY_CAP (new name); fall back to DAILY_BUDGET for VPS .env files
+# that haven't been updated yet.
+DAILY_BUDGET = float(os.getenv("DAILY_CAP") or os.getenv("DAILY_BUDGET") or "60.0")
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "300.0"))
 BOT_MODE          = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
 
