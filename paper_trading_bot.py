@@ -70,7 +70,7 @@ BANKROLL_SCALE_STEPS = [
 
 # Legacy static list — only used when USE_DYNAMIC_WATCHLIST = False
 TRADERS_TO_COPY  = ["majorexploiter", "beachboy4"]
-CSV_FILE         = Path(__file__).parent / "paper_trades.csv"
+CSV_FILE         = Path(os.getenv("CSV_PATH", str(Path(__file__).parent / "paper_trades.csv")))
 
 CRYPTO_KW = {
     "bitcoin","btc","ethereum","eth","crypto","solana","sol","xrp",
@@ -203,10 +203,11 @@ def init_csv():
 
 
 def load_positions_from_csv(bot: PaperBot):
-    """Reload open positions, closed PnL, and today's spend from CSV on restart."""
+    """Reload open positions, closed PnL, today's spend, and whale sizes from CSV on restart."""
     if not CSV_FILE.exists():
         return
-    today_prefix = date.today().isoformat()   # "YYYY-MM-DD" — matches CSV timestamp prefix
+    today_prefix  = date.today().isoformat()   # "YYYY-MM-DD" — matches CSV timestamp prefix
+    whale_records = []  # (timestamp_str, whale_size_usdc) for restoring conviction median
     try:
         with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -217,6 +218,12 @@ def load_positions_from_csv(bot: PaperBot):
                 # of status — we spent that money whether the trade won, lost, or is open.
                 if row.get("timestamp", "").startswith(today_prefix):
                     bot._daily_used += float(row.get("our_size_usdc", 0) or 0)
+
+                # Accumulate whale sizes across all rows so conviction median is
+                # warm on restart rather than starting cold from a single trade.
+                ws = float(row.get("whale_size_usdc", 0) or 0)
+                if ws > 0:
+                    whale_records.append((row.get("timestamp", ""), ws))
 
                 # Restore closed PnL and win/loss counts from resolved trades
                 if status in ("WIN", "LOSS"):
@@ -256,6 +263,12 @@ def load_positions_from_csv(bot: PaperBot):
                 bot.trade_log.append(dict(row))
     except Exception:
         pass
+
+    # Restore rolling whale-size window — sort by timestamp, keep most recent 30.
+    # Must be outside the try block so partial CSV reads still warm the median.
+    if whale_records:
+        whale_records.sort(key=lambda x: x[0])
+        bot.whale_sizes = [w for _, w in whale_records[-30:]]
 
 
 def append_csv(record: dict):
