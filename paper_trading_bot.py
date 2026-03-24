@@ -33,16 +33,18 @@ if hasattr(sys.stdout, "reconfigure"):
 DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
 COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used for sizing)
-DAILY_BUDGET           = 50.0   # simulated USD per calendar day (soft guard, not primary sizer)
-BASE_BET               = 25.0   # base bet size in USD
-MAX_BET                = 100.0  # maximum bet size per trade in USD
+DAILY_CAP              = 60.0   # max simulated USD to spend per calendar day
+BASE_BET               = 10.0   # base bet size in USD
+MAX_BET                = 30.0   # maximum bet size per trade in USD
+STARTING_BANKROLL      = 300.0  # starting simulated bankroll in USD
 MIN_WHALE_SIZE         = 1000.0 # minimum whale USDC size to copy
 MAX_TRADE_AGE          = 300    # 5 minutes in seconds
 POLL_INTERVAL          = 30     # seconds between wallet polls
 RESOLVE_INTERVAL       = 60     # seconds between resolution checks
 ADDRESS_REFRESH_HOURS  = 6      # how often to re-resolve trader addresses (legacy mode)
-MIN_TRADES_FOR_CUTOFF  = 10     # min resolved trades before applying win-rate gate
-MIN_WIN_RATE           = 60.0   # % — stop copying a trader below this threshold (matches watchlist qualification threshold)
+MIN_TRADES_FOR_CUTOFF        = 10  # min resolved trades before applying win-rate gate
+MIN_WIN_RATE                 = 60.0  # % — stop copying a trader below this threshold (matches watchlist qualification threshold)
+MAX_DAILY_LOSSES_PER_TRADER  = 2   # max losses from one trader per calendar day before skipping
 STALE_POSITION_DAYS    = 30     # flag positions open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 
@@ -56,6 +58,15 @@ WATCHLIST_REFRESH_H       = 6      # hours between dynamic watchlist refreshes
 # WATCHLIST_TOP_N=10, WATCHLIST_MIN_WR=40.0, MIN_WHALE_SIZE=100.0 for more
 # trade signals. The current Phase 1 settings are conservative for a small bankroll.
 PHASE2_BANKROLL_THRESHOLD = 500.0
+
+# Bankroll scaling thresholds: (min_bankroll, {BASE_BET, MAX_BET, DAILY_CAP})
+BANKROLL_SCALE_STEPS = [
+    (150,  {"BASE_BET":  5, "MAX_BET":  15, "DAILY_CAP":  30}),
+    (300,  {"BASE_BET": 10, "MAX_BET":  30, "DAILY_CAP":  60}),
+    (500,  {"BASE_BET": 15, "MAX_BET":  50, "DAILY_CAP": 100}),
+    (1000, {"BASE_BET": 25, "MAX_BET": 100, "DAILY_CAP": 200}),
+    (2500, {"BASE_BET": 40, "MAX_BET": 150, "DAILY_CAP": 300}),
+]
 
 # Legacy static list — only used when USE_DYNAMIC_WATCHLIST = False
 TRADERS_TO_COPY  = ["majorexploiter", "beachboy4"]
@@ -92,18 +103,21 @@ class PaperBot:
         self.trader_stats       = {}        # name → {"wins": int, "losses": int}
         self.api_fail_count     = 0         # consecutive poll cycles with all-None responses
         self.last_addr_refresh  = time.time()
-        self.whale_sizes        = []        # rolling last-30 whale trade sizes for median
+        self.whale_sizes             = []   # rolling last-30 whale trade sizes for median
+        self.daily_losses_per_trader = {}  # trader_name → losses today (reset at midnight UTC)
+        self.milestones_reached      = set()  # bankroll thresholds already prompted
 
     def _refresh_budget(self):
         today = date.today()
         if today != self._budget_date:
-            self._daily_used  = 0.0
-            self._budget_date = today
+            self._daily_used             = 0.0
+            self._budget_date            = today
+            self.daily_losses_per_trader = {}
 
     @property
     def daily_remaining(self):
         self._refresh_budget()
-        return max(0.0, DAILY_BUDGET - self._daily_used)
+        return max(0.0, DAILY_CAP - self._daily_used)
 
     @property
     def win_rate(self):
@@ -294,6 +308,14 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
                 )
                 return
 
+        # Per-trader daily loss limit
+        today_losses = bot.daily_losses_per_trader.get(trader_name, 0)
+        if today_losses >= MAX_DAILY_LOSSES_PER_TRADER:
+            msg = f"Skipping {trader_name} - daily loss limit reached ({today_losses} losses today)"
+            _log(msg)
+            bot.status_msg = msg
+            return
+
         # Update rolling whale-size window and compute conviction
         bot.whale_sizes.append(usdc)
         if len(bot.whale_sizes) > 30:
@@ -426,6 +448,39 @@ def get_price_resolved(cid: str, oidx: int):
     return px, is_resolved
 
 
+def _check_bankroll_scale(bot: PaperBot):
+    """After each resolved trade, check if bankroll has crossed a scaling threshold."""
+    global BASE_BET, MAX_BET, DAILY_CAP
+    bankroll = STARTING_BANKROLL + bot.closed_pnl
+    for threshold, cfg in BANKROLL_SCALE_STEPS:
+        if bankroll >= threshold and threshold not in bot.milestones_reached:
+            bot.milestones_reached.add(threshold)
+            _log(
+                f"SCALE UP AVAILABLE: Bankroll ${bankroll:.2f} has crossed ${threshold} threshold"
+            )
+            _log(
+                f"  Suggested config: BASE_BET={cfg['BASE_BET']}, "
+                f"MAX_BET={cfg['MAX_BET']}, DAILY_CAP={cfg['DAILY_CAP']}"
+            )
+            try:
+                print(
+                    f"\n[SCALE UP] Bankroll ${bankroll:.2f} crossed ${threshold} threshold.\n"
+                    f"  Suggested: BASE_BET={cfg['BASE_BET']}, "
+                    f"MAX_BET={cfg['MAX_BET']}, DAILY_CAP={cfg['DAILY_CAP']}"
+                )
+                answer = input("Apply new scaling? (y/n): ").strip().lower()
+            except EOFError:
+                answer = "n"
+            if answer == "y":
+                BASE_BET  = cfg["BASE_BET"]
+                MAX_BET   = cfg["MAX_BET"]
+                DAILY_CAP = cfg["DAILY_CAP"]
+                _log("Scaling applied.")
+                print("Scaling applied.")
+            else:
+                _log("Scaling declined, keeping current config.")
+
+
 def resolution_loop(bot: PaperBot):
     """Periodically price open positions and mark resolved ones WIN/LOSS."""
     while True:
@@ -481,6 +536,9 @@ def resolution_loop(bot: PaperBot):
                         s["wins"] += 1
                     else:
                         s["losses"] += 1
+                        bot.daily_losses_per_trader[trader_name] = (
+                            bot.daily_losses_per_trader.get(trader_name, 0) + 1
+                        )
                     result_tag = "WIN" if pnl >= 0 else "LOSS"
                     bot.status_msg = (
                         f"[RESOLVED] {pos['title'][:30]} | "
@@ -492,6 +550,7 @@ def resolution_loop(bot: PaperBot):
                         f"cost={pos['total_cost']:.2f} pnl={pnl:+.4f} → {result_tag}"
                     )
                     update_csv_status(cid, oidx, pos["status"], pnl)
+                    _check_bankroll_scale(bot)
                     # Sync in-memory trade log so the dashboard reflects WIN/LOSS
                     for rec in bot.trade_log:
                         if rec.get("condition_id") == cid and rec.get("outcome_index") == str(oidx):
@@ -722,7 +781,7 @@ def main():
         print(f"  Watchlist  : dynamic top {WATCHLIST_TOP_N} (min WR {WATCHLIST_MIN_WR:.0f}%, 6h refresh)")
     else:
         print(f"  Copying    : {', '.join(TRADERS_TO_COPY)}  [static list]")
-    print(f"  Ratio      : 10:1  |  Budget: ${DAILY_BUDGET}/day  |  Min whale: ${MIN_WHALE_SIZE}")
+    print(f"  Sizing     : base ${BASE_BET} / max ${MAX_BET}  |  Daily cap: ${DAILY_CAP}  |  Min whale: ${MIN_WHALE_SIZE}")
     print(f"  Poll cycle : every {POLL_INTERVAL}s  |  Max trade age: {MAX_TRADE_AGE}s")
     print(f"  Trade log  : {CSV_FILE.resolve()}")
     print()

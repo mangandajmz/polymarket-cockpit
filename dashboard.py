@@ -26,8 +26,9 @@ PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "changeme")
 CSV_PATH     = Path(os.getenv("CSV_PATH", "paper_trades.csv"))
 LOG_PATH     = Path(os.getenv("LOG_PATH", "bot.log"))
 REFRESH_MS   = int(os.getenv("REFRESH_MS", "30000"))
-DAILY_BUDGET = float(os.getenv("DAILY_BUDGET", "50.0"))
-BOT_MODE     = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
+DAILY_BUDGET      = float(os.getenv("DAILY_BUDGET", os.getenv("DAILY_CAP", "60.0")))
+STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "300.0"))
+BOT_MODE          = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
@@ -435,16 +436,18 @@ with tab_ov:
                     unsafe_allow_html=True)
 
     # Row 1: core PnL metrics + streak
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Today's PnL",  f"${stats['today_pnl']:+.2f}")
     c2.metric("All-Time PnL", f"${stats['all_time_pnl']:+.2f}")
-    c3.metric("Total Trades", stats["total_trades"])
+    current_bankroll = STARTING_BANKROLL + stats["all_time_pnl"]
+    c3.metric("Bankroll", f"${current_bankroll:,.2f}", delta=f"${stats['all_time_pnl']:+.2f}")
+    c4.metric("Total Trades", stats["total_trades"])
     streak_icon = "🔥" if stats["streak_type"] == "WIN" else ("💀" if stats["streak_type"] == "LOSS" else "—")
     streak_label = (
         f"{stats['streak_count']} {stats['streak_type']}"
         if stats["streak_count"] else "—"
     )
-    c4.metric(f"{streak_icon} Streak", streak_label)
+    c5.metric(f"{streak_icon} Streak", streak_label)
 
     st.divider()
 

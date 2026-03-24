@@ -1,25 +1,140 @@
 # Polymarket Copy Trading Bot
 
 A paper-trading (and eventually live) copy-trading bot for [Polymarket](https://polymarket.com).
-It watches two high-performing traders in real time, mirrors their qualifying BUY trades at 1/10th size, and logs everything to a CSV.
-A Streamlit dashboard lets you monitor performance from any browser — phone or desktop.
+It automatically discovers high-performing traders, mirrors their qualifying BUY trades at a conviction-scaled size, and logs everything to a CSV.
+A Streamlit dashboard lets you monitor performance from any browser.
 
 > **Current mode: PAPER TRADING — no real money, no wallet connected.**
 
 ---
 
-## What it does
+## Overview
 
-| Feature | Detail |
-|---|---|
-| **Traders copied** | `majorexploiter`, `beachboy4` |
-| **Copy ratio** | 10 : 1 (whale trades $300 → we simulate $30) |
-| **Daily budget** | $50 simulated USD, resets at midnight UTC |
-| **Min whale size** | $30 USDC per trade |
-| **Filters** | BUY-only · max 5 minutes old · no crypto markets |
-| **Poll interval** | Every 30 seconds |
-| **Resolution** | Checks Polymarket Gamma API every 60 s; marks WIN / LOSS |
-| **Dashboard** | Streamlit on port 8501, password-protected, auto-refreshes |
+The bot watches the top monthly-PNL traders on Polymarket in real time. When a qualifying whale makes a large BUY, the bot copies it immediately at a fraction of the size — scaled by how big that trade is relative to the whale's recent history. All simulated trades, PnL, and market outcomes are logged to `paper_trades.csv` and displayed on a live Streamlit dashboard.
+
+---
+
+## How it works
+
+### 1. Whale discovery (every 6 hours)
+The `WatchlistManager` (`dynamic_watchlist.py`) fetches the top 30 traders from Polymarket's monthly PNL leaderboard, estimates each trader's win rate by sampling their last 10 positions (priced via the Gamma API), and keeps the first 5 traders that pass the 60% win-rate threshold. Qualifying addresses are cached permanently in `watchlist_cache.json` so open positions can still resolve even after a trader drops off the leaderboard.
+
+### 2. Trade polling (every 30 seconds)
+`poll_once()` fetches the last 50 trades for each watched trader. Any trade timestamped within the last 5 minutes is passed to `process_trade()`.
+
+### 3. Trade filtering
+Each candidate trade must pass every filter before being copied:
+
+| Filter | Value | What it prevents |
+|---|---|---|
+| Side | BUY only | Copying exits / redemptions |
+| Age | ≤ 5 minutes | Stale or replayed trades |
+| Whale size | ≥ $1,000 | Low-conviction noise trades |
+| Market type | No crypto keywords | Bitcoin/ETH price-direction bets |
+| Trader win rate | ≥ 60% after 10 resolved trades | Copying a trader mid-slump |
+| Daily loss limit | ≤ 2 losses/trader/day | Tilt-following a trader on a bad day |
+| Daily cap | ≤ $60/day total | Runaway spending in a volatile session |
+
+### 4. Conviction sizing
+When a trade passes all filters, the bot calculates a conviction score:
+
+```
+conviction = whale_size_usdc / median(last_30_whale_trade_sizes)
+our_bet    = min(BASE_BET × conviction, MAX_BET, daily_remaining)
+```
+
+A trade 2× the median → `$20` bet. A trade 3× the median → `$30` (capped by `MAX_BET`). This means the bot naturally bets more when a whale makes an unusually large move.
+
+### 5. Resolution (every 60 seconds)
+`resolution_loop()` checks the Gamma API for every open position. A market is considered settled when `closed == True` and the winning outcome is priced ≥ 0.99. On settlement, PnL is calculated, the position is marked WIN or LOSS, and the CSV is updated.
+
+---
+
+## Configuration
+
+All values are set at the top of `paper_trading_bot.py`.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `MIN_WHALE_SIZE` | `1000.0` | Minimum USDC size of a whale trade to copy |
+| `BASE_BET` | `10.0` | Base bet size in USD; scales with conviction |
+| `MAX_BET` | `30.0` | Hard cap on a single trade in USD |
+| `DAILY_CAP` | `60.0` | Maximum simulated USD to spend per calendar day |
+| `STARTING_BANKROLL` | `300.0` | Starting bankroll used for bankroll scaling calculations |
+| `MAX_DAILY_LOSSES_PER_TRADER` | `2` | Max resolved losses from one trader per day before skipping them |
+| `COPY_RATIO` | `0.10` | Legacy ratio (not used for sizing; kept for reference) |
+| `WATCHLIST_TOP_N` | `5` | Number of traders to watch simultaneously |
+| `WATCHLIST_MIN_WR` | `60.0` | Minimum win rate (%) to qualify for the watchlist |
+| `WATCHLIST_REFRESH_H` | `6` | Hours between watchlist refreshes |
+| `MIN_WIN_RATE` | `60.0` | Per-trader win rate (%) below which trades are skipped |
+| `POLL_INTERVAL` | `30` | Seconds between trade polling cycles |
+
+---
+
+## Bankroll scaling
+
+As the simulated bankroll grows, bet sizing should grow proportionally. The bot uses a semi-automatic scaling system — when `STARTING_BANKROLL + closed_pnl` crosses a threshold for the first time, the bot prints a prompt in the terminal and waits for confirmation before applying the new settings.
+
+| Bankroll | BASE_BET | MAX_BET | DAILY_CAP |
+|---|---|---|---|
+| $150 | $5 | $15 | $30 |
+| $300 | $10 | $30 | $60 |
+| $500 | $15 | $50 | $100 |
+| $1,000 | $25 | $100 | $200 |
+| $2,500 | $40 | $150 | $300 |
+
+**How it works:**
+- After every resolved trade, `_check_bankroll_scale()` evaluates the current bankroll.
+- If a threshold is crossed for the first time this session, the bot logs `SCALE UP AVAILABLE` to `bot.log` and prints the suggested config.
+- You see: `Apply new scaling? (y/n):`
+- Press `y` to apply immediately (updates `BASE_BET`, `MAX_BET`, `DAILY_CAP` in memory).
+- Press `n` to decline — that threshold will not prompt again this session.
+- Each threshold only prompts once per session (`bot.milestones_reached` tracks this).
+
+> **Note:** Scaling is applied to the running process only. To make it permanent, update the values in `paper_trading_bot.py` and redeploy.
+
+---
+
+## Risk management
+
+The bot has three independent capital protection mechanisms:
+
+### 1. Minimum whale size (`MIN_WHALE_SIZE = $1,000`)
+Only copy trades where the whale committed at least $1,000 USDC. This filters out casual, low-conviction trades and keeps the signal-to-noise ratio high. Raising this value makes the bot more selective; lowering it increases trade frequency but reduces average quality.
+
+### 2. Per-trader daily loss limit (`MAX_DAILY_LOSSES_PER_TRADER = 2`)
+If a specific whale has already produced 2 resolved losses for us today, all further trades from that trader are skipped until midnight UTC. This prevents the bot from following a trader through a bad day — when a whale is on a losing streak, continuing to copy them compounds losses faster than the sizing system can compensate.
+
+### 3. Daily cap (`DAILY_CAP = $60`)
+The total amount spent on copy trades resets to zero at midnight UTC. Once $60 has been spent today, all new trades are skipped regardless of conviction score. This sets a hard ceiling on daily drawdown, ensuring a single volatile session cannot exceed a predictable amount.
+
+---
+
+## Phase 2 auto-scaling
+
+When `STARTING_BANKROLL + closed_pnl` exceeds `PHASE2_BANKROLL_THRESHOLD` (`$500`), the following config upgrades are suggested:
+
+```python
+WATCHLIST_TOP_N   = 10     # watch more traders
+WATCHLIST_MIN_WR  = 40.0   # relax win-rate entry threshold
+MIN_WHALE_SIZE    = 100.0  # copy smaller whale trades for more signals
+```
+
+Phase 1 settings are conservative for a small bankroll — fewer, higher-quality signals only. Phase 2 expands the signal universe once there is enough capital to absorb a higher variance of trade quality.
+
+---
+
+## Going live — checklist
+
+Before switching from paper trading to real money:
+
+- [ ] **Conviction median is stable**: Check that `bot.whale_sizes` has at least 30 entries (visible in bot logs). The median needs enough history to be meaningful, otherwise early trades use a single-sample median which inflates conviction scores.
+- [ ] **Set `STARTING_BANKROLL`** to your actual deposit amount in USDC.
+- [ ] **Verify `DAILY_CAP`** is 15–20% of your bankroll. At $300 bankroll the default $60 cap is 20%. Adjust down if you prefer slower drawdown.
+- [ ] **Run paper mode for ≥ 48 hours** and review `paper_trades.csv` — check that all whale sizes are above $1,000, conviction scores look reasonable (0.5–3.0 range is normal), and no single trader is dominating losses.
+- [ ] **Audit the last 20 resolved trades** for market quality — are they politics/sports/finance or noise? Tighten `CRYPTO_KW` if unexpected market types are slipping through.
+- [ ] **Connect wallet and set `LIVE_MODE = True`** on the `live` branch only. Never merge live-mode code to `main`.
+- [ ] Start with `DAILY_CAP` at 50% of the paper-mode value for the first 48 hours live.
 
 ---
 
@@ -27,15 +142,17 @@ A Streamlit dashboard lets you monitor performance from any browser — phone or
 
 ```
 .
-├── paper_trading_bot.py   # The bot (copy-trading engine)
+├── paper_trading_bot.py   # Copy-trading engine
+├── dynamic_watchlist.py   # Whale discovery and watchlist management
+├── backtest_configs.py    # Backtester for comparing watchlist configs
 ├── dashboard.py           # Streamlit monitoring dashboard
-├── requirements.txt       # All Python dependencies
+├── requirements.txt       # Python dependencies
 ├── deploy.sh              # VPS deploy / restart script
 ├── .env.example           # Environment variable template
 └── .gitignore
 ```
 
-> `paper_trades.csv` and `bot.log` are **excluded from git** — they live on the VPS only.
+> `paper_trades.csv`, `bot.log`, and `watchlist_cache.json` are **excluded from git** — they live on the VPS only.
 
 ---
 
@@ -53,14 +170,14 @@ sudo apt install -y python3 python3-pip python3-venv git
 ### 2. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/polymarket-bot.git
+git clone https://github.com/mangandajmz/polymarket-bot.git
 cd polymarket-bot
 ```
 
 ### 3. Install dependencies
 
 ```bash
-pip3 install -r requirements.txt
+pip3 install -r requirements.txt --no-cache-dir
 ```
 
 ### 4. Configure environment
@@ -76,7 +193,8 @@ Set at minimum:
 DASHBOARD_PASSWORD=your_strong_password_here
 CSV_PATH=/home/ubuntu/polymarket-bot/paper_trades.csv
 LOG_PATH=/home/ubuntu/polymarket-bot/bot.log
-DAILY_BUDGET=50.0
+DAILY_CAP=60.0
+STARTING_BANKROLL=300.0
 BOT_MODE=PAPER
 ```
 
@@ -156,67 +274,9 @@ Dashboard is now live at: **`http://YOUR_VPS_IP:8501`**
 
 ## Updating the bot
 
-Pull and restart in one command:
-
 ```bash
-bash deploy.sh
+ssh ubuntu@YOUR_VPS_IP "cd /home/ubuntu/polymarket-bot && git pull && pip install -r requirements.txt --no-cache-dir && sudo systemctl restart polymarket-bot polymarket-dash"
 ```
-
-Or manually:
-
-```bash
-git pull origin main
-sudo systemctl restart polymarket-bot polymarket-dash
-```
-
----
-
-## Switching from paper trading to live
-
-> **Do this carefully. Real money is at stake.**
-
-### Step 1 — Switch to the `live` branch
-
-```bash
-git checkout live
-git pull origin live
-```
-
-### Step 2 — Connect a Polymarket wallet
-
-Polymarket uses an embedded wallet via Magic.link. You need to:
-
-1. Create a Polymarket account and fund it with USDC on Polygon.
-2. Export your wallet's private key or use the Polymarket API key / proxy wallet.
-3. Add credentials to `.env` — **never commit `.env`**.
-
-### Step 3 — Update bot config
-
-In `paper_trading_bot.py` (live branch), the following constants will need real values:
-
-```python
-LIVE_MODE      = True          # flip this flag
-WALLET_ADDRESS = "0x..."       # your proxy wallet
-PRIVATE_KEY    = os.getenv("PRIVATE_KEY")   # from .env only
-DAILY_BUDGET   = 50.0          # real USD — start small
-```
-
-### Step 4 — Set BOT_MODE in .env
-
-```env
-BOT_MODE=LIVE
-```
-
-### Step 5 — Restart
-
-```bash
-bash deploy.sh
-```
-
-The dashboard mode badge will change from **PAPER** (orange) to **LIVE** (green).
-
-> Recommended: run live with `DAILY_BUDGET=10.0` for the first week.
-> Audit every trade. Only increase budget once you're confident.
 
 ---
 
