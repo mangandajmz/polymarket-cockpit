@@ -196,6 +196,46 @@ def seed_seen_hashes(bot: PaperBot):
 
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
+def migrate_csv():
+    """
+    Migrate CSV to the current CSV_FIELDS schema if the header is out of date.
+
+    Background: when new columns are added to CSV_FIELDS (e.g. 'conviction'),
+    init_csv() never rewrites an existing header.  Rows written before the
+    schema change have fewer fields than rows written after, which causes pandas
+    to throw 'ParserError: Expected N fields, saw M' and crash the dashboard.
+
+    This function detects a stale header and rewrites the entire file with the
+    current CSV_FIELDS header, inserting empty strings for any missing columns
+    in old rows.  Safe to call on every startup — exits immediately if the
+    header is already current.
+    """
+    if not CSV_FILE.exists():
+        return
+    try:
+        with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
+            reader     = csv.DictReader(f)
+            old_fields = reader.fieldnames or []
+            if set(old_fields) == set(CSV_FIELDS) and old_fields == CSV_FIELDS:
+                return   # header already matches — nothing to do
+            rows = list(reader)
+
+        # Rewrite with current header; old rows get empty strings for new columns
+        with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in CSV_FIELDS})
+
+        _log(
+            f"migrate_csv: rewrote {len(rows)} rows "
+            f"(old fields: {old_fields} → new: {CSV_FIELDS})"
+        )
+        print(f"  [migrate_csv] Updated CSV schema: added missing columns, {len(rows)} rows preserved.")
+    except Exception as exc:
+        print(f"  [migrate_csv] WARNING: migration failed: {exc}")
+
+
 def init_csv():
     if not CSV_FILE.exists():
         with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
@@ -837,6 +877,7 @@ def main():
     print()
 
     bot = PaperBot()
+    migrate_csv()                  # fix stale header before reading or writing
     init_csv()
     load_positions_from_csv(bot)
     _init_milestones(bot)   # must come after CSV load so closed_pnl is accurate

@@ -42,7 +42,7 @@ TRADERS   = ["majorexploiter", "beachboy4"]
 CSV_FIELDS = [
     "timestamp", "trader", "market", "outcome", "whale_side",
     "whale_size_usdc", "our_size_usdc", "price", "copy_shares",
-    "status", "resolved_pnl", "condition_id", "outcome_index",
+    "conviction", "status", "resolved_pnl", "condition_id", "outcome_index",
 ]
 
 # Market category keyword matching
