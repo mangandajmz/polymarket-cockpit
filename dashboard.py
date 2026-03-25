@@ -34,6 +34,7 @@ REFRESH_MS   = int(os.getenv("REFRESH_MS", "30000"))
 DAILY_BUDGET = float(os.getenv("DAILY_CAP") or os.getenv("DAILY_BUDGET") or "60.0")
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "300.0"))
 BOT_MODE          = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
+MIN_WIN_RATE      = 60.0  # % threshold — must match paper_trading_bot.py
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
@@ -820,7 +821,57 @@ with tab_perf:
     else:
         resolved_all = resolved_all.sort_values("timestamp")
 
-        # 1. Cumulative PnL over time
+        # ── Shared dark-theme helpers ─────────────────────────────────────
+        _AXIS_STYLE = dict(
+            gridcolor="rgba(255,255,255,0.05)",
+            linecolor="rgba(255,255,255,0.10)",
+            tickcolor="rgba(255,255,255,0.20)",
+            zerolinecolor="rgba(255,255,255,0.10)",
+        )
+        _BASE_LAYOUT = dict(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#c9d1d9", size=12),
+            title_font=dict(color="#8b949e", size=14),
+            title_x=0,
+            hovermode="x unified",
+            showlegend=False,
+            margin=dict(t=44, b=44, l=60, r=24),
+            hoverlabel=dict(
+                bgcolor="#0d1117",
+                bordercolor="#30363d",
+                font_color="#c9d1d9",
+            ),
+        )
+
+        def _apply_dark(fig, **extra_layout):
+            fig.update_layout(**_BASE_LAYOUT, **extra_layout)
+            fig.update_xaxes(**_AXIS_STYLE)
+            fig.update_yaxes(**_AXIS_STYLE)
+
+        # ── Summary stats row ─────────────────────────────────────────────
+        total_return_pct = (
+            stats["all_time_pnl"] / STARTING_BANKROLL * 100
+            if STARTING_BANKROLL else 0.0
+        )
+        resolved_all["trade_date"] = resolved_all["timestamp"].dt.date
+        _day_pnl = resolved_all.groupby("trade_date")["resolved_pnl"].sum()
+        best_day_pnl  = float(_day_pnl.max()) if not _day_pnl.empty else 0.0
+        worst_day_pnl = float(_day_pnl.min()) if not _day_pnl.empty else 0.0
+        streak_label  = (
+            f"{stats['streak_count']} {stats['streak_type']}"
+            if stats["streak_count"] else "—"
+        )
+
+        sm1, sm2, sm3, sm4 = st.columns(4)
+        sm1.metric("Total Return",  f"{total_return_pct:+.1f}%")
+        sm2.metric("Best Day PnL",  f"${best_day_pnl:+.2f}")
+        sm3.metric("Worst Day PnL", f"${worst_day_pnl:+.2f}")
+        sm4.metric("Win Streak",    streak_label)
+
+        st.divider()
+
+        # ── Chart 1: Cumulative PnL with area fill ────────────────────────
         resolved_all["cum_pnl"] = resolved_all["resolved_pnl"].cumsum()
         fig_pnl = px.line(
             resolved_all,
@@ -828,13 +879,33 @@ with tab_perf:
             y="cum_pnl",
             title="Cumulative PnL Over Time",
             labels={"timestamp": "Date", "cum_pnl": "Cumulative PnL ($)"},
-            color_discrete_sequence=["#00a651"],
+            color_discrete_sequence=["#00C48C"],
+            line_shape="spline",
         )
-        fig_pnl.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.4)
-        fig_pnl.update_layout(hovermode="x unified", showlegend=False)
+        fig_pnl.update_traces(
+            fill="tozeroy",
+            fillcolor="rgba(0,196,140,0.08)",
+            line=dict(width=2),
+        )
+        fig_pnl.add_hline(
+            y=0,
+            line_dash="dash",
+            line_color="rgba(255,255,255,0.15)",
+            opacity=1,
+        )
+        fig_pnl.add_hline(
+            y=STARTING_BANKROLL,
+            line_dash="dot",
+            line_color="rgba(255,200,60,0.45)",
+            opacity=1,
+            annotation_text="Starting Capital",
+            annotation_font_color="#8b949e",
+            annotation_position="bottom right",
+        )
+        _apply_dark(fig_pnl)
         st.plotly_chart(fig_pnl, use_container_width=True)
 
-        # 2. Rolling 10-trade win rate
+        # ── Chart 2: Rolling 10-trade win rate ────────────────────────────
         resolved_all["is_win"]  = (resolved_all["status"] == "WIN").astype(int)
         resolved_all["roll_wr"] = resolved_all["is_win"].rolling(10, min_periods=1).mean() * 100
         fig_wr = px.line(
@@ -843,32 +914,94 @@ with tab_perf:
             y="roll_wr",
             title="Win Rate Trend (Rolling 10-Trade Average)",
             labels={"timestamp": "Date", "roll_wr": "Win Rate (%)"},
-            color_discrete_sequence=["#4e9af1"],
+            color_discrete_sequence=["#4A90D9"],
+            line_shape="spline",
         )
-        fig_wr.add_hline(y=50, line_dash="dash", line_color="yellow", opacity=0.4,
-                         annotation_text="50%")
-        fig_wr.update_layout(yaxis_range=[0, 100], hovermode="x unified", showlegend=False)
+        fig_wr.update_traces(line=dict(width=2))
+        fig_wr.add_hline(
+            y=MIN_WIN_RATE,
+            line_dash="dash",
+            line_color="rgba(255,220,60,0.50)",
+            opacity=1,
+            annotation_text=f"{MIN_WIN_RATE:.0f}% target",
+            annotation_font_color="#8b949e",
+            annotation_position="bottom right",
+        )
+        _apply_dark(fig_wr, yaxis=dict(**_AXIS_STYLE, range=[0, 100]))
         st.plotly_chart(fig_wr, use_container_width=True)
 
-        # 3. PnL contribution per trader (bar chart)
-        trader_pnl = (
+        # ── Chart 3: PnL by Trader (horizontal bar) ───────────────────────
+        _tpnl = (
             resolved_all.groupby("trader")["resolved_pnl"]
             .sum()
             .reset_index()
-            .rename(columns={"resolved_pnl": "Total PnL ($)"})
+            .sort_values("resolved_pnl")
         )
-        fig_bar = px.bar(
-            trader_pnl,
-            x="trader",
-            y="Total PnL ($)",
-            title="PnL Contribution per Trader",
-            color="Total PnL ($)",
-            color_continuous_scale=["#dc3545", "#333333", "#00a651"],
-            text_auto=".2f",
-            labels={"trader": "Trader"},
+        _tpnl["color"] = _tpnl["resolved_pnl"].apply(
+            lambda v: "#00C48C" if v >= 0 else "#dc3545"
         )
-        fig_bar.update_layout(showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        fig_tpnl = go.Figure(go.Bar(
+            y=_tpnl["trader"],
+            x=_tpnl["resolved_pnl"],
+            orientation="h",
+            marker_color=_tpnl["color"].tolist(),
+            text=_tpnl["resolved_pnl"].map("${:+.2f}".format),
+            textposition="outside",
+            textfont=dict(color="#c9d1d9", size=11),
+            cliponaxis=False,
+        ))
+        fig_tpnl.add_vline(x=0, line_color="rgba(255,255,255,0.15)")
+        _apply_dark(
+            fig_tpnl,
+            title="PnL by Trader",
+            xaxis=dict(**_AXIS_STYLE, title="Total Resolved PnL ($)"),
+            yaxis=dict(**_AXIS_STYLE, title=""),
+            hovermode="y unified",
+        )
+        st.plotly_chart(fig_tpnl, use_container_width=True)
+
+        # ── Chart 4: Win Rate by Trader (horizontal bar) ──────────────────
+        _twr_rows = []
+        for _trader, _grp in resolved_all.groupby("trader"):
+            _wins  = int((_grp["status"] == "WIN").sum())
+            _total = len(_grp)
+            _twr_rows.append({
+                "trader":       _trader,
+                "win_rate":     _wins / _total * 100 if _total else 0.0,
+                "trades":       _total,
+            })
+        _twr = pd.DataFrame(_twr_rows).sort_values("win_rate")
+        _twr["color"] = _twr["win_rate"].apply(
+            lambda v: "#00C48C" if v >= MIN_WIN_RATE else "#dc3545"
+        )
+        fig_twr = go.Figure(go.Bar(
+            y=_twr["trader"],
+            x=_twr["win_rate"],
+            orientation="h",
+            marker_color=_twr["color"].tolist(),
+            text=_twr["win_rate"].map("{:.1f}%".format),
+            textposition="outside",
+            textfont=dict(color="#c9d1d9", size=11),
+            cliponaxis=False,
+            customdata=_twr["trades"].tolist(),
+            hovertemplate="%{y}: %{x:.1f}% win rate (%{customdata} trades)<extra></extra>",
+        ))
+        fig_twr.add_vline(
+            x=MIN_WIN_RATE,
+            line_dash="dash",
+            line_color="rgba(255,220,60,0.50)",
+            annotation_text=f"{MIN_WIN_RATE:.0f}% target",
+            annotation_font_color="#8b949e",
+            annotation_position="top right",
+        )
+        _apply_dark(
+            fig_twr,
+            title="Win Rate by Trader",
+            xaxis=dict(**_AXIS_STYLE, title="Win Rate (%)", range=[0, 115]),
+            yaxis=dict(**_AXIS_STYLE, title=""),
+            hovermode="y unified",
+        )
+        st.plotly_chart(fig_twr, use_container_width=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — MARKET BREAKDOWN
