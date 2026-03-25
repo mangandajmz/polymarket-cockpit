@@ -346,7 +346,7 @@ def is_crypto(title: str) -> bool:
 def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     tx      = trade.get("transactionHash", "")
     side    = trade.get("side", "").upper()
-    usdc    = float(trade.get("size", 0))
+    usdc    = float(trade.get("usdcSize", 0))
     px      = float(trade.get("price", 0.001))
     cid     = trade.get("conditionId", "")
     oidx    = int(trade.get("outcomeIndex", 0))
@@ -760,6 +760,8 @@ def poll_once(bot: PaperBot):
         any_success = True
         cutoff = int(time.time()) - MAX_TRADE_AGE   # look back exactly MAX_TRADE_AGE (5 min)
         for trade in data:
+            if trade.get("type", "TRADE") != "TRADE":
+                continue  # skip REDEEM, YIELD and other non-trade events
             if int(trade.get("timestamp", 0)) >= cutoff:
                 process_trade(bot, name, trade)
         time.sleep(0.3)
