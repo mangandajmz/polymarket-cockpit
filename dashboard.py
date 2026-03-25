@@ -641,8 +641,9 @@ with tab_hist:
     else:
         f1, f2 = st.columns(2)
         with f1:
+            _csv_traders = sorted(df["trader"].dropna().unique().tolist())
             trader_filter = st.multiselect(
-                "Trader", options=TRADERS, default=TRADERS, key="hist_trader"
+                "Trader", options=_csv_traders, default=_csv_traders, key="hist_trader"
             )
         with f2:
             status_filter = st.multiselect(
