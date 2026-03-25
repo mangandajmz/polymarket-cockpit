@@ -723,90 +723,133 @@ with tab_traders:
             "dynamic_watchlist.py may not have run yet."
         )
 
-    cols = st.columns(len(TRADERS))
-    for i, trader in enumerate(TRADERS):
-        tdf      = df[df["trader"] == trader].copy() if not df.empty else pd.DataFrame()
-        resolved = tdf[tdf["status"].isin(["WIN", "LOSS"])] if not tdf.empty else pd.DataFrame()
+    # ── Watchlist cards (all traders in watchlist_cache.json) ─────────────────
+    wl_traders = sorted(_wl_addrs.keys())
+    if not wl_traders:
+        st.info("No traders in watchlist_cache.json yet.")
+    else:
+        ncols = min(len(wl_traders), 3)
+        cols  = st.columns(ncols)
+        for i, trader in enumerate(wl_traders):
+            tdf      = df[df["trader"] == trader].copy() if not df.empty else pd.DataFrame()
+            resolved = tdf[tdf["status"].isin(["WIN", "LOSS"])] if not tdf.empty else pd.DataFrame()
 
-        wins_t   = int((resolved["status"] == "WIN").sum())  if not resolved.empty else 0
-        losses_t = int((resolved["status"] == "LOSS").sum()) if not resolved.empty else 0
-        total_t  = wins_t + losses_t
-        wr_t     = wins_t / total_t * 100 if total_t else 0.0
-        pnl_t    = float(resolved["resolved_pnl"].sum()) if not resolved.empty else 0.0
-        spent_t  = float(tdf["our_size_usdc"].sum())     if not tdf.empty     else 0.0
+            wins_t   = int((resolved["status"] == "WIN").sum())  if not resolved.empty else 0
+            losses_t = int((resolved["status"] == "LOSS").sum()) if not resolved.empty else 0
+            total_t  = wins_t + losses_t
+            wr_t     = wins_t / total_t * 100 if total_t else 0.0
+            pnl_t    = float(resolved["resolved_pnl"].sum()) if not resolved.empty else 0.0
+            spent_t  = float(tdf["our_size_usdc"].sum())     if not tdf.empty     else 0.0
 
-        week_trades   = len(tdf[tdf["timestamp"] >= week_ago]) if not tdf.empty else 0
-        last_trade_dt = tdf["timestamp"].max()                  if not tdf.empty else None
+            week_trades   = len(tdf[tdf["timestamp"] >= week_ago]) if not tdf.empty else 0
+            last_trade_dt = tdf["timestamp"].max()                  if not tdf.empty else None
 
-        if last_trade_dt is not None and pd.notna(last_trade_dt):
-            # Ensure tz-aware before subtracting (guard against tz-naive Timestamps)
-            if getattr(last_trade_dt, "tzinfo", None) is None:
-                last_trade_dt = last_trade_dt.replace(tzinfo=timezone.utc)
-            # Active = copied a trade within the last 7 days
-            is_active      = (now_utc - last_trade_dt).total_seconds() < 604800
-            last_trade_str = last_trade_dt.strftime("%Y-%m-%d %H:%M UTC")
-        else:
-            is_active      = False
-            last_trade_str = "Never"
+            if last_trade_dt is not None and pd.notna(last_trade_dt):
+                if getattr(last_trade_dt, "tzinfo", None) is None:
+                    last_trade_dt = last_trade_dt.replace(tzinfo=timezone.utc)
+                is_active      = (now_utc - last_trade_dt).total_seconds() < 604800
+                last_trade_str = last_trade_dt.strftime("%Y-%m-%d %H:%M UTC")
+            else:
+                is_active      = False
+                last_trade_str = "Never"
 
-        badge_html = (
-            '<span class="badge-active">● Active</span>'
-            if is_active else
-            '<span class="badge-inactive">○ Inactive</span>'
-        )
-
-        # Fetch live API data
-        live = fetch_trader_live_stats(trader)
-
-        with cols[i]:
-            st.markdown(
-                f'<div class="trader-card"><b>👤 {trader}</b> &nbsp; {badge_html}</div>',
-                unsafe_allow_html=True,
+            badge_html = (
+                '<span class="badge-active">● Active</span>'
+                if is_active else
+                '<span class="badge-inactive">○ Inactive</span>'
             )
 
-            # ── Live Polymarket data (public leaderboard API) ──────────────
-            if live["profile_found"]:
-                if live["bio"]:
-                    st.caption(f"_{live['bio']}_")
+            live = fetch_trader_live_stats(trader)
 
-                la, lb = st.columns(2)
-                pnl_30d_str  = f"${live['pnl_30d']:+,.0f}"  if live["pnl_30d"]  is not None else "N/A"
-                vol_30d_str  = f"${live['vol_30d']:,.0f}"    if live["vol_30d"]  is not None else "N/A"
-                rank_30d_str = f"#{live['rank_30d']}"        if live["rank_30d"] else "N/A"
-                rank_all_str = f"#{live['rank_all']}"        if live["rank_all"] else "N/A"
-                la.metric("30d PnL (Global)",    pnl_30d_str)
-                lb.metric("30d Volume (Global)", vol_30d_str)
-
-                lc, ld = st.columns(2)
-                lc.metric("30d Rank",    rank_30d_str)
-                ld.metric("All-Time Rank", rank_all_str)
-            else:
-                st.caption("⚠️ Not found on Polymarket leaderboard")
-
-            # Our copy-trade stats
-            m1, m2 = st.columns(2)
-            m1.metric("Trades Copied",   len(tdf))
-            m2.metric("This Week",       week_trades)
-
-            m3, m4 = st.columns(2)
-            m3.metric("Our Win Rate",    f"{wr_t:.1f}%")
-            m4.metric("Profit for Us",   f"${pnl_t:+.2f}")
-
-            st.caption(f"Last trade: **{last_trade_str}**")
-            st.caption(f"{wins_t}W / {losses_t}L · ${spent_t:.2f} invested")
-
-            if total_t > 0:
-                st.progress(wr_t / 100)
-
-            # Cumulative PnL mini-chart
-            if not resolved.empty:
-                chart = (
-                    resolved.sort_values("timestamp")[["timestamp", "resolved_pnl"]]
-                    .set_index("timestamp")
-                    .rename(columns={"resolved_pnl": "Cumulative PnL ($)"})
+            with cols[i % ncols]:
+                st.markdown(
+                    f'<div class="trader-card"><b>👤 {trader}</b> &nbsp; {badge_html}</div>',
+                    unsafe_allow_html=True,
                 )
-                chart["Cumulative PnL ($)"] = chart["Cumulative PnL ($)"].cumsum()
-                st.line_chart(chart, height=150)
+
+                if live["profile_found"]:
+                    if live["bio"]:
+                        st.caption(f"_{live['bio']}_")
+                    la, lb = st.columns(2)
+                    pnl_30d_str  = f"${live['pnl_30d']:+,.0f}"  if live["pnl_30d"]  is not None else "N/A"
+                    vol_30d_str  = f"${live['vol_30d']:,.0f}"    if live["vol_30d"]  is not None else "N/A"
+                    rank_30d_str = f"#{live['rank_30d']}"        if live["rank_30d"] else "N/A"
+                    rank_all_str = f"#{live['rank_all']}"        if live["rank_all"] else "N/A"
+                    la.metric("30d PnL (Global)",    pnl_30d_str)
+                    lb.metric("30d Volume (Global)", vol_30d_str)
+                    lc, ld = st.columns(2)
+                    lc.metric("30d Rank",      rank_30d_str)
+                    ld.metric("All-Time Rank", rank_all_str)
+                else:
+                    st.caption("⚠️ Not found on Polymarket leaderboard")
+
+                m1, m2 = st.columns(2)
+                m1.metric("Trades Copied", len(tdf))
+                m2.metric("This Week",     week_trades)
+                m3, m4 = st.columns(2)
+                m3.metric("Our Win Rate",  f"{wr_t:.1f}%")
+                m4.metric("Profit for Us", f"${pnl_t:+.2f}")
+
+                st.caption(f"Last trade: **{last_trade_str}**")
+                st.caption(f"{wins_t}W / {losses_t}L · ${spent_t:.2f} invested")
+
+                if total_t > 0:
+                    st.progress(wr_t / 100)
+
+                if not resolved.empty:
+                    chart = (
+                        resolved.sort_values("timestamp")[["timestamp", "resolved_pnl"]]
+                        .set_index("timestamp")
+                        .rename(columns={"resolved_pnl": "Cumulative PnL ($)"})
+                    )
+                    chart["Cumulative PnL ($)"] = chart["Cumulative PnL ($)"].cumsum()
+                    st.line_chart(chart, height=150)
+
+    # ── Other Active Traders (in CSV but not watchlist) ───────────────────────
+    if not df.empty:
+        wl_set       = set(_wl_addrs.keys())
+        csv_traders  = set(df["trader"].dropna().unique())
+        other_traders = sorted(csv_traders - wl_set)
+
+        if other_traders:
+            st.divider()
+            st.markdown("#### Other Active Traders")
+            st.caption(
+                "These traders appear in paper_trades.csv but are not in the watchlist cache. "
+                "Live Polymarket stats are not fetched for them."
+            )
+
+            other_rows = []
+            for trader in other_traders:
+                tdf      = df[df["trader"] == trader]
+                resolved = tdf[tdf["status"].isin(["WIN", "LOSS"])]
+                wins_o   = int((resolved["status"] == "WIN").sum())  if not resolved.empty else 0
+                losses_o = int((resolved["status"] == "LOSS").sum()) if not resolved.empty else 0
+                total_o  = wins_o + losses_o
+                wr_o     = wins_o / total_o * 100 if total_o else 0.0
+                pnl_o    = float(resolved["resolved_pnl"].sum()) if not resolved.empty else 0.0
+                last_dt  = tdf["timestamp"].max() if not tdf.empty else None
+                if last_dt is not None and pd.notna(last_dt):
+                    if getattr(last_dt, "tzinfo", None) is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    last_str = last_dt.strftime("%Y-%m-%d %H:%M UTC")
+                else:
+                    last_str = "Never"
+                other_rows.append({
+                    "Trader":      trader,
+                    "Trades":      len(tdf),
+                    "W":           wins_o,
+                    "L":           losses_o,
+                    "Win Rate":    f"{wr_o:.1f}%",
+                    "PnL ($)":     f"${pnl_o:+.2f}",
+                    "Last Trade":  last_str,
+                })
+
+            st.dataframe(
+                pd.DataFrame(other_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 5 — PERFORMANCE CHARTS
