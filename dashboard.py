@@ -834,7 +834,6 @@ with tab_perf:
             font=dict(color="#c9d1d9", size=12),
             title_font=dict(color="#8b949e", size=14),
             title_x=0,
-            hovermode="x unified",
             showlegend=False,
             margin=dict(t=44, b=44, l=60, r=24),
             hoverlabel=dict(
@@ -902,7 +901,7 @@ with tab_perf:
             annotation_font_color="#8b949e",
             annotation_position="bottom right",
         )
-        _apply_dark(fig_pnl)
+        _apply_dark(fig_pnl, hovermode="x unified")
         st.plotly_chart(fig_pnl, use_container_width=True)
 
         # ── Chart 2: Rolling 10-trade win rate ────────────────────────────
@@ -927,7 +926,7 @@ with tab_perf:
             annotation_font_color="#8b949e",
             annotation_position="bottom right",
         )
-        _apply_dark(fig_wr, yaxis=dict(**_AXIS_STYLE, range=[0, 100]))
+        _apply_dark(fig_wr, hovermode="x unified", yaxis=dict(**_AXIS_STYLE, range=[0, 100]))
         st.plotly_chart(fig_wr, use_container_width=True)
 
         # ── Chart 3: PnL by Trader (horizontal bar) ───────────────────────
