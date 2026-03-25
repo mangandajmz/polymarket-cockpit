@@ -366,6 +366,20 @@ def compute_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def load_watchlist_cache() -> tuple[dict, str]:
+    """Read watchlist_cache.json; return (address_map, last_successful_refresh_str)."""
+    cache_path = _HERE / "watchlist_cache.json"
+    if not cache_path.exists():
+        return {}, "never"
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        addresses    = {k: v for k, v in raw.items() if not k.startswith("_")}
+        last_refresh = raw.get("_last_successful_refresh", "never")
+        return addresses, last_refresh
+    except Exception:
+        return {}, "never"
+
+
 def fmt_duration(td) -> str:
     s = int(td.total_seconds())
     h, m = divmod(s, 3600)
@@ -566,17 +580,20 @@ with tab_pos:
             else:
                 agg["current_px"] = None
 
-            agg["unreal_pnl"] = (
-                agg["total_shares"]
-                * agg["current_px"].fillna(agg["avg_entry"])
-                - agg["total_cost"]
-            )
+            # Unrealised PnL — deduct Polymarket 2% fee from any profit
+            _proj = agg["total_shares"] * agg["current_px"].fillna(agg["avg_entry"])
+            _raw  = _proj - agg["total_cost"]
+            agg["unreal_pnl"] = _raw.where(_raw <= 0, _raw * 0.98)
+            # Flag positions near worthless (price < $0.05 → ≥95% loss)
+            agg["near_zero"] = agg["current_px"].notna() & (agg["current_px"] < 0.05)
 
             rows = []
             for _, r in agg.iterrows():
-                pnl   = r["unreal_pnl"]
-                emoji = "🟢" if pnl >= 0 else "🔴"
-                curr  = f"${r['current_px']:.4f}" if pd.notna(r["current_px"]) else "N/A"
+                pnl       = r["unreal_pnl"]
+                near_zero = bool(r.get("near_zero", False))
+                emoji     = "⚠️" if near_zero else ("🟢" if pnl >= 0 else "🔴")
+                curr      = f"${r['current_px']:.4f}" if pd.notna(r["current_px"]) else "N/A"
+                pnl_str   = f"${pnl:+.2f} ⚠️ Near Zero" if near_zero else f"${pnl:+.2f}"
                 rows.append({
                     "":           emoji,
                     "Market":     r["market"][:50],
@@ -585,15 +602,18 @@ with tab_pos:
                     "Cost ($)":   f"${r['total_cost']:.2f}",
                     "Avg Entry":  f"${r['avg_entry']:.4f}",
                     "Current":    curr,
-                    "Unreal PnL": f"${pnl:+.2f}",
+                    "Unreal PnL": pnl_str,
                     "Open For":   r["time_open"],
                 })
 
             display = pd.DataFrame(rows)
 
             def _color_row(row):
+                pnl_cell = row.get("Unreal PnL", "$0")
+                if "Near Zero" in pnl_cell:
+                    return ["background-color:rgba(220,53,69,0.35)"] * len(row)
                 try:
-                    val = float(row.get("Unreal PnL", "$0").replace("$", "").replace("+", ""))
+                    val = float(pnl_cell.split()[0].replace("$", "").replace("+", ""))
                 except ValueError:
                     val = 0
                 color = "rgba(0,166,81,0.15)" if val >= 0 else "rgba(220,53,69,0.15)"
@@ -633,10 +653,19 @@ with tab_hist:
         mask     = df["trader"].isin(trader_filter) & df["status"].isin(status_filter)
         filtered = df[mask].sort_values("timestamp", ascending=False)
 
-        st.caption(f"Showing **{len(filtered)}** of **{len(df)}** trades")
+        f3, _ = st.columns([1, 3])
+        with f3:
+            page_size = st.selectbox(
+                "Rows per page", [10, 25, 50, "All"], index=3, key="hist_page_size"
+            )
+        view = filtered if page_size == "All" else filtered.head(int(page_size))
+        st.caption(
+            f"Showing **{len(view)}** of **{len(filtered)}** filtered "
+            f"({len(df)} total)"
+        )
 
         if not filtered.empty:
-            display = filtered[[
+            display = view[[
                 "timestamp", "trader", "market", "outcome",
                 "whale_size_usdc", "our_size_usdc", "price", "status", "resolved_pnl",
             ]].copy()
@@ -683,6 +712,15 @@ with tab_hist:
 with tab_traders:
     st.subheader("Trader Watchlist")
 
+    _wl_addrs, _wl_last_refresh = load_watchlist_cache()
+    if _wl_last_refresh != "never":
+        st.caption(f"Watchlist last refreshed by dynamic_watchlist: **{_wl_last_refresh}**")
+    else:
+        st.warning(
+            "Watchlist cache has no refresh timestamp — "
+            "dynamic_watchlist.py may not have run yet."
+        )
+
     cols = st.columns(len(TRADERS))
     for i, trader in enumerate(TRADERS):
         tdf      = df[df["trader"] == trader].copy() if not df.empty else pd.DataFrame()
@@ -699,7 +737,11 @@ with tab_traders:
         last_trade_dt = tdf["timestamp"].max()                  if not tdf.empty else None
 
         if last_trade_dt is not None and pd.notna(last_trade_dt):
-            is_active      = (now_utc - last_trade_dt).total_seconds() < 86400
+            # Ensure tz-aware before subtracting (guard against tz-naive Timestamps)
+            if getattr(last_trade_dt, "tzinfo", None) is None:
+                last_trade_dt = last_trade_dt.replace(tzinfo=timezone.utc)
+            # Active = copied a trade within the last 7 days
+            is_active      = (now_utc - last_trade_dt).total_seconds() < 604800
             last_trade_str = last_trade_dt.strftime("%Y-%m-%d %H:%M UTC")
         else:
             is_active      = False
