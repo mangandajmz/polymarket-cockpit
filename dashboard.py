@@ -367,18 +367,58 @@ def compute_stats(df: pd.DataFrame) -> dict:
     }
 
 
-def load_watchlist_cache() -> tuple[dict, str]:
-    """Read watchlist_cache.json; return (address_map, last_successful_refresh_str)."""
+def load_watchlist_cache() -> tuple[dict, dict, str]:
+    """Read watchlist_cache.json.
+
+    Returns (active_traders, inactive_traders, last_refresh) where each traders
+    dict is {name: address}.  Handles both v1 (flat string) and v2 (dict with
+    'address'/'active' keys) formats.  Duplicate addresses are deduplicated:
+    the active entry wins; if both have the same status, the first-seen wins.
+    """
     cache_path = _HERE / "watchlist_cache.json"
     if not cache_path.exists():
-        return {}, "never"
+        return {}, {}, "never"
     try:
-        raw = json.loads(cache_path.read_text(encoding="utf-8"))
-        addresses    = {k: v for k, v in raw.items() if not k.startswith("_")}
+        raw          = json.loads(cache_path.read_text(encoding="utf-8"))
         last_refresh = raw.get("_last_successful_refresh", "never")
-        return addresses, last_refresh
+        active   = {}
+        inactive = {}
+        seen_addrs: dict = {}   # normalised addr -> name already stored
+
+        for name, val in raw.items():
+            if name.startswith("_"):
+                continue
+            if isinstance(val, dict):
+                addr      = val.get("address", "")
+                is_active = bool(val.get("active", False))
+            elif isinstance(val, str):
+                addr      = val
+                is_active = False   # old format: inactive until next bot refresh
+            else:
+                continue
+            if not addr:
+                continue
+
+            addr_key = addr.lower()
+            if addr_key in seen_addrs:
+                # Duplicate address — active entry beats inactive, else first-seen wins
+                existing_name = seen_addrs[addr_key]
+                if is_active and existing_name in inactive:
+                    del inactive[existing_name]
+                    seen_addrs[addr_key] = name
+                    active[name] = addr
+                # else: existing entry is equal or better — skip this one
+                continue
+
+            seen_addrs[addr_key] = name
+            if is_active:
+                active[name] = addr
+            else:
+                inactive[name] = addr
+
+        return active, inactive, last_refresh
     except Exception:
-        return {}, "never"
+        return {}, {}, "never"
 
 
 def fmt_duration(td) -> str:
@@ -714,7 +754,7 @@ with tab_hist:
 with tab_traders:
     st.subheader("Trader Watchlist")
 
-    _wl_addrs, _wl_last_refresh = load_watchlist_cache()
+    _wl_active, _wl_inactive, _wl_last_refresh = load_watchlist_cache()
     if _wl_last_refresh != "never":
         st.caption(f"Watchlist last refreshed by dynamic_watchlist: **{_wl_last_refresh}**")
     else:
@@ -723,10 +763,10 @@ with tab_traders:
             "dynamic_watchlist.py may not have run yet."
         )
 
-    # ── Watchlist cards (all traders in watchlist_cache.json) ─────────────────
-    wl_traders = sorted(_wl_addrs.keys())
+    # ── Watchlist cards (active top-N traders only) ───────────────────────────
+    wl_traders = sorted(_wl_active.keys())
     if not wl_traders:
-        st.info("No traders in watchlist_cache.json yet.")
+        st.info("No active traders in watchlist_cache.json — bot may not have run a refresh yet.")
     else:
         ncols = min(len(wl_traders), 3)
         cols  = st.columns(ncols)
@@ -805,10 +845,38 @@ with tab_traders:
                     chart["Cumulative PnL ($)"] = chart["Cumulative PnL ($)"].cumsum()
                     st.line_chart(chart, height=150)
 
-    # ── Other Active Traders (in CSV but not watchlist) ───────────────────────
+    # ── Previously watched (inactive / archived traders) ─────────────────────
+    if _wl_inactive:
+        with st.expander(f"Previously watched ({len(_wl_inactive)} archived traders)"):
+            st.caption(
+                "These traders were previously in the top-N watchlist but have since "
+                "been rotated out. Their addresses are kept so open positions can still resolve."
+            )
+            arch_rows = []
+            for trader in sorted(_wl_inactive.keys()):
+                tdf_a    = df[df["trader"] == trader] if not df.empty else pd.DataFrame()
+                res_a    = tdf_a[tdf_a["status"].isin(["WIN", "LOSS"])] if not tdf_a.empty else pd.DataFrame()
+                wins_a   = int((res_a["status"] == "WIN").sum())   if not res_a.empty  else 0
+                losses_a = int((res_a["status"] == "LOSS").sum())  if not res_a.empty  else 0
+                total_a  = wins_a + losses_a
+                pnl_a    = float(res_a["resolved_pnl"].sum())      if not res_a.empty  else 0.0
+                wr_a     = wins_a / total_a * 100                  if total_a          else 0.0
+                pending_a = int((tdf_a["status"] == "PENDING").sum()) if not tdf_a.empty else 0
+                arch_rows.append({
+                    "Trader":        trader,
+                    "Trades":        len(tdf_a),
+                    "Open Positions": pending_a,
+                    "W":             wins_a,
+                    "L":             losses_a,
+                    "Win Rate":      f"{wr_a:.1f}%",
+                    "PnL ($)":       f"${pnl_a:+.2f}",
+                })
+            st.dataframe(pd.DataFrame(arch_rows), use_container_width=True, hide_index=True)
+
+    # ── Other Active Traders (in CSV but not in watchlist cache at all) ───────
     if not df.empty:
-        wl_set       = set(_wl_addrs.keys())
-        csv_traders  = set(df["trader"].dropna().unique())
+        wl_set        = set(_wl_active.keys()) | set(_wl_inactive.keys())
+        csv_traders   = set(df["trader"].dropna().unique())
         other_traders = sorted(csv_traders - wl_set)
 
         if other_traders:

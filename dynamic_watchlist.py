@@ -57,18 +57,26 @@ def _req(url, params=None, retries=3):
 
 class AddressCache:
     """
-    Append-only store of {trader_name: proxyWallet}.
+    Append-only store of {trader_name: {"address": proxyWallet, "active": bool}}.
 
     Entries are written the first time a trader qualifies for the watchlist
     and are never removed. This ensures that:
       - A trader who drops off the leaderboard mid-month can still have their
         open positions resolved by the bot's resolution loop.
       - The bot never loses track of an address it has already acted on.
+
+    Cache format (v2):
+      Each trader entry is a dict: {"address": "0x...", "active": true/false}.
+      The "active" flag is True only for traders in the current top-N selection.
+      Old string-valued entries are migrated to {"address": str, "active": False}
+      on load for backward compatibility.
+
+    Meta keys are prefixed with "_" and stored alongside trader entries.
     """
 
     def __init__(self, path: Path = CACHE_FILE):
         self.path   = path
-        self._data: dict = {}
+        self._data: dict = {}   # name -> {"address": str, "active": bool}
         self._meta: dict = {}
         self._load()
 
@@ -76,9 +84,19 @@ class AddressCache:
         if self.path.exists():
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
-                # Support both old format (flat dict) and new format (with _meta key)
-                self._data = {k: v for k, v in raw.items() if not k.startswith("_")}
                 self._meta = {k: v for k, v in raw.items() if k.startswith("_")}
+                self._data = {}
+                for k, v in raw.items():
+                    if k.startswith("_"):
+                        continue
+                    if isinstance(v, dict):
+                        self._data[k] = {
+                            "address": v.get("address", ""),
+                            "active":  bool(v.get("active", False)),
+                        }
+                    elif isinstance(v, str):
+                        # old flat-string format — treat as inactive until next refresh
+                        self._data[k] = {"address": v, "active": False}
             except Exception:
                 self._data = {}
                 self._meta = {}
@@ -99,18 +117,33 @@ class AddressCache:
     def get_last_successful_refresh(self) -> str:
         return self._meta.get("_last_successful_refresh", "never")
 
+    def set_active_traders(self, active_names: set):
+        """Mark traders in active_names as active=True, all others as active=False."""
+        for name in self._data:
+            self._data[name]["active"] = (name in active_names)
+        self._save()
+
     def update(self, entries: dict):
         """Merge new {name: addr} pairs. Existing entries are never overwritten."""
         changed = False
         for name, addr in entries.items():
             if name not in self._data and addr:
-                self._data[name] = addr
+                self._data[name] = {"address": addr, "active": False}
                 changed = True
         if changed:
             self._save()
 
     def get_all(self) -> dict:
-        return dict(self._data)
+        """Return {name: address} for all cached traders."""
+        return {name: val["address"] for name, val in self._data.items()}
+
+    def get_active(self) -> dict:
+        """Return {name: address} for currently active traders only."""
+        return {
+            name: val["address"]
+            for name, val in self._data.items()
+            if val.get("active", False)
+        }
 
     def __len__(self):
         return len(self._data)
@@ -352,8 +385,9 @@ class WatchlistManager:
 
         new_active = {c["name"]: c["addr"] for c in qualified}
 
-        # Permanent cache update (append-only) + stamp successful refresh time
+        # Permanent cache update (append-only) + mark active/inactive + timestamp
         self.cache.update(new_active)
+        self.cache.set_active_traders(set(new_active.keys()))
         success_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         self.cache.set_last_successful_refresh(success_ts)
         self._last_refresh = time.time()
