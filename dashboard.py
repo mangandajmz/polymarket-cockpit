@@ -29,9 +29,11 @@ _HERE        = Path(__file__).parent
 CSV_PATH     = Path(os.getenv("CSV_PATH", str(_HERE / "paper_trades.csv")))
 LOG_PATH     = Path(os.getenv("LOG_PATH", str(_HERE / "bot.log")))
 REFRESH_MS   = int(os.getenv("REFRESH_MS", "30000"))
-# Prefer DAILY_CAP (new name); fall back to DAILY_BUDGET for VPS .env files
-# that haven't been updated yet.
-DAILY_BUDGET = float(os.getenv("DAILY_CAP") or os.getenv("DAILY_BUDGET") or "60.0")
+# Prefer DAILY_LOSS_CAP (new name); fall back to DAILY_CAP / DAILY_BUDGET for
+# VPS .env files that haven't been updated yet.
+DAILY_LOSS_CAP = float(
+    os.getenv("DAILY_LOSS_CAP") or os.getenv("DAILY_CAP") or os.getenv("DAILY_BUDGET") or "60.0"
+)
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "300.0"))
 BOT_MODE          = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
 MIN_WIN_RATE      = 60.0  # % threshold — must match paper_trading_bot.py
@@ -347,23 +349,28 @@ def compute_stats(df: pd.DataFrame) -> dict:
     avg_loss = float(loss_trades.mean()) if not loss_trades.empty else 0.0
     rr_ratio = abs(avg_win / avg_loss)   if avg_loss != 0         else 0.0
 
+    today_wins  = today_resolved[today_resolved["status"] == "WIN"]
+    today_losses = today_resolved[today_resolved["status"] == "LOSS"]
+
     return {
-        "wins":          wins,
-        "losses":        losses,
-        "win_rate":      win_rate,
-        "all_time_pnl":  float(resolved["resolved_pnl"].sum()),
-        "today_pnl":     float(today_resolved["resolved_pnl"].sum()),
-        "today_spent":   float(today_df["our_size_usdc"].sum()),
-        "total_trades":  len(df),
-        "streak_type":   streak_type,
-        "streak_count":  streak_count,
-        "best_trade":    best_row,
-        "worst_trade":   worst_row,
-        "avg_size":      float(df["our_size_usdc"].mean()) if not df.empty else 0.0,
-        "max_drawdown":  max_drawdown,
-        "avg_win":       avg_win,
-        "avg_loss":      avg_loss,
-        "rr_ratio":      rr_ratio,
+        "wins":              wins,
+        "losses":            losses,
+        "win_rate":          win_rate,
+        "all_time_pnl":      float(resolved["resolved_pnl"].sum()),
+        "today_pnl":         float(today_resolved["resolved_pnl"].sum()),
+        "today_spent":       float(today_df["our_size_usdc"].sum()),
+        "today_gross_wins":  float(today_wins["resolved_pnl"].sum()),
+        "today_gross_losses": float(today_losses["resolved_pnl"].abs().sum()),
+        "total_trades":      len(df),
+        "streak_type":       streak_type,
+        "streak_count":      streak_count,
+        "best_trade":        best_row,
+        "worst_trade":       worst_row,
+        "avg_size":          float(df["our_size_usdc"].mean()) if not df.empty else 0.0,
+        "max_drawdown":      max_drawdown,
+        "avg_win":           avg_win,
+        "avg_loss":          avg_loss,
+        "rr_ratio":          rr_ratio,
     }
 
 
@@ -461,7 +468,9 @@ def parse_log_activity(n_lines: int = 200) -> list[dict]:
 df    = load_trades()
 stats = compute_stats(df) if not df.empty else {
     "wins": 0, "losses": 0, "win_rate": 0, "all_time_pnl": 0,
-    "today_pnl": 0, "today_spent": 0, "total_trades": 0,
+    "today_pnl": 0, "today_spent": 0,
+    "today_gross_wins": 0, "today_gross_losses": 0,
+    "total_trades": 0,
     "streak_type": "—", "streak_count": 0,
     "best_trade": None, "worst_trade": None, "avg_size": 0,
     "max_drawdown": 0, "avg_win": 0, "avg_loss": 0, "rr_ratio": 0,
@@ -545,16 +554,20 @@ with tab_ov:
         st.caption(f"{stats['wins']} wins / {stats['losses']} losses")
 
     with budget_col:
-        st.subheader("Daily Budget")
-        today_spent     = stats["today_spent"] or 0.0
-        today_remaining = max(0.0, DAILY_BUDGET - today_spent)
-        budget_pct      = min(today_spent / DAILY_BUDGET, 1.0) if DAILY_BUDGET else 0.0
+        st.subheader("Daily Risk")
+        gross_wins   = stats["today_gross_wins"]  or 0.0
+        gross_losses = stats["today_gross_losses"] or 0.0
+        net_loss     = gross_losses - gross_wins
+        loss_pct     = min(net_loss / DAILY_LOSS_CAP, 1.0) if DAILY_LOSS_CAP else 0.0
         b1, b2 = st.columns([4, 1])
         with b1:
-            st.progress(budget_pct)
+            st.progress(max(loss_pct, 0.0))
         with b2:
-            st.write(f"Used **${today_spent:.2f}**")
-        st.caption(f"${today_remaining:.2f} remaining of ${DAILY_BUDGET:.0f} daily budget")
+            st.write(f"Net **${net_loss:+.2f}**")
+        st.caption(
+            f"${gross_losses:.2f} losses − ${gross_wins:.2f} wins = "
+            f"${net_loss:.2f} net  (cap ${DAILY_LOSS_CAP:.0f})"
+        )
 
     st.divider()
 
@@ -1192,23 +1205,21 @@ with tab_risk:
     burn_col, dist_col = st.columns(2)
 
     with burn_col:
-        st.markdown("**Daily Budget Burn Rate**")
-        today_spent = stats["today_spent"] or 0.0
-
-        if not df.empty and df["timestamp"].notna().any():
-            first_trade  = df["timestamp"].min()
-            days_active  = max(1, (now_utc - first_trade).days)
-            avg_daily    = float(df["our_size_usdc"].sum()) / days_active
-        else:
-            avg_daily = 0.0
+        st.markdown("**Daily Net Loss**")
+        gross_wins   = stats["today_gross_wins"]  or 0.0
+        gross_losses = stats["today_gross_losses"] or 0.0
+        net_loss     = gross_losses - gross_wins
+        cap_remaining = max(0.0, DAILY_LOSS_CAP - net_loss)
 
         d1, d2 = st.columns(2)
-        d1.metric("Avg Daily Spend",   f"${avg_daily:.2f}")
-        d2.metric("Today's Spend",     f"${today_spent:.2f}")
-        remaining = max(0.0, DAILY_BUDGET - today_spent)
-        budget_pct = min(today_spent / DAILY_BUDGET, 1.0) if DAILY_BUDGET else 0.0
-        st.progress(budget_pct)
-        st.caption(f"${remaining:.2f} remaining · ${DAILY_BUDGET:.0f} daily limit")
+        d1.metric("Today's Losses",  f"${gross_losses:.2f}")
+        d2.metric("Today's Wins",    f"${gross_wins:.2f}")
+        loss_pct = min(max(net_loss, 0.0) / DAILY_LOSS_CAP, 1.0) if DAILY_LOSS_CAP else 0.0
+        st.progress(loss_pct)
+        st.caption(
+            f"Net loss ${net_loss:.2f} · ${cap_remaining:.2f} headroom · "
+            f"${DAILY_LOSS_CAP:.0f} daily loss cap"
+        )
 
     with dist_col:
         st.markdown("**Trade Size Distribution**")

@@ -59,7 +59,7 @@ All values are set at the top of `paper_trading_bot.py`.
 | `MIN_WHALE_SIZE` | `1000.0` | Minimum USDC size of a whale trade to copy |
 | `BASE_BET` | `10.0` | Base bet size in USD; scales with conviction |
 | `MAX_BET` | `30.0` | Hard cap on a single trade in USD |
-| `DAILY_CAP` | `60.0` | Maximum simulated USD to spend per calendar day |
+| `DAILY_LOSS_CAP` | `60.0` | Maximum net loss (gross losses − gross wins) per calendar day before new trades are blocked |
 | `STARTING_BANKROLL` | `300.0` | Starting bankroll used for bankroll scaling calculations |
 | `MAX_DAILY_LOSSES_PER_TRADER` | `2` | Max resolved losses from one trader per day before skipping them |
 | `COPY_RATIO` | `0.10` | Legacy ratio (not used for sizing; kept for reference) |
@@ -75,7 +75,7 @@ All values are set at the top of `paper_trading_bot.py`.
 
 As the simulated bankroll grows, bet sizing should grow proportionally. The bot uses a semi-automatic scaling system — when `STARTING_BANKROLL + closed_pnl` crosses a threshold for the first time, the bot prints a prompt in the terminal and waits for confirmation before applying the new settings.
 
-| Bankroll | BASE_BET | MAX_BET | DAILY_CAP |
+| Bankroll | BASE_BET | MAX_BET | DAILY_LOSS_CAP |
 |---|---|---|---|
 | $150 | $5 | $15 | $30 |
 | $300 | $10 | $30 | $60 |
@@ -87,7 +87,7 @@ As the simulated bankroll grows, bet sizing should grow proportionally. The bot 
 - After every resolved trade, `_check_bankroll_scale()` evaluates the current bankroll.
 - If a threshold is crossed for the first time this session, the bot logs `SCALE UP AVAILABLE` to `bot.log` and prints the suggested config.
 - You see: `Apply new scaling? (y/n):`
-- Press `y` to apply immediately (updates `BASE_BET`, `MAX_BET`, `DAILY_CAP` in memory).
+- Press `y` to apply immediately (updates `BASE_BET`, `MAX_BET`, `DAILY_LOSS_CAP` in memory).
 - Press `n` to decline — that threshold will not prompt again this session.
 - Each threshold only prompts once per session (`bot.milestones_reached` tracks this).
 
@@ -105,8 +105,8 @@ Only copy trades where the whale committed at least $1,000 USDC. This filters ou
 ### 2. Per-trader daily loss limit (`MAX_DAILY_LOSSES_PER_TRADER = 2`)
 If a specific whale has already produced 2 resolved losses for us today, all further trades from that trader are skipped until midnight UTC. This prevents the bot from following a trader through a bad day — when a whale is on a losing streak, continuing to copy them compounds losses faster than the sizing system can compensate.
 
-### 3. Daily cap (`DAILY_CAP = $60`)
-The total amount spent on copy trades resets to zero at midnight UTC. Once $60 has been spent today, all new trades are skipped regardless of conviction score. This sets a hard ceiling on daily drawdown, ensuring a single volatile session cannot exceed a predictable amount.
+### 3. Daily net loss cap (`DAILY_LOSS_CAP = $60`)
+The bot tracks today's gross losses and gross wins from resolved trades. When `gross_losses − gross_wins >= DAILY_LOSS_CAP`, all new trades are blocked until midnight UTC. The key difference from a spend cap: **winning trades reduce the effective cap usage**. On a profitable day the bot can keep placing trades even if gross losses alone exceed $60, as long as wins are offsetting them. Both counters reset at midnight UTC and are restored from the CSV on restart so the cap survives bot restarts.
 
 ---
 
@@ -130,11 +130,11 @@ Before switching from paper trading to real money:
 
 - [ ] **Conviction median is stable**: Check that `bot.whale_sizes` has at least 30 entries (visible in bot logs). The median needs enough history to be meaningful, otherwise early trades use a single-sample median which inflates conviction scores.
 - [ ] **Set `STARTING_BANKROLL`** to your actual deposit amount in USDC.
-- [ ] **Verify `DAILY_CAP`** is 15–20% of your bankroll. At $300 bankroll the default $60 cap is 20%. Adjust down if you prefer slower drawdown.
+- [ ] **Verify `DAILY_LOSS_CAP`** is 15–20% of your bankroll. At $300 bankroll the default $60 cap is 20%. Adjust down if you prefer slower drawdown.
 - [ ] **Run paper mode for ≥ 48 hours** and review `paper_trades.csv` — check that all whale sizes are above $1,000, conviction scores look reasonable (0.5–3.0 range is normal), and no single trader is dominating losses.
 - [ ] **Audit the last 20 resolved trades** for market quality — are they politics/sports/finance or noise? Tighten `CRYPTO_KW` if unexpected market types are slipping through.
 - [ ] **Connect wallet and set `LIVE_MODE = True`** on the `live` branch only. Never merge live-mode code to `main`.
-- [ ] Start with `DAILY_CAP` at 50% of the paper-mode value for the first 48 hours live.
+- [ ] Start with `DAILY_LOSS_CAP` at 50% of the paper-mode value for the first 48 hours live.
 
 ---
 
@@ -193,7 +193,7 @@ Set at minimum:
 DASHBOARD_PASSWORD=your_strong_password_here
 CSV_PATH=/home/ubuntu/polymarket-bot/paper_trades.csv
 LOG_PATH=/home/ubuntu/polymarket-bot/bot.log
-DAILY_CAP=60.0
+DAILY_LOSS_CAP=60.0
 STARTING_BANKROLL=300.0
 BOT_MODE=PAPER
 ```

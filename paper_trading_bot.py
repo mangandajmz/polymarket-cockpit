@@ -34,7 +34,7 @@ DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
 CLOB_API         = "https://clob.polymarket.com"
 COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used for sizing)
-DAILY_CAP              = 60.0   # max simulated USD to spend per calendar day
+DAILY_LOSS_CAP         = 60.0   # max net loss (losses minus wins) per calendar day before halting new trades
 BASE_BET               = 10.0   # base bet size in USD
 MAX_BET                = 30.0   # maximum bet size per trade in USD
 STARTING_BANKROLL      = 300.0  # starting simulated bankroll in USD
@@ -60,13 +60,13 @@ WATCHLIST_REFRESH_H       = 6      # hours between dynamic watchlist refreshes
 # trade signals. The current Phase 1 settings are conservative for a small bankroll.
 PHASE2_BANKROLL_THRESHOLD = 500.0
 
-# Bankroll scaling thresholds: (min_bankroll, {BASE_BET, MAX_BET, DAILY_CAP})
+# Bankroll scaling thresholds: (min_bankroll, {BASE_BET, MAX_BET, DAILY_LOSS_CAP})
 BANKROLL_SCALE_STEPS = [
-    (150,  {"BASE_BET":  5, "MAX_BET":  15, "DAILY_CAP":  30}),
-    (300,  {"BASE_BET": 10, "MAX_BET":  30, "DAILY_CAP":  60}),
-    (500,  {"BASE_BET": 15, "MAX_BET":  50, "DAILY_CAP": 100}),
-    (1000, {"BASE_BET": 25, "MAX_BET": 100, "DAILY_CAP": 200}),
-    (2500, {"BASE_BET": 40, "MAX_BET": 150, "DAILY_CAP": 300}),
+    (150,  {"BASE_BET":  5, "MAX_BET":  15, "DAILY_LOSS_CAP":  30}),
+    (300,  {"BASE_BET": 10, "MAX_BET":  30, "DAILY_LOSS_CAP":  60}),
+    (500,  {"BASE_BET": 15, "MAX_BET":  50, "DAILY_LOSS_CAP": 100}),
+    (1000, {"BASE_BET": 25, "MAX_BET": 100, "DAILY_LOSS_CAP": 200}),
+    (2500, {"BASE_BET": 40, "MAX_BET": 150, "DAILY_LOSS_CAP": 300}),
 ]
 
 # Legacy static list — only used when USE_DYNAMIC_WATCHLIST = False
@@ -94,7 +94,8 @@ class PaperBot:
         self.seen_hashes        = set()     # processed tx hashes
         self.positions          = {}        # (cond_id, oidx) → position dict
         self.trade_log          = []        # list of trade record dicts
-        self._daily_used        = 0.0
+        self.daily_losses       = 0.0      # gross losses today (sum of abs negative pnl)
+        self.daily_wins         = 0.0      # gross wins today (sum of positive pnl)
         self._budget_date       = date.today()
         self.closed_pnl         = 0.0      # realised PnL only
         self.wins               = 0
@@ -111,14 +112,15 @@ class PaperBot:
     def _refresh_budget(self):
         today = date.today()
         if today != self._budget_date:
-            self._daily_used             = 0.0
+            self.daily_losses            = 0.0
+            self.daily_wins              = 0.0
             self._budget_date            = today
             self.daily_losses_per_trader = {}
 
     @property
-    def daily_remaining(self):
-        self._refresh_budget()
-        return max(0.0, DAILY_CAP - self._daily_used)
+    def daily_net_loss(self):
+        """Net loss today = gross losses - gross wins. Positive means we're down money."""
+        return self.daily_losses - self.daily_wins
 
     @property
     def win_rate(self):
@@ -244,7 +246,7 @@ def init_csv():
 
 
 def load_positions_from_csv(bot: PaperBot):
-    """Reload open positions, closed PnL, today's spend, and whale sizes from CSV on restart."""
+    """Reload open positions, closed PnL, today's net loss state, and whale sizes from CSV on restart."""
     if not CSV_FILE.exists():
         return
     today_prefix  = date.today().isoformat()   # "YYYY-MM-DD" — matches CSV timestamp prefix
@@ -254,11 +256,14 @@ def load_positions_from_csv(bot: PaperBot):
             for row in csv.DictReader(f):
                 status = row.get("status")
 
-                # Restore today's cumulative spend so daily cap survives restarts.
-                # Every row whose timestamp starts with today's date counts, regardless
-                # of status — we spent that money whether the trade won, lost, or is open.
-                if row.get("timestamp", "").startswith(today_prefix):
-                    bot._daily_used += float(row.get("our_size_usdc", 0) or 0)
+                # Restore today's daily_losses and daily_wins from resolved trades so the
+                # net loss cap survives bot restarts correctly.
+                if row.get("timestamp", "").startswith(today_prefix) and status in ("WIN", "LOSS"):
+                    pnl = float(row.get("resolved_pnl", 0) or 0)
+                    if status == "WIN":
+                        bot.daily_wins += pnl
+                    else:
+                        bot.daily_losses += abs(pnl)
 
                 # Accumulate whale sizes across all rows so conviction median is
                 # warm on restart rather than starting cold from a single trade.
@@ -395,14 +400,19 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         conviction  = round(usdc / max(median_size, 0.01), 4)
 
         bot._refresh_budget()
-        remaining = bot.daily_remaining
-        if remaining < 0.01:
-            bot.status_msg = f"Budget exhausted — skipped: {title[:30]}"
+        net_loss = bot.daily_losses - bot.daily_wins
+        if net_loss >= DAILY_LOSS_CAP:
+            msg = (
+                f"Daily net loss cap reached "
+                f"(${bot.daily_losses:.2f} losses - ${bot.daily_wins:.2f} wins = "
+                f"${net_loss:.2f} net). No new trades until midnight UTC."
+            )
+            _log(msg)
+            bot.status_msg = msg
             return
 
-        copy_usdc   = min(BASE_BET * conviction, MAX_BET, remaining)
+        copy_usdc   = min(BASE_BET * conviction, MAX_BET)
         copy_shares = copy_usdc / max(px, 0.001)
-        bot._daily_used += copy_usdc
 
         pos_key = (cid, oidx)
         if pos_key not in bot.positions:
@@ -507,7 +517,7 @@ def _init_milestones(bot: PaperBot):
 
 def _check_bankroll_scale(bot: PaperBot):
     """After each resolved trade, check if bankroll has crossed a scaling threshold."""
-    global BASE_BET, MAX_BET, DAILY_CAP
+    global BASE_BET, MAX_BET, DAILY_LOSS_CAP
     bankroll = STARTING_BANKROLL + bot.closed_pnl
     for threshold, cfg in BANKROLL_SCALE_STEPS:
         if bankroll >= threshold and threshold not in bot.milestones_reached:
@@ -517,21 +527,21 @@ def _check_bankroll_scale(bot: PaperBot):
             )
             _log(
                 f"  Suggested config: BASE_BET={cfg['BASE_BET']}, "
-                f"MAX_BET={cfg['MAX_BET']}, DAILY_CAP={cfg['DAILY_CAP']}"
+                f"MAX_BET={cfg['MAX_BET']}, DAILY_LOSS_CAP={cfg['DAILY_LOSS_CAP']}"
             )
             try:
                 print(
                     f"\n[SCALE UP] Bankroll ${bankroll:.2f} crossed ${threshold} threshold.\n"
                     f"  Suggested: BASE_BET={cfg['BASE_BET']}, "
-                    f"MAX_BET={cfg['MAX_BET']}, DAILY_CAP={cfg['DAILY_CAP']}"
+                    f"MAX_BET={cfg['MAX_BET']}, DAILY_LOSS_CAP={cfg['DAILY_LOSS_CAP']}"
                 )
                 answer = input("Apply new scaling? (y/n): ").strip().lower()
             except EOFError:
                 answer = "n"
             if answer == "y":
-                BASE_BET  = cfg["BASE_BET"]
-                MAX_BET   = cfg["MAX_BET"]
-                DAILY_CAP = cfg["DAILY_CAP"]
+                BASE_BET       = cfg["BASE_BET"]
+                MAX_BET        = cfg["MAX_BET"]
+                DAILY_LOSS_CAP = cfg["DAILY_LOSS_CAP"]
                 _log("Scaling applied.")
                 print("Scaling applied.")
             else:
@@ -584,8 +594,10 @@ def resolution_loop(bot: PaperBot):
                     bot.closed_pnl += pnl
                     if pnl >= 0:
                         bot.wins += 1
+                        bot.daily_wins += pnl          # accumulate today's gross wins
                     else:
                         bot.losses += 1
+                        bot.daily_losses += abs(pnl)   # accumulate today's gross losses
                     # Update per-trader stats
                     trader_name = pos.get("trader", "unknown")
                     s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
@@ -644,7 +656,7 @@ def make_header(bot: PaperBot) -> Panel:
     grid.add_row(
         f"[bold {pnl_col}]Simul. PnL   ${bot.total_pnl:+,.2f}[/]",
         f"[bold]Win Rate  {bot.win_rate:.1f}%  ({bot.wins}W / {bot.losses}L)[/]",
-        f"[bold]Budget  used ${bot._daily_used:.2f}  /  left ${bot.daily_remaining:.2f}[/]",
+        f"[bold]Net loss today ${bot.daily_net_loss:+.2f}  /  cap ${DAILY_LOSS_CAP:.0f}[/]",
     )
     grid.add_row(
         f"[{ur_col}]Unrealised   ${bot.unrealised_pnl:+,.2f}[/]",
@@ -790,8 +802,8 @@ def print_plain_dashboard(bot: PaperBot):
           f"(unrealised: ${bot.unrealised_pnl:+,.2f})")
     print(f"  Win Rate       : {bot.win_rate:.1f}%  "
           f"({bot.wins}W / {bot.losses}L)")
-    print(f"  Daily Budget   : ${bot._daily_used:.2f} used  /  "
-          f"${bot.daily_remaining:.2f} remaining")
+    print(f"  Daily Net Loss : ${bot.daily_losses:.2f} losses - ${bot.daily_wins:.2f} wins = "
+          f"${bot.daily_net_loss:+.2f}  (cap ${DAILY_LOSS_CAP:.0f})")
     print(f"  Open Positions : {len(bot.open_positions)}")
     print()
 
@@ -840,7 +852,7 @@ def main():
         print(f"  Watchlist  : dynamic top {WATCHLIST_TOP_N} (min WR {WATCHLIST_MIN_WR:.0f}%, 6h refresh)")
     else:
         print(f"  Copying    : {', '.join(TRADERS_TO_COPY)}  [static list]")
-    print(f"  Sizing     : base ${BASE_BET} / max ${MAX_BET}  |  Daily cap: ${DAILY_CAP}  |  Min whale: ${MIN_WHALE_SIZE}")
+    print(f"  Sizing     : base ${BASE_BET} / max ${MAX_BET}  |  Daily loss cap: ${DAILY_LOSS_CAP}  |  Min whale: ${MIN_WHALE_SIZE}")
     print(f"  Poll cycle : every {POLL_INTERVAL}s  |  Max trade age: {MAX_TRADE_AGE}s")
     print(f"  Trade log  : {CSV_FILE.resolve()}")
     print()
