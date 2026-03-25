@@ -32,6 +32,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
+CLOB_API         = "https://clob.polymarket.com"
 COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used for sizing)
 DAILY_CAP              = 60.0   # max simulated USD to spend per calendar day
 BASE_BET               = 10.0   # base bet size in USD
@@ -453,67 +454,33 @@ def get_price_resolved(cid: str, oidx: int):
     """
     Returns (current_price, is_resolved) for a market outcome.
 
-    KEY FINDINGS from live API testing against gamma-api.polymarket.com:
+    Uses the CLOB API (https://clob.polymarket.com/markets/{cid}) which returns
+    the correct market directly by condition ID.  The Gamma API condition_ids
+    filter was unreliable — it ignored the filter and returned unrelated markets.
 
-    1. The 'resolved' field is always None — never True/False.
-       bool(None) == False, so the original check 'if resolved:' NEVER fired.
-       The correct resolution signal is 'closed: True'.
-
-    2. 'condition_ids' (snake_case) IS the correct query parameter — confirmed
-       by comparing the returned conditionId against the queried one.
-
-    3. A closed market is truly SETTLED when at least one outcomePrices entry
-       is >= 0.99 (i.e. a clear winner has emerged). Markets that are closed
-       but still pending resolution show mid-range or all-zero prices.
-
-    4. We find the matching market in the response list by conditionId field
-       rather than blindly taking index 0, guarding against any ordering
-       changes in the API response.
+    Resolution signal:
+      - closed == True  AND  tokens[oidx]['winner'] == True
+    Price:
+      - tokens[oidx]['price']
     """
-    data = get(f"{GAMMA_API}/markets", {"condition_ids": cid})
+    data = get(f"{CLOB_API}/markets/{cid}")
     if not data:
         return None, False
 
-    if isinstance(data, list):
-        # Find the market that matches our condition ID exactly
-        m = next(
-            (item for item in data if item.get("conditionId") == cid),
-            data[0]  # fall back to first item if conditionId field name differs
-        )
-    else:
-        m = data
+    tokens = data.get("tokens")
+    if not tokens or oidx >= len(tokens):
+        return None, False
 
-    closed = bool(m.get("closed", False))
-    prices_raw = m.get("outcomePrices", "[]")
+    token = tokens[oidx]
 
-    # Parse stringified JSON arrays (API returns them as JSON strings)
-    if isinstance(prices_raw, str):
-        try:
-            prices = json.loads(prices_raw)
-        except Exception:
-            prices = []
-    else:
-        prices = prices_raw or []
-
-    # Get this outcome's current price
     try:
-        px = float(prices[oidx])
-    except (IndexError, TypeError, ValueError):
+        px = float(token.get("price", 0))
+    except (TypeError, ValueError):
         px = None
 
-    # A market is truly SETTLED when:
-    #   - closed == True  (trading has stopped), AND
-    #   - at least one outcome price >= 0.99  (a clear winner is priced in)
-    # Markets that closed but haven't resolved yet (pending arbitration, etc.)
-    # show mid-range or all-zero prices, which we correctly leave as OPEN.
-    is_resolved = False
-    if closed and prices:
-        try:
-            float_prices = [float(p) for p in prices]
-            if max(float_prices) >= 0.99:
-                is_resolved = True
-        except (ValueError, TypeError):
-            pass
+    closed      = bool(data.get("closed", False))
+    is_winner   = bool(token.get("winner", False))
+    is_resolved = closed and is_winner
 
     return px, is_resolved
 
