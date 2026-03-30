@@ -47,6 +47,8 @@ MIN_TRADES_FOR_CUTOFF        = 10  # min resolved trades before applying win-rat
 MIN_WIN_RATE                 = 60.0  # % — stop copying a trader below this threshold (matches watchlist qualification threshold)
 MAX_DAILY_LOSSES_PER_TRADER  = 2   # max losses from one trader per calendar day before skipping
 STALE_POSITION_DAYS    = 30     # flag positions open longer than this
+ZERO_PRICE_CLOSE_HOURS = 24     # force-close unresolved position if price ≈$0 longer than this
+MAX_OPEN_HOURS         = 72     # force-close any unresolved position open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 
 # ── Dynamic watchlist config ───────────────────────────────────────────────────
@@ -626,7 +628,53 @@ def resolution_loop(bot: PaperBot):
                             rec["status"]       = pos["status"]
                             rec["resolved_pnl"] = f"{pnl:+.4f}"
                 else:
-                    pos["pnl"] = pos["total_shares"] * px - pos["total_cost"]
+                    age_hours = age_days * 24
+
+                    # Force-close: price stuck at ~$0 (market likely resolved against us)
+                    force_zero = px < 0.001 and age_hours > ZERO_PRICE_CLOSE_HOURS
+                    # Force-close: position open beyond max allowed duration
+                    force_age  = age_hours > MAX_OPEN_HOURS
+
+                    if force_zero or force_age:
+                        close_px   = px if px >= 0.001 else 0.0
+                        proceeds   = pos["total_shares"] * close_px
+                        pnl        = proceeds - pos["total_cost"]
+                        result_tag = "WIN" if pnl >= 0 else "LOSS"
+                        reason     = "ZERO-PRICE" if force_zero else "MAX-AGE"
+                        pos["pnl"]    = pnl
+                        pos["status"] = result_tag
+                        bot.closed_pnl += pnl
+                        if pnl >= 0:
+                            bot.wins       += 1
+                            bot.daily_wins += pnl
+                        else:
+                            bot.losses       += 1
+                            bot.daily_losses += abs(pnl)
+                        trader_name = pos.get("trader", "unknown")
+                        s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
+                        if pnl >= 0:
+                            s["wins"] += 1
+                        else:
+                            s["losses"] += 1
+                            bot.daily_losses_per_trader[trader_name] = (
+                                bot.daily_losses_per_trader.get(trader_name, 0) + 1
+                            )
+                        bot.status_msg = (
+                            f"[{reason}] {pos['title'][:30]} | "
+                            f"open {age_hours:.0f}h — forced {result_tag} ${pnl:+.2f}"
+                        )
+                        _log(
+                            f"  [{reason}] {cid[:20]}… oidx={oidx} open {age_hours:.0f}h "
+                            f"px={close_px:.4f} — forced close as {result_tag} pnl={pnl:+.4f}"
+                        )
+                        update_csv_status(cid, oidx, result_tag, pnl)
+                        _check_bankroll_scale(bot)
+                        for rec in bot.trade_log:
+                            if rec.get("condition_id") == cid and rec.get("outcome_index") == str(oidx):
+                                rec["status"]       = result_tag
+                                rec["resolved_pnl"] = f"{pnl:+.4f}"
+                    else:
+                        pos["pnl"] = pos["total_shares"] * px - pos["total_cost"]
             time.sleep(0.15)
 
 
