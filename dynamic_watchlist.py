@@ -182,7 +182,7 @@ def _estimate_win_rate(address: str, sample: int = _WR_SAMPLE) -> float:
     })
     for trade in data:
         side   = trade.get("side", "").upper()
-        usdc   = float(trade.get("size", 0))
+        usdc   = float(trade.get("usdcSize") or trade.get("size") or 0)
         price  = float(trade.get("price", 0.001))
         shares = usdc / max(price, 0.001)
         cid    = trade.get("conditionId", "")

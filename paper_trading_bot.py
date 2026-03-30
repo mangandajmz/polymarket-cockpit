@@ -353,7 +353,7 @@ def is_crypto(title: str) -> bool:
 def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     tx      = trade.get("transactionHash", "")
     side    = trade.get("side", "").upper()
-    usdc    = float(trade.get("usdcSize", 0))
+    usdc    = float(trade.get("usdcSize") or trade.get("size") or 0)
     px      = float(trade.get("price", 0.001))
     cid     = trade.get("conditionId", "")
     oidx    = int(trade.get("outcomeIndex", 0))
