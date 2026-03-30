@@ -292,13 +292,20 @@ def load_positions_from_csv(bot: PaperBot):
                 price   = float(row.get("price", 0.001) or 0.001)
                 shares  = float(row.get("copy_shares", 0) or 0)
                 if pos_key not in bot.positions:
+                    ts_str = row.get("timestamp", "")
+                    try:
+                        opened_at = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=timezone.utc
+                        ).timestamp()
+                    except (ValueError, TypeError):
+                        opened_at = time.time()
                     bot.positions[pos_key] = {
                         "condition_id":  cid,
                         "outcome_index": oidx,
                         "title":         row.get("market", cid[:30]),
                         "outcome":       row.get("outcome", str(oidx)),
                         "trader":        row.get("trader", "unknown"),
-                        "opened_at":     time.time(),   # approx; exact age not critical
+                        "opened_at":     opened_at,
                         "total_cost":    0.0,
                         "total_shares":  0.0,
                         "status":        "OPEN",
