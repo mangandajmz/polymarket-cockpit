@@ -253,19 +253,27 @@ def load_positions_from_csv(bot: PaperBot):
         return
     today_prefix  = date.today().isoformat()   # "YYYY-MM-DD" — matches CSV timestamp prefix
     whale_records = []  # (timestamp_str, whale_size_usdc) for restoring conviction median
+    # resolved_pnl is stamped identically on every row that shares a (cid, oidx) position.
+    # Without deduplication, each multi-row position inflates closed_pnl and win/loss counts.
+    seen_resolved = set()  # (cid, oidx) — count each resolved position only once
+    seen_today    = set()  # (cid, oidx) — same dedup for today's daily budget restoration
     try:
         with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                status = row.get("status")
+                status  = row.get("status")
+                cid     = row.get("condition_id", "")
+                oidx    = int(row.get("outcome_index", 0))
+                pos_key = (cid, oidx)
 
-                # Restore today's daily_losses and daily_wins from resolved trades so the
-                # net loss cap survives bot restarts correctly.
+                # Restore today's daily_losses and daily_wins — one per position
                 if row.get("timestamp", "").startswith(today_prefix) and status in ("WIN", "LOSS"):
-                    pnl = float(row.get("resolved_pnl", 0) or 0)
-                    if status == "WIN":
-                        bot.daily_wins += pnl
-                    else:
-                        bot.daily_losses += abs(pnl)
+                    if pos_key not in seen_today:
+                        seen_today.add(pos_key)
+                        pnl = float(row.get("resolved_pnl", 0) or 0)
+                        if status == "WIN":
+                            bot.daily_wins += pnl
+                        else:
+                            bot.daily_losses += abs(pnl)
 
                 # Accumulate whale sizes across all rows so conviction median is
                 # warm on restart rather than starting cold from a single trade.
@@ -273,21 +281,20 @@ def load_positions_from_csv(bot: PaperBot):
                 if ws > 0:
                     whale_records.append((row.get("timestamp", ""), ws))
 
-                # Restore closed PnL and win/loss counts from resolved trades
+                # Restore closed PnL and win/loss counts — one per position
                 if status in ("WIN", "LOSS"):
-                    pnl = float(row.get("resolved_pnl", 0) or 0)
-                    bot.closed_pnl += pnl
-                    if pnl >= 0:
-                        bot.wins += 1
-                    else:
-                        bot.losses += 1
+                    if pos_key not in seen_resolved:
+                        seen_resolved.add(pos_key)
+                        pnl = float(row.get("resolved_pnl", 0) or 0)
+                        bot.closed_pnl += pnl
+                        if pnl >= 0:
+                            bot.wins += 1
+                        else:
+                            bot.losses += 1
                 if status not in ("PENDING", "OPEN"):
                     continue
-                cid  = row.get("condition_id", "")
-                oidx = int(row.get("outcome_index", 0))
                 if not cid:
                     continue
-                pos_key = (cid, oidx)
                 cost    = float(row.get("our_size_usdc", 0) or 0)
                 price   = float(row.get("price", 0.001) or 0.001)
                 shares  = float(row.get("copy_shares", 0) or 0)

@@ -317,50 +317,70 @@ def compute_streak(resolved: pd.DataFrame) -> tuple[str, int]:
     return last, count
 
 
-def compute_stats(df: pd.DataFrame) -> dict:
+def positions_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return one row per resolved position, deduped by (condition_id, outcome_index).
+
+    The bot stamps the total position PnL identically on every CSV row that
+    belongs to the same (condition_id, outcome_index) position.  Summing or
+    counting raw rows inflates all PnL totals and win/loss counts by the number
+    of rows per position.  Use this helper wherever wins, losses, or
+    resolved_pnl are aggregated — never operate on the raw resolved rows directly.
+    """
     resolved = df[df["status"].isin(["WIN", "LOSS"])]
-    wins   = int((resolved["status"] == "WIN").sum())
-    losses = int((resolved["status"] == "LOSS").sum())
+    if resolved.empty:
+        return resolved
+    return (
+        resolved
+        .sort_values("timestamp")
+        .groupby(["condition_id", "outcome_index"], as_index=False)
+        .first()
+    )
+
+
+def compute_stats(df: pd.DataFrame) -> dict:
+    pos    = positions_df(df)          # one row per resolved position
+    wins   = int((pos["status"] == "WIN").sum())
+    losses = int((pos["status"] == "LOSS").sum())
     total  = wins + losses
     win_rate = wins / total * 100 if total else 0.0
 
-    today_df       = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
-    today_resolved = today_df[today_df["status"].isin(["WIN", "LOSS"])]
+    today_df  = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
+    today_pos = positions_df(today_df)
 
-    # Best / worst trade
-    best_row  = resolved.loc[resolved["resolved_pnl"].idxmax()] if not resolved.empty else None
-    worst_row = resolved.loc[resolved["resolved_pnl"].idxmin()] if not resolved.empty else None
+    # Best / worst trade (position-level)
+    best_row  = pos.loc[pos["resolved_pnl"].idxmax()] if not pos.empty else None
+    worst_row = pos.loc[pos["resolved_pnl"].idxmin()] if not pos.empty else None
 
     # Streak
-    streak_type, streak_count = compute_streak(resolved)
+    streak_type, streak_count = compute_streak(pos)
 
     # Max drawdown
-    if not resolved.empty:
-        cum_pnl     = resolved.sort_values("timestamp")["resolved_pnl"].cumsum()
+    if not pos.empty:
+        cum_pnl     = pos.sort_values("timestamp")["resolved_pnl"].cumsum()
         running_max = cum_pnl.cummax()
         max_drawdown = float((cum_pnl - running_max).min())
     else:
         max_drawdown = 0.0
 
     # Avg win / loss / risk-reward
-    win_trades  = resolved[resolved["status"] == "WIN"]["resolved_pnl"]
-    loss_trades = resolved[resolved["status"] == "LOSS"]["resolved_pnl"]
+    win_trades  = pos[pos["status"] == "WIN"]["resolved_pnl"]
+    loss_trades = pos[pos["status"] == "LOSS"]["resolved_pnl"]
     avg_win  = float(win_trades.mean())  if not win_trades.empty  else 0.0
     avg_loss = float(loss_trades.mean()) if not loss_trades.empty else 0.0
     rr_ratio = abs(avg_win / avg_loss)   if avg_loss != 0         else 0.0
 
-    today_wins  = today_resolved[today_resolved["status"] == "WIN"]
-    today_losses = today_resolved[today_resolved["status"] == "LOSS"]
+    today_wins_pos   = today_pos[today_pos["status"] == "WIN"]
+    today_losses_pos = today_pos[today_pos["status"] == "LOSS"]
 
     return {
         "wins":              wins,
         "losses":            losses,
         "win_rate":          win_rate,
-        "all_time_pnl":      float(resolved["resolved_pnl"].sum()),
-        "today_pnl":         float(today_resolved["resolved_pnl"].sum()),
+        "all_time_pnl":      float(pos["resolved_pnl"].sum()),
+        "today_pnl":         float(today_pos["resolved_pnl"].sum()),
         "today_spent":       float(today_df["our_size_usdc"].sum()),
-        "today_gross_wins":  float(today_wins["resolved_pnl"].sum()),
-        "today_gross_losses": float(today_losses["resolved_pnl"].abs().sum()),
+        "today_gross_wins":  float(today_wins_pos["resolved_pnl"].sum()),
+        "today_gross_losses": float(today_losses_pos["resolved_pnl"].abs().sum()),
         "total_trades":      len(df),
         "streak_type":       streak_type,
         "streak_count":      streak_count,
@@ -785,7 +805,7 @@ with tab_traders:
         cols  = st.columns(ncols)
         for i, trader in enumerate(wl_traders):
             tdf      = df[df["trader"] == trader].copy() if not df.empty else pd.DataFrame()
-            resolved = tdf[tdf["status"].isin(["WIN", "LOSS"])] if not tdf.empty else pd.DataFrame()
+            resolved = positions_df(tdf) if not tdf.empty else pd.DataFrame()
 
             wins_t   = int((resolved["status"] == "WIN").sum())  if not resolved.empty else 0
             losses_t = int((resolved["status"] == "LOSS").sum()) if not resolved.empty else 0
@@ -868,7 +888,7 @@ with tab_traders:
             arch_rows = []
             for trader in sorted(_wl_inactive.keys()):
                 tdf_a    = df[df["trader"] == trader] if not df.empty else pd.DataFrame()
-                res_a    = tdf_a[tdf_a["status"].isin(["WIN", "LOSS"])] if not tdf_a.empty else pd.DataFrame()
+                res_a    = positions_df(tdf_a) if not tdf_a.empty else pd.DataFrame()
                 wins_a   = int((res_a["status"] == "WIN").sum())   if not res_a.empty  else 0
                 losses_a = int((res_a["status"] == "LOSS").sum())  if not res_a.empty  else 0
                 total_a  = wins_a + losses_a
@@ -903,7 +923,7 @@ with tab_traders:
             other_rows = []
             for trader in other_traders:
                 tdf      = df[df["trader"] == trader]
-                resolved = tdf[tdf["status"].isin(["WIN", "LOSS"])]
+                resolved = positions_df(tdf)
                 wins_o   = int((resolved["status"] == "WIN").sum())  if not resolved.empty else 0
                 losses_o = int((resolved["status"] == "LOSS").sum()) if not resolved.empty else 0
                 total_o  = wins_o + losses_o
@@ -938,7 +958,7 @@ with tab_traders:
 with tab_perf:
     st.subheader("Performance Charts")
 
-    resolved_all = df[df["status"].isin(["WIN", "LOSS"])].copy() if not df.empty else pd.DataFrame()
+    resolved_all = positions_df(df).copy() if not df.empty else pd.DataFrame()
 
     if resolved_all.empty:
         st.info("No resolved trades to chart yet.")
@@ -1054,12 +1074,19 @@ with tab_perf:
         st.plotly_chart(fig_wr, use_container_width=True)
 
         # ── Chart 3: PnL by Trader (horizontal bar) ───────────────────────
+        # Dedup per (trader, position) so shared positions count for each trader
+        _trader_pos = (
+            df[df["status"].isin(["WIN", "LOSS"])]
+            .sort_values("timestamp")
+            .groupby(["trader", "condition_id", "outcome_index"], as_index=False)
+            .first()
+        ) if not df.empty else pd.DataFrame()
         _tpnl = (
-            resolved_all.groupby("trader")["resolved_pnl"]
+            _trader_pos.groupby("trader")["resolved_pnl"]
             .sum()
             .reset_index()
             .sort_values("resolved_pnl")
-        )
+        ) if not _trader_pos.empty else pd.DataFrame(columns=["trader", "resolved_pnl"])
         _tpnl["color"] = _tpnl["resolved_pnl"].apply(
             lambda v: "#00C48C" if v >= 0 else "#dc3545"
         )
@@ -1085,7 +1112,7 @@ with tab_perf:
 
         # ── Chart 4: Win Rate by Trader (horizontal bar) ──────────────────
         _twr_rows = []
-        for _trader, _grp in resolved_all.groupby("trader"):
+        for _trader, _grp in _trader_pos.groupby("trader"):
             _wins  = int((_grp["status"] == "WIN").sum())
             _total = len(_grp)
             _twr_rows.append({
@@ -1154,7 +1181,7 @@ with tab_markets:
             st.plotly_chart(fig_pie, use_container_width=True)
 
         with table_col:
-            resolved_cat = df_cat[df_cat["status"].isin(["WIN", "LOSS"])]
+            resolved_cat = positions_df(df_cat)
             if not resolved_cat.empty:
                 # Win rate per category
                 cat_stats_rows = []
@@ -1189,7 +1216,7 @@ with tab_markets:
 with tab_risk:
     st.subheader("Risk Metrics")
 
-    resolved_risk = df[df["status"].isin(["WIN", "LOSS"])].copy() if not df.empty else pd.DataFrame()
+    resolved_risk = positions_df(df).copy() if not df.empty else pd.DataFrame()
 
     largest_loss = float(resolved_risk["resolved_pnl"].min()) if not resolved_risk.empty else 0.0
     largest_win  = float(resolved_risk["resolved_pnl"].max()) if not resolved_risk.empty else 0.0
