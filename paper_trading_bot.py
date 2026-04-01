@@ -8,7 +8,7 @@ Ratio:     10:1  |  Daily budget: $50  |  Min whale: $150
 Poll:      every 30 seconds
 """
 
-import csv, json, os, sys, time, threading, statistics
+import csv, json, os, re, sys, time, threading, statistics
 from datetime import datetime, date, timezone
 from pathlib import Path
 
@@ -37,6 +37,7 @@ COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used 
 DAILY_LOSS_CAP         = 60.0   # max net loss (losses minus wins) per calendar day before halting new trades
 BASE_BET               = 10.0   # base bet size in USD
 MAX_BET                = 30.0   # maximum bet size per trade in USD
+MAX_DEPLOY_PCT         = 0.60   # never deploy more than 60% of bankroll simultaneously
 STARTING_BANKROLL      = 300.0  # starting simulated bankroll in USD
 MIN_WHALE_SIZE         = 1000.0 # minimum whale USDC size to copy
 MAX_TRADE_AGE          = 300    # 5 minutes in seconds
@@ -50,6 +51,7 @@ STALE_POSITION_DAYS    = 30     # flag positions open longer than this
 ZERO_PRICE_CLOSE_HOURS = 24     # force-close unresolved position if price ≈$0 longer than this
 MAX_OPEN_HOURS         = 72     # force-close any unresolved position open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
+SEEN_HASHES_FILE       = "seen_hashes.json"
 
 # ── Dynamic watchlist config ───────────────────────────────────────────────────
 USE_DYNAMIC_WATCHLIST     = True   # set False to revert to static TRADERS_TO_COPY
@@ -198,6 +200,16 @@ def seed_seen_hashes(bot: PaperBot):
                     if h:
                         bot.seen_hashes.add(h)
         time.sleep(0.3)
+
+    # Merge persisted hashes from previous sessions
+    if os.path.exists(SEEN_HASHES_FILE):
+        try:
+            with open(SEEN_HASHES_FILE, "r") as f:
+                persisted = set(json.load(f))
+            bot.seen_hashes.update(persisted)
+            _log(f"Loaded {len(persisted)} persisted hashes from disk")
+        except Exception as e:
+            _log(f"Could not load seen_hashes.json — starting fresh: {e}")
 
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
@@ -363,6 +375,11 @@ def is_crypto(title: str) -> bool:
     return any(kw in low for kw in CRYPTO_KW)
 
 
+def is_spread(title: str) -> bool:
+    """Return True if the market is a spread bet — these are excluded."""
+    return bool(re.search(r'\bspread\b', title, re.IGNORECASE))
+
+
 # ── Trade Processing ──────────────────────────────────────────────────────────
 def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     tx      = trade.get("transactionHash", "")
@@ -381,12 +398,19 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         if tx and tx in bot.seen_hashes:
             return
         bot.seen_hashes.add(tx)
+        # Persist to disk immediately — handles crash/hard-kill restarts
+        try:
+            with open(SEEN_HASHES_FILE, "w") as f:
+                json.dump(list(bot.seen_hashes), f)
+        except Exception as e:
+            _log(f"Warning: could not persist seen_hashes: {e}")
 
     # Filters (checked outside lock — pure logic)
     if side != "BUY":                       return  # BUY trades only
     if age  >  MAX_TRADE_AGE:               return  # < 5 minutes old
     if usdc <  MIN_WHALE_SIZE:              return  # min $30 conviction
     if is_crypto(title):                    return  # no crypto markets
+    if is_spread(title):                    return  # exclude spread markets — 55% win rate vs 100% O/U
 
     with bot.lock:
         # Per-trader win-rate gate
@@ -427,7 +451,23 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             bot.status_msg = msg
             return
 
-        copy_usdc   = min(BASE_BET * conviction, MAX_BET)
+        # --- Deployment cap ---
+        deployed = sum(
+            p["total_cost"]
+            for p in bot.positions.values()
+            if p.get("status") == "OPEN"
+        )
+        bankroll = STARTING_BANKROLL + bot.closed_pnl
+        if bankroll > 0 and (deployed / bankroll) >= MAX_DEPLOY_PCT:
+            bot.status_msg = f"Deployment cap hit ({deployed:.0f}/{bankroll:.0f} = {deployed/bankroll*100:.1f}%) — skipping trade"
+            return
+
+        # --- Bankroll-aware sizing ---
+        # Bet is capped at 3.5% of total bankroll to scale down in drawdown.
+        # Above ~$857 bankroll this resolves to MAX_BET ($30) and is transparent.
+        # Below $857 it shrinks automatically to protect against ruin.
+        dynamic_max = bankroll * 0.035
+        copy_usdc   = min(BASE_BET * conviction, MAX_BET, dynamic_max)
         copy_shares = copy_usdc / max(px, 0.001)
 
         pos_key = (cid, oidx)

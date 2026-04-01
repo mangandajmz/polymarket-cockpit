@@ -38,6 +38,12 @@ _REQ_PAUSE  = 0.25  # seconds between Gamma API calls during WR estimation
 
 CACHE_FILE  = Path("watchlist_cache.json")
 
+# Traders permanently excluded from the watchlist regardless of performance.
+# Add names in lowercase. These traders will never be copied.
+TRADER_BLOCKLIST = {
+    "cemeterysun",  # 20% win rate, -$81.35 net, excluded 2026-04-01
+}
+
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
@@ -288,6 +294,7 @@ class WatchlistManager:
         Then spawns a daemon thread for subsequent 6-hour refreshes.
         """
         self._bot = bot
+        self._log(f"Trader blocklist active: {TRADER_BLOCKLIST}")
         self._do_refresh()
         t = threading.Thread(target=self._refresh_loop, daemon=True)
         t.start()
@@ -359,6 +366,8 @@ class WatchlistManager:
         qualified = []
         checked   = 0
         for c in candidates:
+            if c.get("name", "").lower() in TRADER_BLOCKLIST:
+                continue  # permanently blocked
             if len(qualified) >= self.top_n:
                 break
             checked += 1
