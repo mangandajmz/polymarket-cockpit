@@ -338,18 +338,40 @@ def positions_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_stats(df: pd.DataFrame) -> dict:
-    pos    = positions_df(df)          # one row per resolved position
-    wins   = int((pos["status"] == "WIN").sum())
-    losses = int((pos["status"] == "LOSS").sum())
-    total  = wins + losses
+    pos = positions_df(df)          # one row per resolved position
+    # Win/loss count: deduplicate by (condition_id, outcome_index).
+    # A position is WIN if ANY row for it has status=WIN; LOSS otherwise.
+    # This guards against .first() picking a stale row when statuses differ.
+    closed_rows = df[df["status"].isin(["WIN", "LOSS"])]
+    if not closed_rows.empty:
+        pos_status = (
+            closed_rows.groupby(["condition_id", "outcome_index"])["status"]
+            .apply(lambda x: "WIN" if "WIN" in x.values else "LOSS")
+        )
+        wins   = int((pos_status == "WIN").sum())
+        losses = int((pos_status == "LOSS").sum())
+    else:
+        wins, losses = 0, 0
+    total    = wins + losses
     win_rate = wins / total * 100 if total else 0.0
 
     today_df  = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
     today_pos = positions_df(today_df)
 
-    # Best / worst trade (position-level)
-    best_row  = pos.loc[pos["resolved_pnl"].idxmax()] if not pos.empty else None
-    worst_row = pos.loc[pos["resolved_pnl"].idxmin()] if not pos.empty else None
+    # Best / worst trade — use actual proportional profit formula for best trade
+    # to avoid stale whale-payout values in resolved_pnl.
+    if not pos.empty:
+        wins_df = df[df["status"] == "WIN"].copy()
+        wins_df["actual_profit"] = wins_df["our_size_usdc"] * (1.0 / wins_df["price"] - 1.0)
+        best_trade_pnl = float(
+            wins_df.groupby(["condition_id", "outcome_index"])["actual_profit"].sum().max()
+        ) if not wins_df.empty else 0.0
+        best_row  = pos.loc[pos["resolved_pnl"].idxmax()]
+        worst_row = pos.loc[pos["resolved_pnl"].idxmin()]
+    else:
+        best_trade_pnl = 0.0
+        best_row  = None
+        worst_row = None
 
     # Streak
     streak_type, streak_count = compute_streak(pos)
@@ -385,8 +407,9 @@ def compute_stats(df: pd.DataFrame) -> dict:
         "streak_type":       streak_type,
         "streak_count":      streak_count,
         "best_trade":        best_row,
+        "best_trade_pnl":    best_trade_pnl,
         "worst_trade":       worst_row,
-        "avg_size":          float(pos["our_size_usdc"].mean()) if not pos.empty else 0.0,
+        "avg_size":          float(closed_rows["our_size_usdc"].mean()) if not closed_rows.empty else 0.0,
         "max_drawdown":      max_drawdown,
         "avg_win":           avg_win,
         "avg_loss":          avg_loss,
@@ -492,7 +515,7 @@ stats = compute_stats(df) if not df.empty else {
     "today_gross_wins": 0, "today_gross_losses": 0,
     "total_trades": 0,
     "streak_type": "—", "streak_count": 0,
-    "best_trade": None, "worst_trade": None, "avg_size": 0,
+    "best_trade": None, "best_trade_pnl": 0, "worst_trade": None, "avg_size": 0,
     "max_drawdown": 0, "avg_win": 0, "avg_loss": 0, "rr_ratio": 0,
 }
 
@@ -547,7 +570,7 @@ with tab_ov:
         if stats["best_trade"] is not None:
             bt = stats["best_trade"]
             mkt = str(bt["market"])[:70]
-            st.success(f"${bt['resolved_pnl']:+.2f} — {mkt}")
+            st.success(f"${stats['best_trade_pnl']:+.2f} — {mkt}")
         else:
             st.info("No resolved trades yet")
 
