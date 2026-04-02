@@ -50,6 +50,7 @@ MIN_WIN_RATE                 = 60.0  # % — stop copying a trader below this th
 MAX_DAILY_LOSSES_PER_TRADER  = 2   # max losses from one trader per calendar day before skipping
 STALE_POSITION_DAYS    = 30     # flag positions open longer than this
 ZERO_PRICE_CLOSE_HOURS = 24     # force-close unresolved position if price ≈$0 longer than this
+ZERO_PRICE_GUARD       = 0.005  # treat anything below this as effectively zero
 MAX_OPEN_HOURS         = 72     # force-close any unresolved position open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 SEEN_HASHES_FILE       = "seen_hashes.json"
@@ -261,6 +262,29 @@ def init_csv():
             csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
 
 
+def _parse_ts(ts_str: str) -> float:
+    """Parse a CSV timestamp string to a UTC unix timestamp.
+    Tries multiple formats; falls back to 48h ago so force-close fires promptly."""
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            dt = datetime.strptime(ts_str.strip(), fmt)
+            return dt.replace(tzinfo=timezone.utc).timestamp() if dt.tzinfo is None else dt.timestamp()
+        except ValueError:
+            continue
+    # Last resort: pandas
+    try:
+        import pandas as _pd
+        return _pd.to_datetime(ts_str, utc=True).timestamp()
+    except Exception:
+        _log(f"  [WARN] Could not parse timestamp '{ts_str}' — defaulting to 48h ago")
+        return time.time() - (48 * 3600)  # assume at least 48h old, not 0
+
+
 def load_positions_from_csv(bot: PaperBot):
     """Reload open positions, closed PnL, today's net loss state, and whale sizes from CSV on restart."""
     if not CSV_FILE.exists():
@@ -313,13 +337,8 @@ def load_positions_from_csv(bot: PaperBot):
                 price   = float(row.get("price", 0.001) or 0.001)
                 shares  = float(row.get("copy_shares", 0) or 0)
                 if pos_key not in bot.positions:
-                    ts_str = row.get("timestamp", "")
-                    try:
-                        opened_at = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").replace(
-                            tzinfo=timezone.utc
-                        ).timestamp()
-                    except (ValueError, TypeError):
-                        opened_at = time.time()
+                    ts_str    = row.get("timestamp", "")
+                    opened_at = _parse_ts(ts_str)
                     bot.positions[pos_key] = {
                         "condition_id":  cid,
                         "outcome_index": oidx,
@@ -462,7 +481,8 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             for p in bot.positions.values()
             if p.get("status") == "OPEN"
         )
-        bankroll = STARTING_BANKROLL + bot.closed_pnl
+        bankroll = STARTING_BANKROLL + bot.closed_pnl + bot.unrealised_pnl
+        # unrealised_pnl included so deployment cap reflects economic reality
         if bankroll > 0 and (deployed / bankroll) >= MAX_DEPLOY_PCT:
             bot.status_msg = f"Deployment cap hit ({deployed:.0f}/{bankroll:.0f} = {deployed/bankroll*100:.1f}%) — skipping trade"
             return
@@ -551,7 +571,9 @@ def get_price_resolved(cid: str, oidx: int):
 
     closed      = bool(data.get("closed", False))
     is_winner   = bool(token.get("winner", False))
-    is_resolved = closed and is_winner
+    # A closed market IS resolved regardless of which outcome won.
+    # The price (0.0 for losers, 1.0 for winners) determines WIN/LOSS.
+    is_resolved = closed  # resolve both winners AND losers when market closes
 
     return px, is_resolved
 
@@ -565,7 +587,8 @@ def _init_milestones(bot: PaperBot):
     Without this, every threshold below STARTING_BANKROLL would fire on the first
     resolved trade of every new session.
     """
-    bankroll = STARTING_BANKROLL + bot.closed_pnl
+    bankroll = STARTING_BANKROLL + bot.closed_pnl + bot.unrealised_pnl
+    # unrealised_pnl included so deployment cap reflects economic reality
     for threshold, _ in BANKROLL_SCALE_STEPS:
         if bankroll >= threshold:
             bot.milestones_reached.add(threshold)
@@ -579,7 +602,8 @@ def _init_milestones(bot: PaperBot):
 def _check_bankroll_scale(bot: PaperBot):
     """After each resolved trade, check if bankroll has crossed a scaling threshold."""
     global BASE_BET, MAX_BET, DAILY_LOSS_CAP
-    bankroll = STARTING_BANKROLL + bot.closed_pnl
+    bankroll = STARTING_BANKROLL + bot.closed_pnl + bot.unrealised_pnl
+    # unrealised_pnl included so deployment cap reflects economic reality
     for threshold, cfg in BANKROLL_SCALE_STEPS:
         if bankroll >= threshold and threshold not in bot.milestones_reached:
             bot.milestones_reached.add(threshold)
@@ -697,13 +721,17 @@ def resolution_loop(bot: PaperBot):
                 else:
                     age_hours = age_days * 24
 
+                    # Early warning when approaching force-close threshold
+                    if px < ZERO_PRICE_GUARD and age_hours > 12:
+                        _log(f"  [WATCH] {cid[:20]} px={px:.4f} age={age_hours:.1f}h approaching force-close")
+
                     # Force-close: price stuck at ~$0 (market likely resolved against us)
-                    force_zero = px < 0.001 and age_hours > ZERO_PRICE_CLOSE_HOURS
+                    force_zero = px < ZERO_PRICE_GUARD and age_hours > ZERO_PRICE_CLOSE_HOURS
                     # Force-close: position open beyond max allowed duration
                     force_age  = age_hours > MAX_OPEN_HOURS
 
                     if force_zero or force_age:
-                        close_px   = px if px >= 0.001 else 0.0
+                        close_px   = px if px >= ZERO_PRICE_GUARD else 0.0
                         proceeds   = pos["total_shares"] * close_px
                         pnl        = proceeds - pos["total_cost"]
                         result_tag = "WIN" if pnl >= 0 else "LOSS"
