@@ -53,6 +53,7 @@ ZERO_PRICE_CLOSE_HOURS = 24     # force-close unresolved position if price ≈$0
 MAX_OPEN_HOURS         = 72     # force-close any unresolved position open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
 SEEN_HASHES_FILE       = "seen_hashes.json"
+INTERACTIVE_MODE       = False  # True only when running manually in terminal
 
 # ── Dynamic watchlist config ───────────────────────────────────────────────────
 USE_DYNAMIC_WATCHLIST     = True   # set False to revert to static TRADERS_TO_COPY
@@ -589,15 +590,23 @@ def _check_bankroll_scale(bot: PaperBot):
                 f"  Suggested config: BASE_BET={cfg['BASE_BET']}, "
                 f"MAX_BET={cfg['MAX_BET']}, DAILY_LOSS_CAP={cfg['DAILY_LOSS_CAP']}"
             )
-            try:
-                print(
-                    f"\n[SCALE UP] Bankroll ${bankroll:.2f} crossed ${threshold} threshold.\n"
-                    f"  Suggested: BASE_BET={cfg['BASE_BET']}, "
-                    f"MAX_BET={cfg['MAX_BET']}, DAILY_LOSS_CAP={cfg['DAILY_LOSS_CAP']}"
-                )
-                answer = input("Apply new scaling? (y/n): ").strip().lower()
-            except EOFError:
+            if INTERACTIVE_MODE:
+                try:
+                    print(
+                        f"\n[SCALE UP] Bankroll ${bankroll:.2f} crossed ${threshold} threshold.\n"
+                        f"  Suggested: BASE_BET={cfg['BASE_BET']}, "
+                        f"MAX_BET={cfg['MAX_BET']}, DAILY_LOSS_CAP={cfg['DAILY_LOSS_CAP']}"
+                    )
+                    answer = input("Apply new scaling? (y/n): ").strip().lower()
+                except EOFError:
+                    answer = "n"
+            else:
                 answer = "n"
+                _log(
+                    f"[SCALE UP] Service mode — auto-declined. "
+                    f"To apply, manually set BASE_BET, MAX_BET, DAILY_LOSS_CAP "
+                    f"in the constants block and restart the service."
+                )
             if answer == "y":
                 BASE_BET       = cfg["BASE_BET"]
                 MAX_BET        = cfg["MAX_BET"]
@@ -1021,6 +1030,7 @@ def main():
     threading.Thread(target=resolution_loop, args=(bot,), daemon=True).start()
 
     _log(f"Price cap: ACTIVE — entries >= ${MAX_ENTRY_PRICE} will be skipped")
+    _log(f"Interactive mode: {'ON' if INTERACTIVE_MODE else 'OFF (service mode)'}")
     bot.status_msg = "Live — scanning for qualifying BUY trades..."
 
     print(f"\n  [PAPER MODE] Monitoring started. Press Ctrl+C to stop.\n")
