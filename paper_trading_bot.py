@@ -37,6 +37,7 @@ COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used 
 DAILY_LOSS_CAP         = 60.0   # max net loss (losses minus wins) per calendar day before halting new trades
 BASE_BET               = 10.0   # base bet size in USD
 MAX_BET                = 30.0   # maximum bet size per trade in USD
+MAX_ENTRY_PRICE        = 0.75   # skip near-certainty bets — poor R/R above this price
 MAX_DEPLOY_PCT         = 0.60   # never deploy more than 60% of bankroll simultaneously
 STARTING_BANKROLL      = 300.0  # starting simulated bankroll in USD
 MIN_WHALE_SIZE         = 1000.0 # minimum whale USDC size to copy
@@ -411,6 +412,9 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     if usdc <  MIN_WHALE_SIZE:              return  # min $30 conviction
     if is_crypto(title):                    return  # no crypto markets
     if is_spread(title):                    return  # exclude spread markets — 55% win rate vs 100% O/U
+    if px >= MAX_ENTRY_PRICE:
+        bot.status_msg = f"Skipped {title[:50]} — price {px:.2f} >= cap {MAX_ENTRY_PRICE}"
+        return  # poor risk/reward at near-certainty prices
 
     with bot.lock:
         # Per-trader win-rate gate
@@ -1016,6 +1020,7 @@ def main():
     # Background threads (resolution loop always runs; address refresh only in legacy mode)
     threading.Thread(target=resolution_loop, args=(bot,), daemon=True).start()
 
+    _log(f"Price cap: ACTIVE — entries >= ${MAX_ENTRY_PRICE} will be skipped")
     bot.status_msg = "Live — scanning for qualifying BUY trades..."
 
     print(f"\n  [PAPER MODE] Monitoring started. Press Ctrl+C to stop.\n")
