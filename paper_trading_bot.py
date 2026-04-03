@@ -308,10 +308,19 @@ def load_positions_from_csv(bot: PaperBot):
                     if pos_key not in seen_today:
                         seen_today.add(pos_key)
                         pnl = float(row.get("resolved_pnl", 0) or 0)
+                        trader = row.get("trader", "")
                         if status == "WIN":
                             bot.daily_wins += pnl
                         else:
                             bot.daily_losses += abs(pnl)
+                            # Restore per-trader loss count so the 3-loss rule
+                            # survives bot restarts. Without this, daily_losses_per_trader
+                            # resets to zero on every restart, allowing a blocked trader
+                            # to keep firing trades after a restart.
+                            if trader:
+                                bot.daily_losses_per_trader[trader] = (
+                                    bot.daily_losses_per_trader.get(trader, 0) + 1
+                                )
 
                 # Accumulate whale sizes across all rows so conviction median is
                 # warm on restart rather than starting cold from a single trade.
