@@ -48,6 +48,7 @@ ADDRESS_REFRESH_HOURS  = 6      # how often to re-resolve trader addresses (lega
 MIN_TRADES_FOR_CUTOFF        = 10  # min resolved trades before applying win-rate gate
 MIN_WIN_RATE                 = 60.0  # % — stop copying a trader below this threshold (matches watchlist qualification threshold)
 MAX_DAILY_LOSSES_PER_TRADER  = 2   # max losses from one trader per calendar day before skipping
+MAX_DAILY_DEPLOY_PER_TRADER  = 60.0  # max $ deployed to one trader per day
 STALE_POSITION_DAYS    = 30     # flag positions open longer than this
 ZERO_PRICE_CLOSE_HOURS = 24     # force-close unresolved position if price ≈$0 longer than this
 ZERO_PRICE_GUARD       = 0.005  # treat anything below this as effectively zero
@@ -87,6 +88,11 @@ CRYPTO_KW = {
     "ada","litecoin","ltc","usdc","usdt","stablecoin","web3","token",
 }
 
+FUTURES_KW = {
+    "nba finals", "nhl finals", "world series", "super bowl",
+    "win the", "qualify for", "advance to", "2026 champion", "2027 champion"
+}
+
 CSV_FIELDS = [
     "timestamp","trader","market","outcome","whale_side",
     "whale_size_usdc","our_size_usdc","price","copy_shares",
@@ -114,6 +120,7 @@ class PaperBot:
         self.last_addr_refresh  = time.time()
         self.whale_sizes             = []   # rolling last-30 whale trade sizes for median
         self.daily_losses_per_trader = {}  # trader_name → losses today (reset at midnight UTC)
+        self.daily_deploy_per_trader = {}  # trader → $ deployed today
         self.milestones_reached      = set()  # bankroll thresholds already prompted
 
     def _refresh_budget(self):
@@ -123,6 +130,7 @@ class PaperBot:
             self.daily_wins              = 0.0
             self._budget_date            = today
             self.daily_losses_per_trader = {}
+            self.daily_deploy_per_trader = {}
 
     @property
     def daily_net_loss(self):
@@ -322,6 +330,16 @@ def load_positions_from_csv(bot: PaperBot):
                                     bot.daily_losses_per_trader.get(trader, 0) + 1
                                 )
 
+                # Restore today's per-trader deploy spend — every row (not per-position dedup)
+                # so that the daily dollar cap survives bot restarts.
+                if row.get("timestamp", "").startswith(today_prefix):
+                    _trader = row.get("trader", "")
+                    _cost   = float(row.get("our_size_usdc", 0) or 0)
+                    if _trader and _cost > 0:
+                        bot.daily_deploy_per_trader[_trader] = (
+                            bot.daily_deploy_per_trader.get(_trader, 0) + _cost
+                        )
+
                 # Accumulate whale sizes across all rows so conviction median is
                 # warm on restart rather than starting cold from a single trade.
                 ws = float(row.get("whale_size_usdc", 0) or 0)
@@ -332,12 +350,24 @@ def load_positions_from_csv(bot: PaperBot):
                 if status in ("WIN", "LOSS"):
                     if pos_key not in seen_resolved:
                         seen_resolved.add(pos_key)
-                        pnl = float(row.get("resolved_pnl", 0) or 0)
+                        pnl    = float(row.get("resolved_pnl", 0) or 0)
+                        trader = row.get("trader", "")
                         bot.closed_pnl += pnl
                         if pnl >= 0:
                             bot.wins += 1
                         else:
                             bot.losses += 1
+                        # Restore all-time trader_stats from full CSV history.
+                        # This makes win-rate gate, auto-drop, and perf_mult
+                        # all work correctly from the first trade after any restart.
+                        if trader:
+                            s = bot.trader_stats.setdefault(
+                                trader, {"wins": 0, "losses": 0}
+                            )
+                            if pnl >= 0:
+                                s["wins"] += 1
+                            else:
+                                s["losses"] += 1
                 if status not in ("PENDING", "OPEN"):
                     continue
                 if not cid:
@@ -441,11 +471,30 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     if usdc <  MIN_WHALE_SIZE:              return  # min $30 conviction
     if is_crypto(title):                    return  # no crypto markets
     if is_spread(title):                    return  # exclude spread markets — 55% win rate vs 100% O/U
+    # Block futures markets — lock capital for weeks/months
+    if any(kw in title.lower() for kw in FUTURES_KW):
+        bot.status_msg = f"Skipped {title[:50]} — futures market"
+        return
     if px >= MAX_ENTRY_PRICE:
         bot.status_msg = f"Skipped {title[:50]} — price {px:.2f} >= cap {MAX_ENTRY_PRICE}"
         return  # poor risk/reward at near-certainty prices
 
     with bot.lock:
+        # Block same-game duplicate — one position per base game at a time.
+        # Strips O/U and spread suffixes to find the base game name.
+        base_game = re.sub(
+            r':\s*(O/U|Spread).*$', '', title, flags=re.IGNORECASE
+        ).strip().lower()
+        existing_games = {
+            re.sub(r':\s*(O/U|Spread).*$', '', p["title"], flags=re.IGNORECASE
+                   ).strip().lower()
+            for p in bot.positions.values()
+            if p.get("status") == "OPEN"
+        }
+        if base_game in existing_games:
+            bot.status_msg = f"Skipped {title[:50]} — already open in this game"
+            return
+
         # Per-trader win-rate gate
         stats = bot.trader_stats.get(trader_name, {"wins": 0, "losses": 0})
         resolved = stats["wins"] + stats["losses"]
@@ -484,6 +533,15 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             bot.status_msg = msg
             return
 
+        # Per-trader daily dollar cap
+        trader_today_deploy = bot.daily_deploy_per_trader.get(trader_name, 0)
+        if trader_today_deploy >= MAX_DAILY_DEPLOY_PER_TRADER:
+            bot.status_msg = (
+                f"Skipped {trader_name} — daily trader cap "
+                f"(${trader_today_deploy:.0f} deployed today)"
+            )
+            return
+
         # --- Deployment cap ---
         deployed = sum(
             p["total_cost"]
@@ -518,6 +576,9 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
 
         copy_usdc = min(BASE_BET * conviction * perf_mult, MAX_BET, dynamic_max)
         copy_shares = copy_usdc / max(px, 0.001)
+        bot.daily_deploy_per_trader[trader_name] = (
+            bot.daily_deploy_per_trader.get(trader_name, 0) + copy_usdc
+        )
 
         pos_key = (cid, oidx)
         if pos_key not in bot.positions:
