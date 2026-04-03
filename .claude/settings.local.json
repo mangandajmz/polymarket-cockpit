@@ -30,7 +30,16 @@
       "Bash(wmic process:*)",
       "Bash(python backtest_configs.py)",
       "Bash(python _dry_run_test.py)",
-      "Bash(del:*)"
+      "Bash(del:*)",
+      "Bash(grep -r \"def \" \"/c/Users/james/OneDrive/Documents/Manganda LTD/Trading/polymarket-bot\"/*.py)",
+      "Read(//c/Users/james/**)",
+      "Read(//c/Users/james/OneDrive/Documents/Manganda LTD/**)",
+      "Bash(grep:*)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//c/Users/james/OneDrive/Documents/Manganda LTD/Trading/finance_web_page/**)",
+      "Bash(cd:*)",
+      "Bash(python -c \":*)"
     ]
   }
 }
