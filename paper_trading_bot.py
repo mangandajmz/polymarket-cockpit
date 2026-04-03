@@ -13,7 +13,7 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 
 import requests
-from dynamic_watchlist import WatchlistManager
+from dynamic_watchlist import WatchlistManager, TRADER_BLOCKLIST
 
 try:
     from rich.live import Live
@@ -501,7 +501,22 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         # Above ~$857 bankroll this resolves to MAX_BET ($30) and is transparent.
         # Below $857 it shrinks automatically to protect against ruin.
         dynamic_max = bankroll * 0.035
-        copy_usdc   = min(BASE_BET * conviction, MAX_BET, dynamic_max)
+        # Per-trader performance multiplier — sizes up on proven signals,
+        # cautious on unproven traders.
+        t_stats  = bot.trader_stats.get(trader_name, {"wins": 0, "losses": 0})
+        t_total  = t_stats["wins"] + t_stats["losses"]
+        t_wr     = t_stats["wins"] / t_total * 100 if t_total > 0 else 0.0
+
+        if t_total < 15:
+            perf_mult = 0.75   # unproven — cautious until track record established
+        elif t_wr >= 70.0:
+            perf_mult = 1.25   # proven high performer — size up
+        elif t_wr >= 60.0:
+            perf_mult = 1.0    # solid performer — standard sizing
+        else:
+            perf_mult = 0.75   # below standard but not yet dropped — reduce exposure
+
+        copy_usdc = min(BASE_BET * conviction * perf_mult, MAX_BET, dynamic_max)
         copy_shares = copy_usdc / max(px, 0.001)
 
         pos_key = (cid, oidx)
@@ -650,6 +665,60 @@ def _check_bankroll_scale(bot: PaperBot):
                 _log("Scaling declined, keeping current config.")
 
 
+def _auto_drop_trader(bot: PaperBot, trader_name: str, s: dict):
+    """
+    Two-tier exit system optimised for capital preservation + growth.
+
+    Tier 1 — Temporary drop (15 trades, <55% WR):
+        Remove from active watchlist until next 6-hour leaderboard refresh.
+        55% is the mathematical break-even floor at current R/R ratio.
+        15 trades gives statistical confidence without being trigger-happy.
+
+    Tier 2 — Permanent block (25 trades, <50% WR):
+        Add to TRADER_BLOCKLIST. No comeback via leaderboard refresh.
+        At 25 trades below 50%, this is a bad signal not a cold spell.
+    """
+    _total = s["wins"] + s["losses"]
+    _wr = s["wins"] / _total * 100 if _total > 0 else 0.0
+
+    # Tier 2: permanent block — 25+ trades below 50%
+    if _total >= 25 and _wr < 50.0:
+        if trader_name.lower() not in TRADER_BLOCKLIST:
+            TRADER_BLOCKLIST.add(trader_name.lower())
+            _log(
+                f"  [PERM-BLOCK] {trader_name} added to permanent blocklist "
+                f"(observed WR {_wr:.1f}% over {_total} trades < 50% floor). "
+                f"Will not be re-qualified by leaderboard refresh."
+            )
+            bot.status_msg = (
+                f"[PERM-BLOCK] {trader_name} permanently blocked — "
+                f"{_wr:.1f}% WR over {_total} trades"
+            )
+
+    # Tier 1: temporary drop — 15+ trades below 55%
+    if _total >= 15 and _wr < 55.0:
+        if trader_name in bot.trader_addrs:
+            del bot.trader_addrs[trader_name]
+            try:
+                from dynamic_watchlist import AddressCache, CACHE_FILE
+                _cache = AddressCache(CACHE_FILE)
+                if trader_name in _cache._data:
+                    _cache._data[trader_name]["active"] = False
+                    _cache._save()
+            except Exception:
+                pass
+            if _wr >= 50.0:
+                _log(
+                    f"  [AUTO-DROP] {trader_name} removed from active watchlist "
+                    f"(observed WR {_wr:.1f}% over {_total} trades < 55% break-even). "
+                    f"Can re-qualify on next leaderboard refresh."
+                )
+                bot.status_msg = (
+                    f"[AUTO-DROP] {trader_name} dropped — "
+                    f"{_wr:.1f}% WR over {_total} trades"
+                )
+
+
 def resolution_loop(bot: PaperBot):
     """Periodically price open positions and mark resolved ones WIN/LOSS."""
     while True:
@@ -710,6 +779,7 @@ def resolution_loop(bot: PaperBot):
                         bot.daily_losses_per_trader[trader_name] = (
                             bot.daily_losses_per_trader.get(trader_name, 0) + 1
                         )
+                    _auto_drop_trader(bot, trader_name, s)
                     result_tag = "WIN" if pnl >= 0 else "LOSS"
                     bot.status_msg = (
                         f"[RESOLVED] {pos['title'][:30]} | "
@@ -763,6 +833,7 @@ def resolution_loop(bot: PaperBot):
                             bot.daily_losses_per_trader[trader_name] = (
                                 bot.daily_losses_per_trader.get(trader_name, 0) + 1
                             )
+                        _auto_drop_trader(bot, trader_name, s)
                         bot.status_msg = (
                             f"[{reason}] {pos['title'][:30]} | "
                             f"open {age_hours:.0f}h — forced {result_tag} ${pnl:+.2f}"
