@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from api_client import JsonApiClient
+from category_utils import classify_market, classify_market_details
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -72,35 +73,6 @@ CSV_FIELDS = [
     "whale_size_usdc", "our_size_usdc", "price", "copy_shares",
     "conviction", "status", "resolved_pnl", "condition_id", "outcome_index",
 ]
-
-# Market category keyword matching
-CATEGORY_KEYWORDS = {
-    "Sports":   [
-        "nba", "nfl", "nhl", "mlb", "soccer", "football", "basketball",
-        "baseball", "hockey", "tennis", "ufc", "mma", "olympics",
-        "super bowl", "world cup", "champions league", "premier league",
-        "la liga", "bundesliga", "serie a", "ligue 1",
-    ],
-    "Politics": [
-        "election", "president", "congress", "senate", "biden", "trump",
-        "harris", "republican", "democrat", "vote", "poll", "governor",
-        "mayor", "parliament", "primary", "inauguration",
-    ],
-    "Crypto":   [
-        "bitcoin", "btc", "eth", "ethereum", "crypto", "solana", "sol",
-        "defi", "nft", "coinbase", "binance", "polygon", "matic",
-        "dogecoin", "doge", "xrp", "ripple", "altcoin",
-    ],
-    "Finance":  [
-        "fed", "interest rate", "gdp", "inflation", "sp500", "s&p",
-        "dow jones", "nasdaq", "stock", "earnings", "ipo", "recession",
-        "unemployment", "cpi", "fomc",
-    ],
-    "Tech":     [
-        "apple", "google", "amazon", "meta", "microsoft", "openai",
-        "ai ", "tesla", "spacex", "chatgpt", "iphone", "android",
-    ],
-}
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -459,14 +431,6 @@ def bot_status() -> tuple[str, str]:
     if age < 600:
         return "Idle", last_str
     return "Offline", last_str
-
-
-def classify_market(name: str) -> str:
-    nl = name.lower()
-    for cat, keywords in CATEGORY_KEYWORDS.items():
-        if any(kw in nl for kw in keywords):
-            return cat
-    return "Other"
 
 
 def compute_streak(resolved: pd.DataFrame) -> tuple[str, int]:
@@ -1902,6 +1866,25 @@ with tab_markets:
                 )
             else:
                 st.info("No resolved trades to analyze by category.")
+
+        with st.expander("Category Audit", expanded=False):
+            audit = (
+                df_cat[["market"]]
+                .dropna()
+                .drop_duplicates()
+                .copy()
+                .sort_values("market")
+            )
+            if audit.empty:
+                st.info("No markets available to audit.")
+            else:
+                audit["Category"] = audit["market"].apply(classify_market)
+                audit["Score"] = audit["market"].apply(lambda m: classify_market_details(m)[1])
+                st.dataframe(
+                    audit.rename(columns={"market": "Market"}),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 7 — RISK METRICS
