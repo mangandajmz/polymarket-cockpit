@@ -2,7 +2,9 @@ import csv
 import gc
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import paper_trading_bot as botmod
 
@@ -125,6 +127,55 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertEqual(alice_row["resolved_pnl"], "+5.0000")
         self.assertEqual(bob_row["status"], "PENDING")
         self.assertEqual(bob_row["resolved_pnl"], "")
+
+    def test_refresh_budget_resets_utc_daily_counters(self):
+        bot = botmod.PaperBot()
+        bot.daily_losses = 12.5
+        bot.daily_wins = 4.0
+        bot.daily_losses_per_trader = {"alice": 2}
+        bot.daily_deploy_per_trader = {"alice": 18.0}
+        bot._budget_date = date(2026, 4, 3)
+
+        with patch.object(botmod, "utc_today", return_value=date(2026, 4, 4)):
+            bot._refresh_budget()
+
+        self.assertEqual(bot.daily_losses, 0.0)
+        self.assertEqual(bot.daily_wins, 0.0)
+        self.assertEqual(bot.daily_losses_per_trader, {})
+        self.assertEqual(bot.daily_deploy_per_trader, {})
+        self.assertEqual(bot._budget_date, date(2026, 4, 4))
+
+    def test_runtime_snapshot_roundtrip_restores_store_state(self):
+        bot = botmod.PaperBot()
+        botmod.process_trade(bot, "alice", self._trade("tx-1", "Match A Winner"))
+        bot.closed_pnl = 7.25
+        bot.wins = 1
+        bot.losses = 0
+        bot.daily_wins = 7.25
+        bot.daily_losses = 0.0
+        bot.daily_losses_per_trader = {"alice": 0}
+        bot.daily_deploy_per_trader = {"alice": 10.0}
+        bot.trader_stats = {"alice": {"wins": 1, "losses": 0}}
+        pos = bot.positions[("alice", "cond-1", 0)]
+        pos["status"] = "WIN"
+        pos["pnl"] = 7.25
+
+        botmod.persist_runtime_snapshot(bot)
+
+        restored = botmod.PaperBot()
+        loaded = botmod.load_positions_from_store(restored)
+
+        self.assertTrue(loaded)
+        self.assertEqual(restored.closed_pnl, 7.25)
+        self.assertEqual(restored.wins, 1)
+        self.assertEqual(restored.losses, 0)
+        self.assertEqual(restored.trader_stats["alice"]["wins"], 1)
+        self.assertEqual(restored.daily_deploy_per_trader["alice"], 10.0)
+        self.assertIn(("alice", "cond-1", 0), restored.positions)
+        restored_pos = restored.positions[("alice", "cond-1", 0)]
+        self.assertEqual(restored_pos["position_id"], "alice|cond-1|0")
+        self.assertEqual(restored_pos["status"], "WIN")
+        self.assertEqual(len(restored.trade_log), 1)
 
 
 if __name__ == "__main__":
