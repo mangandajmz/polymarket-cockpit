@@ -536,6 +536,83 @@ def load_positions_from_store(bot: PaperBot) -> bool:
     return True
 
 
+def backfill_resolved_positions_from_csv(bot: PaperBot):
+    """Backfill historical closed positions from CSV into canonical state if missing."""
+    if not CSV_FILE.exists():
+        return
+
+    aggregates = {}
+    try:
+        with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                status = row.get("status")
+                if status not in ("WIN", "LOSS"):
+                    continue
+                trader = row.get("trader", "unknown")
+                cid = row.get("condition_id", "")
+                if not cid:
+                    continue
+                oidx = int(row.get("outcome_index", 0) or 0)
+                key = (trader, cid, oidx)
+                entry = aggregates.setdefault(key, {
+                    "position_id": row.get("position_id") or make_position_id(trader, cid, oidx),
+                    "condition_id": cid,
+                    "outcome_index": oidx,
+                    "title": row.get("market", cid[:30]),
+                    "outcome": row.get("outcome", str(oidx)),
+                    "trader": trader,
+                    "opened_at_utc": row.get("timestamp", ""),
+                    "updated_at_utc": row.get("timestamp", ""),
+                    "opened_at": _parse_ts(row.get("timestamp", "")),
+                    "total_cost": 0.0,
+                    "total_shares": 0.0,
+                    "status": status,
+                    "pnl": float(row.get("resolved_pnl", 0) or 0),
+                    "last_price": float(row.get("price", 0) or 0),
+                })
+                entry["total_cost"] += float(row.get("our_size_usdc", 0) or 0)
+                entry["total_shares"] += float(row.get("copy_shares", 0) or 0)
+                ts_str = row.get("timestamp", "")
+                if ts_str and (not entry["opened_at_utc"] or ts_str < entry["opened_at_utc"]):
+                    entry["opened_at_utc"] = ts_str
+                    entry["opened_at"] = _parse_ts(ts_str)
+                if ts_str and ts_str > entry["updated_at_utc"]:
+                    entry["updated_at_utc"] = ts_str
+                    entry["last_price"] = float(row.get("price", 0) or 0)
+                if status == "WIN":
+                    entry["status"] = "WIN"
+                if str(row.get("resolved_pnl", "")).strip():
+                    entry["pnl"] = float(row.get("resolved_pnl", 0) or 0)
+    except Exception as exc:
+        _log(f"[BACKFILL] Could not scan CSV for resolved positions: {exc}")
+        return
+
+    inserted = 0
+    for key, pos in aggregates.items():
+        if key in bot.positions:
+            continue
+        bot.positions[key] = {
+            "position_id": pos["position_id"],
+            "condition_id": pos["condition_id"],
+            "outcome_index": pos["outcome_index"],
+            "title": pos["title"],
+            "outcome": pos["outcome"],
+            "trader": pos["trader"],
+            "opened_at": pos["opened_at"],
+            "opened_at_utc": pos["opened_at_utc"],
+            "total_cost": pos["total_cost"],
+            "total_shares": pos["total_shares"],
+            "status": pos["status"],
+            "pnl": pos["pnl"],
+            "last_price": pos["last_price"],
+        }
+        bot.store.update_position(bot.positions[key], pos["updated_at_utc"], close_reason="CSV-BACKFILL")
+        inserted += 1
+
+    if inserted:
+        _log(f"[BACKFILL] Added {inserted} historical resolved position(s) from CSV into canonical state")
+
+
 def persist_runtime_snapshot(bot: PaperBot):
     for record in bot.trade_log:
         bot.store.upsert_fill(record)
@@ -1390,6 +1467,7 @@ def main():
     loaded_from_store = load_positions_from_store(bot)
     if not loaded_from_store:
         load_positions_from_csv(bot)
+    backfill_resolved_positions_from_csv(bot)
     _init_milestones(bot)   # must come after CSV load so closed_pnl is accurate
     if not loaded_from_store:
         persist_runtime_snapshot(bot)
