@@ -318,6 +318,48 @@ class BotRobustnessTests(unittest.TestCase):
 
         self.assertEqual(bot.store.get_value("invariant_issues", []), [])
 
+    def test_rebuild_trader_stats_from_positions_uses_canonical_closed_history(self):
+        bot = botmod.PaperBot()
+        bot.positions[("beachboy4", "cond-a", 0)] = {
+            "position_id": "beachboy4|cond-a|0",
+            "condition_id": "cond-a",
+            "outcome_index": 0,
+            "title": "Legacy Win",
+            "outcome": "YES",
+            "trader": "beachboy4",
+            "opened_at": botmod.time.time(),
+            "opened_at_utc": "2026-04-03 00:00:00",
+            "total_cost": 10.0,
+            "total_shares": 20.0,
+            "status": "WIN",
+            "pnl": 5.0,
+            "last_price": 1.0,
+            "close_reason": "CSV-BACKFILL",
+        }
+        bot.positions[("beachboy4", "cond-b", 1)] = {
+            "position_id": "beachboy4|cond-b|1",
+            "condition_id": "cond-b",
+            "outcome_index": 1,
+            "title": "Legacy Loss",
+            "outcome": "NO",
+            "trader": "beachboy4",
+            "opened_at": botmod.time.time(),
+            "opened_at_utc": "2026-04-03 01:00:00",
+            "total_cost": 12.0,
+            "total_shares": 24.0,
+            "status": "LOSS",
+            "pnl": -12.0,
+            "last_price": 0.0,
+            "close_reason": "CSV-BACKFILL",
+        }
+        bot.trader_stats = {"beachboy4": {"wins": 99, "losses": 0}}
+
+        botmod.rebuild_trader_stats_from_positions(bot)
+
+        self.assertEqual(bot.trader_stats, {"beachboy4": {"wins": 1, "losses": 1}})
+        restored = bot.store.load_runtime_state()
+        self.assertEqual(restored["trader_stats"]["beachboy4"], {"wins": 1, "losses": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
