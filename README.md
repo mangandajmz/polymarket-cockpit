@@ -288,6 +288,7 @@ ssh ubuntu@YOUR_VPS_IP "cd /home/ubuntu/polymarket-bot && bash deploy.sh"
 | Dashboard | `http://YOUR_VPS_IP:8501` |
 | Bot logs (live) | `sudo journalctl -u polymarket-bot -f` |
 | Trade CSV | `tail -f paper_trades.csv` |
+| Health summary | `python3 health_check.py` |
 | Service status | `sudo systemctl status polymarket-bot polymarket-dash` |
 
 ---
