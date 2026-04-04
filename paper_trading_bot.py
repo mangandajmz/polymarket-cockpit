@@ -15,6 +15,7 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 
 import requests
+from api_client import JsonApiClient
 from dynamic_watchlist import WatchlistManager, TRADER_BLOCKLIST
 from state_store import StateStore
 
@@ -152,6 +153,9 @@ def get_build_version() -> str:
     except Exception:
         return "unknown"
 
+
+HTTP = JsonApiClient(default_timeout=10.0, default_retries=3, backoff_base=1.0, jitter_max=0.2)
+
 # ── Bot State ─────────────────────────────────────────────────────────────────
 class PaperBot:
     def __init__(self):
@@ -213,15 +217,7 @@ class PaperBot:
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
 def get(url, params=None, timeout=10, retries=3):
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            if i < retries - 1:
-                time.sleep(2 ** i)   # 1s, 2s backoff
-    return None
+    return HTTP.get_json(url, params=params, timeout=timeout, retries=retries)
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────

@@ -23,13 +23,13 @@ Win rate estimation:
 """
 
 import json
-import random
 import time
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from api_client import JsonApiClient
 
 # ── Module-level API config ───────────────────────────────────────────────────
 _DATA_API   = "https://data-api.polymarket.com/v1"
@@ -48,16 +48,11 @@ TRADER_BLOCKLIST = {
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
+_HTTP = JsonApiClient(default_timeout=15.0, default_retries=3, backoff_base=1.0, jitter_max=0.25)
+
+
 def _req(url, params=None, retries=3):
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=15)
-            r.raise_for_status()
-            return r.json()
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(1 + attempt + random.uniform(0, 0.25))
-    return None
+    return _HTTP.get_json(url, params=params, retries=retries)
 
 
 def _valid_addr(addr: str) -> bool:
