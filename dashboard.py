@@ -252,6 +252,24 @@ def load_open_positions() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=15)
+def load_runtime_kv() -> dict:
+    if not STATE_DB_PATH.exists():
+        return {}
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            rows = conn.execute("SELECT key, value FROM kv_state").fetchall()
+    except Exception:
+        return {}
+    out = {}
+    for key, value in rows:
+        try:
+            out[key] = json.loads(value)
+        except Exception:
+            out[key] = value
+    return out
+
+
 @st.cache_data(ttl=60)
 def fetch_price(condition_id: str, outcome_index: int) -> float | None:
     try:
@@ -719,6 +737,7 @@ with tab_ov:
     # Bot status
     st.subheader("Bot Status")
     status_str, last_seen = bot_status()
+    runtime_kv = load_runtime_kv()
     icon = {"Online": "🟢", "Idle": "🟡", "Offline": "🔴"}.get(status_str, "⚪")
     s_col, s_lbl = st.columns(2)
     with s_col:
@@ -726,6 +745,19 @@ with tab_ov:
     with s_lbl:
         st.write("Last heartbeat:")
         st.code(last_seen, language=None)
+    watchlist_health = runtime_kv.get("watchlist_health", {})
+    if watchlist_health:
+        st.caption(
+            f"Watchlist: {watchlist_health.get('active_count', 0)} active"
+            f" | last refresh {watchlist_health.get('last_successful_refresh', 'unknown')}"
+        )
+        if watchlist_health.get("last_error"):
+            st.warning(f"Watchlist refresh warning: {watchlist_health['last_error']}")
+    invariant_issues = runtime_kv.get("invariant_issues", []) or []
+    if invariant_issues:
+        st.error("Invariant warnings detected in bot state.")
+        for issue in invariant_issues[:3]:
+            st.code(issue, language=None)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — ACTIVE POSITIONS
@@ -842,7 +874,7 @@ with tab_pos:
                 use_container_width=True,
                 hide_index=True,
             )
-            st.caption(f"{len(agg)} active position(s)")
+            st.caption(f"{len(display)} active position(s)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — TRADE HISTORY
