@@ -209,6 +209,33 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertEqual(bot.trade_log[0]["status"], "LOSS")
         self.assertTrue(bot.trade_log[0]["resolved_pnl"].startswith("-"))
 
+    def test_resolve_position_snapshot_force_closes_max_age(self):
+        bot = botmod.PaperBot()
+        botmod.process_trade(bot, "alice", self._trade("tx-1", "Match A Winner"))
+
+        key = ("alice", "cond-1", 0)
+        pos = bot.positions[key]
+        now_ts = pos["opened_at"] + ((botmod.MAX_OPEN_HOURS + 2) * 3600)
+        botmod.resolve_position_snapshot(bot, key, px=0.40, resolved=False, now_ts=now_ts)
+
+        self.assertEqual(pos["status"], "LOSS")
+        self.assertIn("[MAX-AGE]", bot.status_msg)
+        self.assertEqual(bot.losses, 1)
+        self.assertEqual(bot.trade_log[0]["status"], "LOSS")
+
+    def test_resolve_position_snapshot_resolved_with_missing_price_forces_zero_loss(self):
+        bot = botmod.PaperBot()
+        botmod.process_trade(bot, "alice", self._trade("tx-1", "Match A Winner"))
+
+        key = ("alice", "cond-1", 0)
+        botmod.resolve_position_snapshot(bot, key, px=None, resolved=True)
+
+        pos = bot.positions[key]
+        self.assertEqual(pos["status"], "LOSS")
+        self.assertEqual(pos["last_price"], 0.0)
+        self.assertLess(bot.closed_pnl, 0)
+        self.assertEqual(bot.trade_log[0]["status"], "LOSS")
+
 
 if __name__ == "__main__":
     unittest.main()
