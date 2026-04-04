@@ -19,6 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from api_client import JsonApiClient
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,6 +47,7 @@ DATA_API  = "https://data-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 TRADERS   = ["majorexploiter", "beachboy4"]
 POSITION_KEYS = ["trader", "condition_id", "outcome_index"]
+HTTP = JsonApiClient(default_timeout=8.0, default_retries=3, backoff_base=1.0, jitter_max=0.2)
 
 
 def get_build_version() -> str:
@@ -292,12 +294,9 @@ def load_runtime_kv() -> dict:
 @st.cache_data(ttl=60)
 def fetch_price(condition_id: str, outcome_index: int) -> float | None:
     try:
-        r = requests.get(
-            f"{CLOB_API}/markets/{condition_id}",
-            timeout=5,
-        )
-        r.raise_for_status()
-        data = r.json()
+        data = HTTP.get_json(f"{CLOB_API}/markets/{condition_id}", timeout=5, retries=2)
+        if not isinstance(data, dict):
+            return None
         tokens = data.get("tokens") or []
         if outcome_index >= len(tokens):
             return None
@@ -333,21 +332,19 @@ def fetch_trader_live_stats(username: str) -> dict:
 
     def _leaderboard(period: str) -> dict | None:
         try:
-            r = requests.get(
+            data = HTTP.get_json(
                 LEADERBOARD_API,
                 params={"timePeriod": period, "userName": username, "limit": 1},
                 timeout=8,
+                retries=3,
             )
-            if r.status_code == 200:
-                data = r.json()
-                # API may return the full leaderboard; find our trader
-                if isinstance(data, list):
-                    for row in data:
-                        if str(row.get("userName", "")).lower() == username.lower():
-                            return row
-                    # If filtered correctly there may only be one entry
-                    if data:
-                        return data[0]
+            # API may return the full leaderboard; find our trader
+            if isinstance(data, list):
+                for row in data:
+                    if str(row.get("userName", "")).lower() == username.lower():
+                        return row
+                if data:
+                    return data[0]
         except Exception:
             pass
         return None
@@ -377,13 +374,13 @@ def fetch_trader_live_stats(username: str) -> dict:
     # Fetch public profile for bio (best-effort)
     if result["proxy_wallet"]:
         try:
-            rp = requests.get(
+            pd_data = HTTP.get_json(
                 PUBLIC_PROFILE_API,
                 params={"address": result["proxy_wallet"]},
                 timeout=6,
+                retries=2,
             )
-            if rp.status_code == 200:
-                pd_data = rp.json()
+            if isinstance(pd_data, dict):
                 result["bio"] = pd_data.get("bio") or pd_data.get("pseudonym")
         except Exception:
             pass
