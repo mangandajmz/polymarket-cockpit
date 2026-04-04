@@ -236,6 +236,63 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertLess(bot.closed_pnl, 0)
         self.assertEqual(bot.trade_log[0]["status"], "LOSS")
 
+    def test_backfill_resolved_positions_from_csv_restores_closed_history(self):
+        rows = [
+            {
+                "timestamp": "2026-04-03 00:00:00",
+                "trader": "beachboy4",
+                "market": "Legacy Market",
+                "outcome": "YES",
+                "whale_side": "BUY",
+                "whale_size_usdc": "1000",
+                "our_size_usdc": "10",
+                "price": "0.5",
+                "copy_shares": "20",
+                "conviction": "1.0",
+                "status": "WIN",
+                "resolved_pnl": "+5.0000",
+                "condition_id": "legacy-cond",
+                "outcome_index": "0",
+                "event_id": "legacy-e1",
+                "position_id": "beachboy4|legacy-cond|0",
+            },
+            {
+                "timestamp": "2026-04-03 00:02:00",
+                "trader": "beachboy4",
+                "market": "Legacy Market",
+                "outcome": "YES",
+                "whale_side": "BUY",
+                "whale_size_usdc": "1200",
+                "our_size_usdc": "5",
+                "price": "0.25",
+                "copy_shares": "20",
+                "conviction": "1.2",
+                "status": "WIN",
+                "resolved_pnl": "+5.0000",
+                "condition_id": "legacy-cond",
+                "outcome_index": "0",
+                "event_id": "legacy-e2",
+                "position_id": "beachboy4|legacy-cond|0",
+            },
+        ]
+        with open(botmod.CSV_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=botmod.CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        bot = botmod.PaperBot()
+        bot.trader_stats = {"beachboy4": {"wins": 1, "losses": 0}}
+
+        botmod.backfill_resolved_positions_from_csv(bot)
+
+        key = ("beachboy4", "legacy-cond", 0)
+        self.assertIn(key, bot.positions)
+        pos = bot.positions[key]
+        self.assertEqual(pos["status"], "WIN")
+        self.assertAlmostEqual(pos["total_cost"], 15.0)
+        self.assertAlmostEqual(pos["total_shares"], 40.0)
+        self.assertAlmostEqual(pos["pnl"], 5.0)
+
 
 if __name__ == "__main__":
     unittest.main()
