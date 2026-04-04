@@ -77,14 +77,83 @@ class StateStore:
                     value TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS opportunities (
+                    event_id TEXT PRIMARY KEY,
+                    observed_at_utc TEXT NOT NULL,
+                    trader TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    whale_side TEXT NOT NULL,
+                    whale_size_usdc REAL NOT NULL,
+                    price REAL NOT NULL,
+                    condition_id TEXT NOT NULL,
+                    outcome_index INTEGER NOT NULL,
+                    transaction_hash TEXT,
+                    source_timestamp INTEGER,
+                    opportunity_age_sec INTEGER NOT NULL DEFAULT 0,
+                    trader_resolved_count INTEGER NOT NULL DEFAULT 0,
+                    trader_win_rate REAL,
+                    daily_losses_for_trader INTEGER NOT NULL DEFAULT 0,
+                    daily_deploy_for_trader REAL NOT NULL DEFAULT 0,
+                    bankroll REAL,
+                    deployed_cap_pct REAL,
+                    open_positions_count INTEGER NOT NULL DEFAULT 0,
+                    median_whale_size REAL,
+                    conviction REAL,
+                    perf_mult REAL,
+                    dynamic_max_bet REAL,
+                    recommended_size REAL,
+                    copied_size_usdc REAL,
+                    copy_shares REAL,
+                    position_id TEXT,
+                    decision TEXT NOT NULL,
+                    decision_reason TEXT NOT NULL,
+                    is_crypto INTEGER NOT NULL DEFAULT 0,
+                    is_spread INTEGER NOT NULL DEFAULT 0,
+                    is_futures INTEGER NOT NULL DEFAULT 0,
+                    price_capped INTEGER NOT NULL DEFAULT 0,
+                    duplicate_game INTEGER NOT NULL DEFAULT 0,
+                    base_game TEXT,
+                    bayes_posterior_mean REAL,
+                    bayes_lower_bound REAL,
+                    shadow_model_score REAL,
+                    shadow_model_decision TEXT,
+                    resolution_status TEXT,
+                    resolved_pnl REAL,
+                    resolved_at_utc TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_fills_position_id
                     ON copied_fills(position_id);
                 CREATE INDEX IF NOT EXISTS idx_fills_timestamp
                     ON copied_fills(timestamp_utc);
                 CREATE INDEX IF NOT EXISTS idx_positions_status
                     ON positions(status);
+                CREATE INDEX IF NOT EXISTS idx_opportunities_observed
+                    ON opportunities(observed_at_utc);
+                CREATE INDEX IF NOT EXISTS idx_opportunities_position_id
+                    ON opportunities(position_id);
                 """
             )
+        self._ensure_opportunity_columns()
+
+    def _ensure_opportunity_columns(self):
+        required = {
+            "bayes_posterior_mean": "REAL",
+            "bayes_lower_bound": "REAL",
+            "shadow_model_score": "REAL",
+            "shadow_model_decision": "TEXT",
+        }
+        with self._connect() as conn:
+            cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()
+            }
+            for name, col_type in required.items():
+                if name not in cols:
+                    conn.execute(
+                        f"ALTER TABLE opportunities ADD COLUMN {name} {col_type}"
+                    )
 
     def load_seen_events(self) -> set[str]:
         with self._connect() as conn:
@@ -214,6 +283,241 @@ class StateStore:
                 (status, pnl, position_id),
             )
 
+    def upsert_opportunity(self, record: dict):
+        payload = {
+            "event_id": record.get("event_id", ""),
+            "observed_at_utc": record.get("observed_at_utc", ""),
+            "trader": record.get("trader", ""),
+            "market": record.get("market", ""),
+            "outcome": record.get("outcome", ""),
+            "whale_side": record.get("whale_side", ""),
+            "whale_size_usdc": float(record.get("whale_size_usdc", 0) or 0),
+            "price": float(record.get("price", 0) or 0),
+            "condition_id": record.get("condition_id", ""),
+            "outcome_index": int(record.get("outcome_index", 0) or 0),
+            "transaction_hash": record.get("transaction_hash", ""),
+            "source_timestamp": int(record.get("source_timestamp", 0) or 0),
+            "opportunity_age_sec": int(record.get("opportunity_age_sec", 0) or 0),
+            "trader_resolved_count": int(record.get("trader_resolved_count", 0) or 0),
+            "trader_win_rate": (
+                float(record.get("trader_win_rate"))
+                if record.get("trader_win_rate") is not None
+                else None
+            ),
+            "daily_losses_for_trader": int(record.get("daily_losses_for_trader", 0) or 0),
+            "daily_deploy_for_trader": float(record.get("daily_deploy_for_trader", 0) or 0),
+            "bankroll": (
+                float(record.get("bankroll"))
+                if record.get("bankroll") is not None
+                else None
+            ),
+            "deployed_cap_pct": (
+                float(record.get("deployed_cap_pct"))
+                if record.get("deployed_cap_pct") is not None
+                else None
+            ),
+            "open_positions_count": int(record.get("open_positions_count", 0) or 0),
+            "median_whale_size": (
+                float(record.get("median_whale_size"))
+                if record.get("median_whale_size") is not None
+                else None
+            ),
+            "conviction": (
+                float(record.get("conviction"))
+                if record.get("conviction") is not None
+                else None
+            ),
+            "perf_mult": (
+                float(record.get("perf_mult"))
+                if record.get("perf_mult") is not None
+                else None
+            ),
+            "dynamic_max_bet": (
+                float(record.get("dynamic_max_bet"))
+                if record.get("dynamic_max_bet") is not None
+                else None
+            ),
+            "recommended_size": (
+                float(record.get("recommended_size"))
+                if record.get("recommended_size") is not None
+                else None
+            ),
+            "copied_size_usdc": (
+                float(record.get("copied_size_usdc"))
+                if record.get("copied_size_usdc") is not None
+                else None
+            ),
+            "copy_shares": (
+                float(record.get("copy_shares"))
+                if record.get("copy_shares") is not None
+                else None
+            ),
+            "position_id": record.get("position_id"),
+            "decision": record.get("decision", "SEEN"),
+            "decision_reason": record.get("decision_reason", ""),
+            "is_crypto": 1 if record.get("is_crypto") else 0,
+            "is_spread": 1 if record.get("is_spread") else 0,
+            "is_futures": 1 if record.get("is_futures") else 0,
+            "price_capped": 1 if record.get("price_capped") else 0,
+            "duplicate_game": 1 if record.get("duplicate_game") else 0,
+            "base_game": record.get("base_game", ""),
+            "bayes_posterior_mean": (
+                float(record.get("bayes_posterior_mean"))
+                if record.get("bayes_posterior_mean") is not None
+                else None
+            ),
+            "bayes_lower_bound": (
+                float(record.get("bayes_lower_bound"))
+                if record.get("bayes_lower_bound") is not None
+                else None
+            ),
+            "shadow_model_score": (
+                float(record.get("shadow_model_score"))
+                if record.get("shadow_model_score") is not None
+                else None
+            ),
+            "shadow_model_decision": record.get("shadow_model_decision"),
+            "resolution_status": record.get("resolution_status"),
+            "resolved_pnl": (
+                float(record.get("resolved_pnl"))
+                if record.get("resolved_pnl") is not None
+                else None
+            ),
+            "resolved_at_utc": record.get("resolved_at_utc"),
+        }
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO opportunities (
+                    event_id, observed_at_utc, trader, market, outcome, whale_side,
+                    whale_size_usdc, price, condition_id, outcome_index, transaction_hash,
+                    source_timestamp, opportunity_age_sec, trader_resolved_count,
+                    trader_win_rate, daily_losses_for_trader, daily_deploy_for_trader,
+                    bankroll, deployed_cap_pct, open_positions_count, median_whale_size,
+                    conviction, perf_mult, dynamic_max_bet, recommended_size,
+                    copied_size_usdc, copy_shares, position_id, decision, decision_reason,
+                    is_crypto, is_spread, is_futures, price_capped, duplicate_game,
+                    bayes_posterior_mean, bayes_lower_bound, shadow_model_score, shadow_model_decision,
+                    base_game, resolution_status, resolved_pnl, resolved_at_utc
+                ) VALUES (
+                    :event_id, :observed_at_utc, :trader, :market, :outcome, :whale_side,
+                    :whale_size_usdc, :price, :condition_id, :outcome_index, :transaction_hash,
+                    :source_timestamp, :opportunity_age_sec, :trader_resolved_count,
+                    :trader_win_rate, :daily_losses_for_trader, :daily_deploy_for_trader,
+                    :bankroll, :deployed_cap_pct, :open_positions_count, :median_whale_size,
+                    :conviction, :perf_mult, :dynamic_max_bet, :recommended_size,
+                    :copied_size_usdc, :copy_shares, :position_id, :decision, :decision_reason,
+                    :is_crypto, :is_spread, :is_futures, :price_capped, :duplicate_game,
+                    :bayes_posterior_mean, :bayes_lower_bound, :shadow_model_score, :shadow_model_decision,
+                    :base_game, :resolution_status, :resolved_pnl, :resolved_at_utc
+                )
+                ON CONFLICT(event_id) DO UPDATE SET
+                    observed_at_utc=excluded.observed_at_utc,
+                    trader=excluded.trader,
+                    market=excluded.market,
+                    outcome=excluded.outcome,
+                    whale_side=excluded.whale_side,
+                    whale_size_usdc=excluded.whale_size_usdc,
+                    price=excluded.price,
+                    condition_id=excluded.condition_id,
+                    outcome_index=excluded.outcome_index,
+                    transaction_hash=excluded.transaction_hash,
+                    source_timestamp=excluded.source_timestamp,
+                    opportunity_age_sec=excluded.opportunity_age_sec,
+                    trader_resolved_count=excluded.trader_resolved_count,
+                    trader_win_rate=excluded.trader_win_rate,
+                    daily_losses_for_trader=excluded.daily_losses_for_trader,
+                    daily_deploy_for_trader=excluded.daily_deploy_for_trader,
+                    bankroll=excluded.bankroll,
+                    deployed_cap_pct=excluded.deployed_cap_pct,
+                    open_positions_count=excluded.open_positions_count,
+                    median_whale_size=excluded.median_whale_size,
+                    conviction=excluded.conviction,
+                    perf_mult=excluded.perf_mult,
+                    dynamic_max_bet=excluded.dynamic_max_bet,
+                    recommended_size=excluded.recommended_size,
+                    copied_size_usdc=excluded.copied_size_usdc,
+                    copy_shares=excluded.copy_shares,
+                    position_id=excluded.position_id,
+                    decision=excluded.decision,
+                    decision_reason=excluded.decision_reason,
+                    is_crypto=excluded.is_crypto,
+                    is_spread=excluded.is_spread,
+                    is_futures=excluded.is_futures,
+                    price_capped=excluded.price_capped,
+                    duplicate_game=excluded.duplicate_game,
+                    bayes_posterior_mean=excluded.bayes_posterior_mean,
+                    bayes_lower_bound=excluded.bayes_lower_bound,
+                    shadow_model_score=excluded.shadow_model_score,
+                    shadow_model_decision=excluded.shadow_model_decision,
+                    base_game=excluded.base_game,
+                    resolution_status=excluded.resolution_status,
+                    resolved_pnl=excluded.resolved_pnl,
+                    resolved_at_utc=excluded.resolved_at_utc
+                """,
+                payload,
+            )
+
+    def load_opportunities_for_position(self, position_id: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM opportunities
+                WHERE position_id = ?
+                ORDER BY observed_at_utc
+                """,
+                (position_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_opportunity_resolution(
+        self,
+        position_id: str | None,
+        status: str,
+        pnl: float | None,
+        resolved_at_utc: str,
+        *,
+        event_id: str | None = None,
+    ):
+        with self._lock, self._connect() as conn:
+            if event_id:
+                conn.execute(
+                    """
+                    UPDATE opportunities
+                       SET resolution_status = ?,
+                           resolved_pnl = ?,
+                           resolved_at_utc = ?
+                     WHERE event_id = ?
+                    """,
+                    (status, pnl, resolved_at_utc, event_id),
+                )
+            elif position_id:
+                conn.execute(
+                    """
+                    UPDATE opportunities
+                       SET resolution_status = ?,
+                           resolved_pnl = ?,
+                           resolved_at_utc = ?
+                     WHERE position_id = ?
+                    """,
+                    (status, pnl, resolved_at_utc, position_id),
+                )
+
+    def load_unresolved_opportunities(self, limit: int = 100) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM opportunities
+                WHERE resolution_status IS NULL
+                ORDER BY observed_at_utc
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def set_trader_stats(self, trader: str, wins: int, losses: int):
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -290,11 +594,17 @@ class StateStore:
                     "SELECT * FROM copied_fills ORDER BY timestamp_utc"
                 ).fetchall()
             ]
+            opportunities = [
+                dict(row) for row in conn.execute(
+                    "SELECT * FROM opportunities ORDER BY observed_at_utc"
+                ).fetchall()
+            ]
         return {
             "positions": positions,
             "trader_stats": trader_stats,
             "daily_risk": daily_rows,
             "fills": fills,
+            "opportunities": opportunities,
             "closed_pnl": float(self.get_value("closed_pnl", 0.0) or 0.0),
             "wins": int(self.get_value("wins", 0) or 0),
             "losses": int(self.get_value("losses", 0) or 0),
