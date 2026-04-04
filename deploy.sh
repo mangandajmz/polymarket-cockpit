@@ -66,8 +66,17 @@ echo "  OK: $SERVICE_DASH is active"
 
 echo
 echo "> Verifying dashboard listener..."
-if ! sudo ss -ltnp | grep -q ":${DASH_PORT}"; then
-    echo "  FAIL: no listener on port $DASH_PORT"
+READY=0
+for _ in $(seq 1 10); do
+    if sudo ss -ltnp | grep -q ":${DASH_PORT}"; then
+        READY=1
+        break
+    fi
+    sleep 2
+done
+if [[ "$READY" -ne 1 ]]; then
+    echo "  FAIL: no listener on port $DASH_PORT after waiting"
+    sudo journalctl -u "$SERVICE_DASH" -n 30 --no-pager || true
     exit 1
 fi
 sudo ss -ltnp | grep ":${DASH_PORT}" || true

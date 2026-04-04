@@ -172,7 +172,7 @@ def check_password() -> bool:
         st.markdown("## 🔐 Polymarket Bot Dashboard")
         with st.form("login"):
             pwd = st.text_input("Password", type="password", placeholder="Enter password")
-            if st.form_submit_button("Login", use_container_width=True):
+            if st.form_submit_button("Login", width="stretch"):
                 if pwd == PASSWORD:
                     st.session_state.authenticated = True
                     st.rerun()
@@ -892,7 +892,7 @@ with tab_pos:
                 styled = display
             st.dataframe(
                 styled,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.caption(f"{len(display)} active position(s)")
@@ -962,7 +962,7 @@ with tab_hist:
                 styled = display
             st.dataframe(
                 styled,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1097,7 +1097,7 @@ with tab_traders:
                     "Win Rate":      f"{wr_a:.1f}%",
                     "PnL ($)":       f"${pnl_a:+.2f}",
                 })
-            st.dataframe(pd.DataFrame(arch_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(arch_rows), width="stretch", hide_index=True)
 
     # ── Other Active Traders (in CSV but not in watchlist cache at all) ───────
     if not df.empty:
@@ -1141,7 +1141,7 @@ with tab_traders:
 
             st.dataframe(
                 pd.DataFrame(other_rows),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -1239,7 +1239,7 @@ with tab_perf:
             annotation_position="bottom right",
         )
         _apply_dark(fig_pnl, hovermode="x unified")
-        st.plotly_chart(fig_pnl, use_container_width=True)
+        st.plotly_chart(fig_pnl, width="stretch")
 
         # ── Chart 2: Rolling 10-trade win rate ────────────────────────────
         resolved_all["is_win"]  = (resolved_all["status"] == "WIN").astype(int)
@@ -1264,7 +1264,7 @@ with tab_perf:
             annotation_position="bottom right",
         )
         _apply_dark(fig_wr, hovermode="x unified", yaxis=dict(**_AXIS_STYLE, range=[0, 100]))
-        st.plotly_chart(fig_wr, use_container_width=True)
+        st.plotly_chart(fig_wr, width="stretch")
 
         # ── Chart 3: PnL by Trader (horizontal bar) ───────────────────────
         # Dedup per (trader, position) so shared positions count for each trader
@@ -1301,7 +1301,7 @@ with tab_perf:
             yaxis=dict(**_AXIS_STYLE, title=""),
             hovermode="y unified",
         )
-        st.plotly_chart(fig_tpnl, use_container_width=True)
+        st.plotly_chart(fig_tpnl, width="stretch")
 
         # ── Chart 4: Win Rate by Trader (horizontal bar) ──────────────────
         _twr_rows = []
@@ -1344,7 +1344,7 @@ with tab_perf:
             yaxis=dict(**_AXIS_STYLE, title=""),
             hovermode="y unified",
         )
-        st.plotly_chart(fig_twr, use_container_width=True)
+        st.plotly_chart(fig_twr, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 6 — MARKET BREAKDOWN
@@ -1371,7 +1371,7 @@ with tab_markets:
                 color_discrete_sequence=px.colors.qualitative.Set2,
             )
             fig_pie.update_traces(textposition="inside", textinfo="percent+label")
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
 
         with table_col:
             resolved_cat = positions_df(df_cat)
@@ -1392,7 +1392,7 @@ with tab_markets:
                     })
                 cat_stats_df = pd.DataFrame(cat_stats_rows)
                 st.markdown("**Win Rate by Category**")
-                st.dataframe(cat_stats_df, use_container_width=True, hide_index=True)
+                st.dataframe(cat_stats_df, width="stretch", hide_index=True)
 
                 # Best performing category by PnL
                 best_cat_row = max(cat_stats_rows, key=lambda r: float(r["PnL ($)"].replace("$", "").replace("+", "")))
@@ -1453,7 +1453,7 @@ with tab_risk:
                 nbins=20,
             )
             fig_hist.update_layout(showlegend=False, margin=dict(t=30))
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width="stretch")
         else:
             st.info("Not enough trades for distribution chart.")
 
@@ -1472,7 +1472,7 @@ with tab_logs:
     hdr_col, btn_col = st.columns([5, 1])
     hdr_col.subheader("Bot Logs & Activity Feed")
     with btn_col:
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
