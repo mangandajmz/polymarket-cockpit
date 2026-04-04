@@ -776,10 +776,10 @@ with tab_pos:
             rows = []
             for _, r in open_positions.iterrows():
                 pnl = float(r["pnl"] or 0.0)
-                px = r["last_price"]
-                near_zero = pd.notna(px) and float(px) < 0.05
+                last_px = r["last_price"]
+                near_zero = pd.notna(last_px) and float(last_px) < 0.05
                 emoji = "⚠️" if near_zero else ("🟢" if pnl >= 0 else "🔴")
-                curr = f"${float(px):.4f}" if pd.notna(px) else "N/A"
+                curr = f"${float(last_px):.4f}" if pd.notna(last_px) else "N/A"
                 pnl_str = f"${pnl:+.2f} ⚠️ Near Zero" if near_zero else f"${pnl:+.2f}"
                 rows.append({
                     "": emoji,
