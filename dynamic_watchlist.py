@@ -23,6 +23,7 @@ Win rate estimation:
 """
 
 import json
+import random
 import time
 import threading
 from datetime import datetime, timezone
@@ -55,8 +56,12 @@ def _req(url, params=None, retries=3):
             return r.json()
         except Exception:
             if attempt < retries - 1:
-                time.sleep(1 + attempt)
+                time.sleep(1 + attempt + random.uniform(0, 0.25))
     return None
+
+
+def _valid_addr(addr: str) -> bool:
+    return isinstance(addr, str) and addr.startswith("0x") and len(addr) >= 10
 
 
 # ── Permanent address cache ───────────────────────────────────────────────────
@@ -315,6 +320,18 @@ class WatchlistManager:
             f"next refresh ~{next_h:.1f}h"
         )
 
+    def _write_health(self, **extra):
+        if self._bot is None or not hasattr(self._bot, "store"):
+            return
+        payload = {
+            "active_names": sorted(self.get_active().keys()),
+            "active_count": len(self.get_active()),
+            "cache_total": len(self.cache),
+            "last_successful_refresh": self.cache.get_last_successful_refresh(),
+        }
+        payload.update(extra)
+        self._bot.store.set_value("watchlist_health", payload)
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _refresh_loop(self):
@@ -332,6 +349,7 @@ class WatchlistManager:
         try:
             self._do_refresh_inner()
         except Exception as exc:
+            self._write_health(last_error=repr(exc))
             self._log(
                 f"  [Watchlist] ERROR during refresh: {exc!r} — "
                 f"keeping existing list (last successful: "
@@ -345,6 +363,7 @@ class WatchlistManager:
             "limit": self.top_n * 6,
         })
         if not data:
+            self._write_health(last_error="leaderboard_fetch_failed")
             self._log(
                 f"  [Watchlist] Leaderboard fetch failed — keeping existing list "
                 f"(last successful: {self.cache.get_last_successful_refresh()})"
@@ -353,12 +372,29 @@ class WatchlistManager:
 
         rows = data if isinstance(data, list) else data.get("data", [])
         candidates = []
+        seen_addrs = set()
         for row in rows:
             addr = row.get("proxyWallet") or row.get("address") or ""
             name = row.get("name") or row.get("userName") or (addr[:10] if addr else "")
-            pnl  = float(row.get("pnl", 0))
-            if addr and name:
-                candidates.append({"name": name, "addr": addr, "pnl": pnl})
+            try:
+                pnl = float(row.get("pnl", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if not _valid_addr(addr) or not isinstance(name, str) or not name.strip():
+                continue
+            addr_key = addr.lower()
+            if addr_key in seen_addrs:
+                continue
+            seen_addrs.add(addr_key)
+            candidates.append({"name": name.strip(), "addr": addr, "pnl": pnl})
+
+        if not candidates:
+            self._write_health(last_error="no_valid_candidates")
+            self._log(
+                "  [Watchlist] Leaderboard payload had no valid trader candidates — "
+                "keeping existing list"
+            )
+            return
 
         # Re-sort by PNL descending to be explicit (API should already be sorted)
         candidates.sort(key=lambda x: x["pnl"], reverse=True)
@@ -385,10 +421,26 @@ class WatchlistManager:
             time.sleep(0.2)
 
         if not qualified:
+            self._write_health(last_error="no_qualified_traders")
             self._log(
                 f"  [Watchlist] No traders passed {self.min_wr}% WR filter "
                 f"(checked {checked}) — keeping existing list "
                 f"(last successful: {self.cache.get_last_successful_refresh()})"
+            )
+            return
+
+        with self._lock:
+            current_count = len(self._active)
+        min_required = self.top_n if current_count == 0 else max(1, min(current_count, self.top_n))
+        if len(qualified) < min_required:
+            self._write_health(
+                last_error="insufficient_qualified_traders",
+                qualified_count=len(qualified),
+                min_required=min_required,
+            )
+            self._log(
+                f"  [Watchlist] Only {len(qualified)} qualified trader(s); "
+                f"need at least {min_required} to replace current active set — keeping existing list"
             )
             return
 
@@ -422,6 +474,7 @@ class WatchlistManager:
             with self._bot.lock:
                 self._bot.trader_addrs       = new_active
                 self._bot.last_addr_refresh  = time.time()
+            self._write_health(last_error="")
 
         self._log(
             f"  [Watchlist] Active: {list(new_names)}  "

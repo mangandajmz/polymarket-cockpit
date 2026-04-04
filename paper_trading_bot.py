@@ -543,6 +543,48 @@ def persist_runtime_snapshot(bot: PaperBot):
     bot.store.set_value("budget_day_utc", bot._budget_date.isoformat())
 
 
+def _validate_runtime_invariants(bot: PaperBot):
+    issues = []
+    for pos in bot.positions.values():
+        related = [r for r in bot.trade_log if r.get("position_id") == pos.get("position_id")]
+        fill_cost = sum(float(r.get("our_size_usdc", 0) or 0) for r in related)
+        fill_shares = sum(float(r.get("copy_shares", 0) or 0) for r in related)
+        if abs(fill_cost - float(pos.get("total_cost", 0) or 0)) > 0.01:
+            issues.append(
+                f"position {pos.get('position_id')} cost mismatch "
+                f"fills={fill_cost:.4f} pos={float(pos.get('total_cost', 0) or 0):.4f}"
+            )
+        if abs(fill_shares - float(pos.get("total_shares", 0) or 0)) > 0.01:
+            issues.append(
+                f"position {pos.get('position_id')} shares mismatch "
+                f"fills={fill_shares:.4f} pos={float(pos.get('total_shares', 0) or 0):.4f}"
+            )
+
+    stat_totals = {}
+    for pos in bot.positions.values():
+        if pos.get("status") not in ("WIN", "LOSS"):
+            continue
+        trader = pos.get("trader", "unknown")
+        bucket = stat_totals.setdefault(trader, {"wins": 0, "losses": 0})
+        if pos["status"] == "WIN":
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+    for trader, stats in bot.trader_stats.items():
+        expected = stat_totals.get(trader, {"wins": 0, "losses": 0})
+        if stats != expected:
+            issues.append(
+                f"trader_stats mismatch for {trader}: expected {expected}, got {stats}"
+            )
+
+    if issues:
+        for issue in issues[:5]:
+            _log(f"[INVARIANT] {issue}")
+        bot.store.set_value("invariant_issues", issues)
+    else:
+        bot.store.set_value("invariant_issues", [])
+
+
 def append_csv(record: dict):
     row = {k: record.get(k, "") for k in CSV_FIELDS}
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
@@ -777,6 +819,7 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     bot.store.update_position(pos, now_str)
     bot.store.set_value("whale_sizes", bot.whale_sizes)
     bot.store.set_value("daily_deploy_per_trader", bot.daily_deploy_per_trader)
+    _validate_runtime_invariants(bot)
 
 
 # ── Resolution Checker (background thread) ────────────────────────────────────
@@ -1021,6 +1064,7 @@ def resolution_loop(bot: PaperBot):
                     bot.store.set_value("losses", bot.losses)
                     bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
                     _check_bankroll_scale(bot)
+                    _validate_runtime_invariants(bot)
                     # Sync in-memory trade log so the dashboard reflects WIN/LOSS
                     for rec in bot.trade_log:
                         if rec.get("position_id") == pos["position_id"]:
@@ -1086,6 +1130,7 @@ def resolution_loop(bot: PaperBot):
                         bot.store.set_value("losses", bot.losses)
                         bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
                         _check_bankroll_scale(bot)
+                        _validate_runtime_invariants(bot)
                         for rec in bot.trade_log:
                             if rec.get("position_id") == pos["position_id"]:
                                 rec["status"]       = result_tag
@@ -1096,6 +1141,7 @@ def resolution_loop(bot: PaperBot):
                             pos,
                             utc_now().strftime("%Y-%m-%d %H:%M:%S"),
                         )
+                        _validate_runtime_invariants(bot)
             time.sleep(0.15)
 
 
@@ -1336,6 +1382,7 @@ def main():
     _init_milestones(bot)   # must come after CSV load so closed_pnl is accurate
     if not loaded_from_store:
         persist_runtime_snapshot(bot)
+    _validate_runtime_invariants(bot)
     if bot.positions:
         print(f"  Reloaded {len(bot.positions)} open position(s) from previous run.")
 
