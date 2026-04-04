@@ -273,6 +273,46 @@ def load_open_positions() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30)
+def load_position_history() -> pd.DataFrame:
+    if not STATE_DB_PATH.exists():
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    position_id,
+                    trader,
+                    condition_id,
+                    outcome_index,
+                    market,
+                    outcome,
+                    opened_at_utc,
+                    updated_at_utc,
+                    status,
+                    total_cost,
+                    total_shares,
+                    last_price,
+                    pnl,
+                    close_reason
+                FROM positions
+                ORDER BY opened_at_utc
+                """,
+                conn,
+            )
+    except Exception as exc:
+        st.error(f"Could not read position history from state database: {exc}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for col in ["total_cost", "total_shares", "last_price", "pnl"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["opened_at_utc"] = pd.to_datetime(df["opened_at_utc"], utc=True, errors="coerce")
+    df["updated_at_utc"] = pd.to_datetime(df["updated_at_utc"], utc=True, errors="coerce")
+    return df
+
+
 @st.cache_data(ttl=15)
 def load_runtime_kv() -> dict:
     if not STATE_DB_PATH.exists():
@@ -544,6 +584,150 @@ def compute_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def compute_analytics(fills: pd.DataFrame, position_history: pd.DataFrame) -> dict:
+    out = {
+        "closed": pd.DataFrame(),
+        "open": pd.DataFrame(),
+        "trader_summary": pd.DataFrame(),
+        "entry_bucket": pd.DataFrame(),
+        "conviction_bucket": pd.DataFrame(),
+        "hold_bucket": pd.DataFrame(),
+    }
+    if fills.empty or position_history.empty:
+        return out
+
+    fill_cols = ["position_id", "trader", "condition_id", "outcome_index"]
+    usable = fills.copy()
+    if "position_id" not in usable.columns or usable["position_id"].isna().all():
+        usable["position_id"] = (
+            usable["trader"].astype(str) + "|" +
+            usable["condition_id"].astype(str) + "|" +
+            usable["outcome_index"].astype(str)
+        )
+
+    pos_fills = (
+        usable
+        .groupby(fill_cols, as_index=False)
+        .agg(
+            market=("market", "last"),
+            outcome=("outcome", "last"),
+            first_fill_ts=("timestamp", "min"),
+            last_fill_ts=("timestamp", "max"),
+            total_cost=("our_size_usdc", "sum"),
+            total_shares=("copy_shares", "sum"),
+            avg_conviction=("conviction", "mean"),
+            total_whale_size=("whale_size_usdc", "sum"),
+        )
+    )
+    pos_fills["avg_entry"] = pos_fills["total_cost"] / pos_fills["total_shares"].replace(0, pd.NA)
+
+    merged = position_history.merge(
+        pos_fills,
+        on=["position_id", "trader", "condition_id", "outcome_index"],
+        how="left",
+        suffixes=("", "_fill"),
+    )
+    merged["market"] = merged["market"].fillna(merged.get("market_fill"))
+    merged["outcome"] = merged["outcome"].fillna(merged.get("outcome_fill"))
+
+    closed = merged[merged["status"].isin(["WIN", "LOSS"])].copy()
+    open_df = merged[merged["status"] == "OPEN"].copy()
+
+    if not closed.empty:
+        closed["pnl"] = pd.to_numeric(closed["pnl"], errors="coerce").fillna(0.0)
+        closed["total_cost"] = pd.to_numeric(closed["total_cost"], errors="coerce").fillna(0.0)
+        closed["avg_entry"] = pd.to_numeric(closed["avg_entry"], errors="coerce")
+        closed["avg_conviction"] = pd.to_numeric(closed["avg_conviction"], errors="coerce")
+        closed["hold_hours"] = (
+            (closed["updated_at_utc"] - closed["opened_at_utc"]).dt.total_seconds() / 3600.0
+        )
+        closed["roi_pct"] = (
+            closed["pnl"] / closed["total_cost"].replace(0, pd.NA) * 100.0
+        )
+        closed["entry_bucket"] = pd.cut(
+            closed["avg_entry"],
+            bins=[0.0, 0.2, 0.4, 0.6, 0.8, 1.01],
+            labels=["<0.20", "0.20-0.40", "0.40-0.60", "0.60-0.80", "0.80+"],
+            include_lowest=True,
+        )
+        closed["conviction_bucket"] = pd.cut(
+            closed["avg_conviction"],
+            bins=[0.0, 0.8, 1.0, 1.2, 1.5, 99.0],
+            labels=["<0.8", "0.8-1.0", "1.0-1.2", "1.2-1.5", "1.5+"],
+            include_lowest=True,
+        )
+        closed["hold_bucket"] = pd.cut(
+            closed["hold_hours"],
+            bins=[0.0, 6.0, 24.0, 72.0, 168.0, 99999.0],
+            labels=["<6h", "6-24h", "1-3d", "3-7d", "7d+"],
+            include_lowest=True,
+        )
+
+        trader_rows = []
+        for trader, grp in closed.groupby("trader"):
+            wins = grp[grp["status"] == "WIN"]["pnl"]
+            losses = grp[grp["status"] == "LOSS"]["pnl"]
+            gross_wins = float(wins.sum()) if not wins.empty else 0.0
+            gross_losses = abs(float(losses.sum())) if not losses.empty else 0.0
+            trader_rows.append({
+                "Trader": trader,
+                "Trades": len(grp),
+                "Win Rate": grp["status"].eq("WIN").mean() * 100.0,
+                "PnL": float(grp["pnl"].sum()),
+                "Expectancy": float(grp["pnl"].mean()),
+                "Profit Factor": (gross_wins / gross_losses) if gross_losses else None,
+                "Avg Hold (h)": float(grp["hold_hours"].mean()) if grp["hold_hours"].notna().any() else None,
+                "Avg Entry": float(grp["avg_entry"].mean()) if grp["avg_entry"].notna().any() else None,
+            })
+        trader_summary = pd.DataFrame(trader_rows).sort_values(["PnL", "Expectancy"], ascending=False)
+
+        entry_bucket = (
+            closed.dropna(subset=["entry_bucket"])
+            .groupby("entry_bucket", observed=False)
+            .agg(
+                Trades=("position_id", "count"),
+                Win_Rate=("status", lambda s: (s == "WIN").mean() * 100.0),
+                Avg_PnL=("pnl", "mean"),
+                Total_PnL=("pnl", "sum"),
+            )
+            .reset_index()
+        )
+        conviction_bucket = (
+            closed.dropna(subset=["conviction_bucket"])
+            .groupby("conviction_bucket", observed=False)
+            .agg(
+                Trades=("position_id", "count"),
+                Win_Rate=("status", lambda s: (s == "WIN").mean() * 100.0),
+                Avg_PnL=("pnl", "mean"),
+                Total_PnL=("pnl", "sum"),
+            )
+            .reset_index()
+        )
+        hold_bucket = (
+            closed.dropna(subset=["hold_bucket"])
+            .groupby("hold_bucket", observed=False)
+            .agg(
+                Trades=("position_id", "count"),
+                Win_Rate=("status", lambda s: (s == "WIN").mean() * 100.0),
+                Avg_PnL=("pnl", "mean"),
+                Median_Hold_Hours=("hold_hours", "median"),
+            )
+            .reset_index()
+        )
+
+        out["closed"] = closed
+        out["trader_summary"] = trader_summary
+        out["entry_bucket"] = entry_bucket
+        out["conviction_bucket"] = conviction_bucket
+        out["hold_bucket"] = hold_bucket
+
+    if not open_df.empty:
+        open_df["category"] = open_df["market"].fillna("").apply(classify_market)
+        out["open"] = open_df
+
+    return out
+
+
 def load_watchlist_cache() -> tuple[dict, dict, str]:
     """Read watchlist_cache.json.
 
@@ -636,6 +820,7 @@ def parse_log_activity(n_lines: int = 200) -> list[dict]:
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 df    = load_trades()
+position_history = load_position_history()
 stats = compute_stats(df) if not df.empty else {
     "wins": 0, "losses": 0, "win_rate": 0, "all_time_pnl": 0,
     "today_pnl": 0, "today_spent": 0,
@@ -645,6 +830,7 @@ stats = compute_stats(df) if not df.empty else {
     "best_trade": None, "best_trade_pnl": 0, "worst_trade": None, "avg_size": 0,
     "max_drawdown": 0, "avg_win": 0, "avg_loss": 0, "rr_ratio": 0,
 }
+analytics = compute_analytics(df, position_history)
 
 # ── Shared runtime values ─────────────────────────────────────────────────────
 now_utc  = datetime.now(timezone.utc)
@@ -652,12 +838,13 @@ week_ago = now_utc - timedelta(days=7)
 day_ago  = now_utc - timedelta(days=1)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ov, tab_pos, tab_hist, tab_traders, tab_perf, tab_markets, tab_risk, tab_logs = st.tabs([
+tab_ov, tab_pos, tab_hist, tab_traders, tab_perf, tab_analytics, tab_markets, tab_risk, tab_logs = st.tabs([
     "📊 Overview",
     "💼 Positions",
     "📜 Trade History",
     "👥 Trader Watchlist",
     "📈 Performance",
+    "🧠 Analytics",
     "🌍 Markets",
     "⚠️ Risk",
     "🔍 Bot Logs",
@@ -1344,7 +1531,175 @@ with tab_perf:
         st.plotly_chart(fig_twr, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — MARKET BREAKDOWN
+# TAB 6 — ADVANCED ANALYTICS
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_analytics:
+    st.subheader("Advanced Analytics")
+
+    closed_analytics = analytics["closed"]
+    trader_summary = analytics["trader_summary"]
+    entry_bucket = analytics["entry_bucket"]
+    conviction_bucket = analytics["conviction_bucket"]
+    hold_bucket = analytics["hold_bucket"]
+    open_analytics = analytics["open"]
+
+    if closed_analytics.empty:
+        st.info("No canonical resolved positions available for deeper analytics yet.")
+    else:
+        gross_wins = float(closed_analytics.loc[closed_analytics["pnl"] > 0, "pnl"].sum())
+        gross_losses = abs(float(closed_analytics.loc[closed_analytics["pnl"] < 0, "pnl"].sum()))
+        expectancy = float(closed_analytics["pnl"].mean())
+        median_hold = float(closed_analytics["hold_hours"].median()) if closed_analytics["hold_hours"].notna().any() else 0.0
+        profit_factor = gross_wins / gross_losses if gross_losses else 0.0
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Expectancy / Trade", f"${expectancy:+.2f}")
+        a2.metric("Profit Factor", f"{profit_factor:.2f}x" if profit_factor else "N/A")
+        a3.metric("Median Hold", f"{median_hold:.1f}h")
+        a4.metric("Resolved Positions", len(closed_analytics))
+
+        st.divider()
+
+        top_col, expose_col = st.columns([3, 2])
+
+        with top_col:
+            st.markdown("**Trader Quality Table**")
+            trader_display = trader_summary.copy()
+            if not trader_display.empty:
+                trader_display["PnL"] = trader_display["PnL"].map(lambda v: f"${v:+.2f}")
+                trader_display["Expectancy"] = trader_display["Expectancy"].map(lambda v: f"${v:+.2f}")
+                trader_display["Win Rate"] = trader_display["Win Rate"].map(lambda v: f"{v:.1f}%")
+                trader_display["Profit Factor"] = trader_display["Profit Factor"].map(
+                    lambda v: f"{v:.2f}x" if pd.notna(v) else "N/A"
+                )
+                trader_display["Avg Hold (h)"] = trader_display["Avg Hold (h)"].map(
+                    lambda v: f"{v:.1f}" if pd.notna(v) else "N/A"
+                )
+                trader_display["Avg Entry"] = trader_display["Avg Entry"].map(
+                    lambda v: f"${v:.3f}" if pd.notna(v) else "N/A"
+                )
+                st.dataframe(trader_display, width="stretch", hide_index=True)
+
+        with expose_col:
+            st.markdown("**Open Exposure Concentration**")
+            if open_analytics.empty:
+                st.info("No open positions to analyze.")
+            else:
+                exp = (
+                    open_analytics.groupby("trader", as_index=False)["total_cost"]
+                    .sum()
+                    .sort_values("total_cost", ascending=False)
+                    .head(8)
+                )
+                fig_exp = px.bar(
+                    exp,
+                    x="total_cost",
+                    y="trader",
+                    orientation="h",
+                    title="Open Cost by Trader",
+                    labels={"total_cost": "Open Exposure ($)", "trader": ""},
+                    color="total_cost",
+                    color_continuous_scale="Tealgrn",
+                )
+                fig_exp.update_layout(showlegend=False, margin=dict(t=40, b=30, l=10, r=10))
+                st.plotly_chart(fig_exp, width="stretch")
+
+                cat_exp = (
+                    open_analytics.groupby("category", as_index=False)["total_cost"]
+                    .sum()
+                    .sort_values("total_cost", ascending=False)
+                )
+                cat_exp["Share"] = cat_exp["total_cost"] / cat_exp["total_cost"].sum() * 100.0
+                st.dataframe(
+                    cat_exp.assign(
+                        total_cost=cat_exp["total_cost"].map(lambda v: f"${v:.2f}"),
+                        Share=cat_exp["Share"].map(lambda v: f"{v:.1f}%"),
+                    ).rename(columns={"category": "Category", "total_cost": "Open Cost"}),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        st.divider()
+
+        ch1, ch2 = st.columns(2)
+        with ch1:
+            st.markdown("**PnL by Entry Price Bucket**")
+            if entry_bucket.empty:
+                st.info("Not enough resolved positions with entry-price data.")
+            else:
+                fig_entry = px.bar(
+                    entry_bucket,
+                    x="entry_bucket",
+                    y="Avg_PnL",
+                    color="Win_Rate",
+                    color_continuous_scale="RdYlGn",
+                    title="Average PnL by Entry Price",
+                    labels={"entry_bucket": "Entry Bucket", "Avg_PnL": "Average PnL ($)", "Win_Rate": "Win Rate %"},
+                    hover_data={"Trades": True, "Total_PnL": ":.2f"},
+                )
+                fig_entry.update_layout(margin=dict(t=40, b=30, l=10, r=10))
+                st.plotly_chart(fig_entry, width="stretch")
+
+        with ch2:
+            st.markdown("**PnL by Conviction Bucket**")
+            if conviction_bucket.empty:
+                st.info("Not enough resolved positions with conviction data.")
+            else:
+                fig_conv = px.bar(
+                    conviction_bucket,
+                    x="conviction_bucket",
+                    y="Avg_PnL",
+                    color="Win_Rate",
+                    color_continuous_scale="RdYlGn",
+                    title="Average PnL by Conviction",
+                    labels={"conviction_bucket": "Conviction Bucket", "Avg_PnL": "Average PnL ($)", "Win_Rate": "Win Rate %"},
+                    hover_data={"Trades": True, "Total_PnL": ":.2f"},
+                )
+                fig_conv.update_layout(margin=dict(t=40, b=30, l=10, r=10))
+                st.plotly_chart(fig_conv, width="stretch")
+
+        st.divider()
+
+        ch3, ch4 = st.columns(2)
+        with ch3:
+            st.markdown("**Hold Time vs PnL**")
+            hold_scatter = closed_analytics.dropna(subset=["hold_hours"]).copy()
+            if hold_scatter.empty:
+                st.info("No hold-time data available.")
+            else:
+                fig_hold = px.scatter(
+                    hold_scatter,
+                    x="hold_hours",
+                    y="pnl",
+                    color="status",
+                    hover_data=["trader", "market", "avg_entry", "avg_conviction"],
+                    title="Resolved PnL by Hold Time",
+                    labels={"hold_hours": "Hold Time (hours)", "pnl": "Resolved PnL ($)"},
+                    color_discrete_map={"WIN": "#00C48C", "LOSS": "#dc3545"},
+                )
+                fig_hold.update_layout(margin=dict(t=40, b=30, l=10, r=10))
+                st.plotly_chart(fig_hold, width="stretch")
+
+        with ch4:
+            st.markdown("**Hold-Time Bucket Summary**")
+            if hold_bucket.empty:
+                st.info("No hold-time summary available.")
+            else:
+                fig_hold_bucket = px.bar(
+                    hold_bucket,
+                    x="hold_bucket",
+                    y="Avg_PnL",
+                    color="Win_Rate",
+                    color_continuous_scale="RdYlGn",
+                    title="Average PnL by Hold Duration",
+                    labels={"hold_bucket": "Hold Bucket", "Avg_PnL": "Average PnL ($)", "Win_Rate": "Win Rate %"},
+                    hover_data={"Trades": True, "Median_Hold_Hours": ":.1f"},
+                )
+                fig_hold_bucket.update_layout(margin=dict(t=40, b=30, l=10, r=10))
+                st.plotly_chart(fig_hold_bucket, width="stretch")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — MARKET BREAKDOWN
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_markets:
     st.subheader("Market Breakdown")
