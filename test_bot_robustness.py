@@ -177,6 +177,38 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertEqual(restored_pos["status"], "WIN")
         self.assertEqual(len(restored.trade_log), 1)
 
+    def test_resolve_position_snapshot_marks_win_and_updates_trade_log(self):
+        bot = botmod.PaperBot()
+        botmod.process_trade(bot, "alice", self._trade("tx-1", "Match A Winner"))
+
+        key = ("alice", "cond-1", 0)
+        pos = bot.positions[key]
+        botmod.resolve_position_snapshot(bot, key, px=1.0, resolved=True, now_ts=pos["opened_at"] + 3600)
+
+        self.assertEqual(pos["status"], "WIN")
+        self.assertGreater(bot.closed_pnl, 0)
+        self.assertEqual(bot.wins, 1)
+        self.assertEqual(bot.losses, 0)
+        self.assertEqual(bot.trader_stats["alice"]["wins"], 1)
+        self.assertEqual(bot.trade_log[0]["status"], "WIN")
+        self.assertTrue(bot.trade_log[0]["resolved_pnl"].startswith("+"))
+
+    def test_resolve_position_snapshot_force_closes_zero_price_loss(self):
+        bot = botmod.PaperBot()
+        botmod.process_trade(bot, "alice", self._trade("tx-1", "Match A Winner"))
+
+        key = ("alice", "cond-1", 0)
+        pos = bot.positions[key]
+        now_ts = pos["opened_at"] + ((botmod.ZERO_PRICE_CLOSE_HOURS + 1) * 3600)
+        botmod.resolve_position_snapshot(bot, key, px=0.0, resolved=False, now_ts=now_ts)
+
+        self.assertEqual(pos["status"], "LOSS")
+        self.assertLess(bot.closed_pnl, 0)
+        self.assertEqual(bot.losses, 1)
+        self.assertEqual(bot.daily_losses_per_trader["alice"], 1)
+        self.assertEqual(bot.trade_log[0]["status"], "LOSS")
+        self.assertTrue(bot.trade_log[0]["resolved_pnl"].startswith("-"))
+
 
 if __name__ == "__main__":
     unittest.main()

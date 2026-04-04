@@ -938,6 +938,153 @@ def _check_bankroll_scale(bot: PaperBot):
                 _log("Scaling declined, keeping current config.")
 
 
+def resolve_position_snapshot(bot: PaperBot, key, px, resolved, now_ts: float | None = None):
+    trader_name, cid, oidx = key
+    now_ts = time.time() if now_ts is None else now_ts
+
+    if px is None and not resolved:
+        _log(f"  skip {cid[:20]}…  px=None resolved=False")
+        return
+    if px is None:
+        px = 0.0
+        _log(f"  [WARN] {cid[:20]}… resolved but px unknown — forcing close at 0.0")
+
+    with bot.lock:
+        pos = bot.positions.get(key)
+        if not pos or pos["status"] != "OPEN":
+            return
+        pos["last_price"] = px
+
+        age_days = (now_ts - pos.get("opened_at", now_ts)) / 86400
+        if age_days > STALE_POSITION_DAYS and not pos.get("stale_flagged"):
+            pos["stale_flagged"] = True
+            bot.status_msg = (
+                f"[STALE] {pos['title'][:35]} open {age_days:.0f} days — market may be stuck"
+            )
+
+        if resolved:
+            bot._refresh_budget()
+            proceeds = pos["total_shares"] * px
+            pnl      = proceeds - pos["total_cost"]
+            pos["pnl"]    = pnl
+            pos["status"] = "WIN" if pnl >= 0 else "LOSS"
+            bot.closed_pnl += pnl
+            if pnl >= 0:
+                bot.wins += 1
+                bot.daily_wins += pnl
+            else:
+                bot.losses += 1
+                bot.daily_losses += abs(pnl)
+            trader_name = pos.get("trader", "unknown")
+            s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
+            if pnl >= 0:
+                s["wins"] += 1
+            else:
+                s["losses"] += 1
+                bot.daily_losses_per_trader[trader_name] = (
+                    bot.daily_losses_per_trader.get(trader_name, 0) + 1
+                )
+            _auto_drop_trader(bot, trader_name, s)
+            result_tag = "WIN" if pnl >= 0 else "LOSS"
+            bot.status_msg = (
+                f"[RESOLVED] {pos['title'][:30]} | "
+                f"{pos['outcome']} → {result_tag} ${pnl:+.2f}"
+            )
+            _log(
+                f"  RESOLVED {cid[:20]}… oidx={oidx} "
+                f"px={px:.4f} shares={pos['total_shares']:.4f} "
+                f"cost={pos['total_cost']:.2f} pnl={pnl:+.4f} → {result_tag}"
+            )
+            update_csv_status(trader_name, cid, oidx, pos["status"], pnl)
+            bot.store.update_fill_resolution(pos["position_id"], pos["status"], pnl)
+            bot.store.update_position(
+                pos,
+                utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+                close_reason="RESOLVED",
+            )
+            bot.store.set_trader_stats(trader_name, s["wins"], s["losses"])
+            bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
+            bot.store.set_value("closed_pnl", bot.closed_pnl)
+            bot.store.set_value("wins", bot.wins)
+            bot.store.set_value("losses", bot.losses)
+            bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
+            _check_bankroll_scale(bot)
+            _validate_runtime_invariants(bot)
+            for rec in bot.trade_log:
+                if rec.get("position_id") == pos["position_id"]:
+                    rec["status"] = pos["status"]
+                    rec["resolved_pnl"] = f"{pnl:+.4f}"
+            return
+
+        age_hours = age_days * 24
+        if px < ZERO_PRICE_GUARD and age_hours > 12:
+            _log(f"  [WATCH] {cid[:20]} px={px:.4f} age={age_hours:.1f}h approaching force-close")
+
+        force_zero = px < ZERO_PRICE_GUARD and age_hours > ZERO_PRICE_CLOSE_HOURS
+        force_age  = age_hours > MAX_OPEN_HOURS
+        if force_zero or force_age:
+            bot._refresh_budget()
+            close_px   = px if px >= ZERO_PRICE_GUARD else 0.0
+            proceeds   = pos["total_shares"] * close_px
+            pnl        = proceeds - pos["total_cost"]
+            result_tag = "WIN" if pnl >= 0 else "LOSS"
+            reason     = "ZERO-PRICE" if force_zero else "MAX-AGE"
+            pos["pnl"]    = pnl
+            pos["status"] = result_tag
+            bot.closed_pnl += pnl
+            if pnl >= 0:
+                bot.wins += 1
+                bot.daily_wins += pnl
+            else:
+                bot.losses += 1
+                bot.daily_losses += abs(pnl)
+            trader_name = pos.get("trader", "unknown")
+            s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
+            if pnl >= 0:
+                s["wins"] += 1
+            else:
+                s["losses"] += 1
+                bot.daily_losses_per_trader[trader_name] = (
+                    bot.daily_losses_per_trader.get(trader_name, 0) + 1
+                )
+            _auto_drop_trader(bot, trader_name, s)
+            bot.status_msg = (
+                f"[{reason}] {pos['title'][:30]} | "
+                f"open {age_hours:.0f}h — forced {result_tag} ${pnl:+.2f}"
+            )
+            _log(
+                f"  [{reason}] {cid[:20]}… oidx={oidx} open {age_hours:.0f}h "
+                f"px={close_px:.4f} — forced close as {result_tag} pnl={pnl:+.4f}"
+            )
+            update_csv_status(trader_name, cid, oidx, result_tag, pnl)
+            bot.store.update_fill_resolution(pos["position_id"], result_tag, pnl)
+            bot.store.update_position(
+                pos,
+                utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+                close_reason=reason,
+            )
+            bot.store.set_trader_stats(trader_name, s["wins"], s["losses"])
+            bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
+            bot.store.set_value("closed_pnl", bot.closed_pnl)
+            bot.store.set_value("wins", bot.wins)
+            bot.store.set_value("losses", bot.losses)
+            bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
+            _check_bankroll_scale(bot)
+            _validate_runtime_invariants(bot)
+            for rec in bot.trade_log:
+                if rec.get("position_id") == pos["position_id"]:
+                    rec["status"] = result_tag
+                    rec["resolved_pnl"] = f"{pnl:+.4f}"
+            return
+
+        pos["pnl"] = pos["total_shares"] * px - pos["total_cost"]
+        bot.store.update_position(
+            pos,
+            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        _validate_runtime_invariants(bot)
+
+
 def _auto_drop_trader(bot: PaperBot, trader_name: str, s: dict):
     """
     Two-tier exit system optimised for capital preservation + growth.
@@ -1002,160 +1149,9 @@ def resolution_loop(bot: PaperBot):
         _log(f"resolution_loop: checking {len(open_keys)} open position(s)")
 
         for key in open_keys:
-            trader_name, cid, oidx = key
+            _, cid, oidx = key
             px, resolved = get_price_resolved(cid, oidx)
-
-            # Only skip if we have NO price AND the market is genuinely not resolved.
-            # A resolved market must never be left PENDING due to a price parse failure.
-            if px is None and not resolved:
-                _log(f"  skip {cid[:20]}…  px=None resolved=False")
-                continue
-            if px is None:
-                # Resolved but price still indeterminate after all fallbacks.
-                # Close at 0.0 (worst-case loss) so the position doesn't stay PENDING.
-                px = 0.0
-                _log(f"  [WARN] {cid[:20]}… resolved but px unknown — forcing close at 0.0")
-
-            with bot.lock:
-                pos = bot.positions.get(key)
-                if not pos or pos["status"] != "OPEN":
-                    continue
-                pos["last_price"] = px
-
-                # Flag stale positions
-                age_days = (time.time() - pos.get("opened_at", time.time())) / 86400
-                if age_days > STALE_POSITION_DAYS and not pos.get("stale_flagged"):
-                    pos["stale_flagged"] = True
-                    bot.status_msg = (
-                        f"[STALE] {pos['title'][:35]} open {age_days:.0f} days — market may be stuck"
-                    )
-
-                if resolved:
-                    bot._refresh_budget()
-                    proceeds = pos["total_shares"] * px
-                    pnl      = proceeds - pos["total_cost"]
-                    pos["pnl"]    = pnl
-                    pos["status"] = "WIN" if pnl >= 0 else "LOSS"
-                    bot.closed_pnl += pnl
-                    if pnl >= 0:
-                        bot.wins += 1
-                        bot.daily_wins += pnl          # accumulate today's gross wins
-                    else:
-                        bot.losses += 1
-                        bot.daily_losses += abs(pnl)   # accumulate today's gross losses
-                    # Update per-trader stats
-                    trader_name = pos.get("trader", "unknown")
-                    s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
-                    if pnl >= 0:
-                        s["wins"] += 1
-                    else:
-                        s["losses"] += 1
-                        bot.daily_losses_per_trader[trader_name] = (
-                            bot.daily_losses_per_trader.get(trader_name, 0) + 1
-                        )
-                    _auto_drop_trader(bot, trader_name, s)
-                    result_tag = "WIN" if pnl >= 0 else "LOSS"
-                    bot.status_msg = (
-                        f"[RESOLVED] {pos['title'][:30]} | "
-                        f"{pos['outcome']} → {result_tag} ${pnl:+.2f}"
-                    )
-                    _log(
-                        f"  RESOLVED {cid[:20]}… oidx={oidx} "
-                        f"px={px:.4f} shares={pos['total_shares']:.4f} "
-                        f"cost={pos['total_cost']:.2f} pnl={pnl:+.4f} → {result_tag}"
-                    )
-                    update_csv_status(trader_name, cid, oidx, pos["status"], pnl)
-                    bot.store.update_fill_resolution(pos["position_id"], pos["status"], pnl)
-                    bot.store.update_position(
-                        pos,
-                        utc_now().strftime("%Y-%m-%d %H:%M:%S"),
-                        close_reason="RESOLVED",
-                    )
-                    bot.store.set_trader_stats(trader_name, s["wins"], s["losses"])
-                    bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
-                    bot.store.set_value("closed_pnl", bot.closed_pnl)
-                    bot.store.set_value("wins", bot.wins)
-                    bot.store.set_value("losses", bot.losses)
-                    bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
-                    _check_bankroll_scale(bot)
-                    _validate_runtime_invariants(bot)
-                    # Sync in-memory trade log so the dashboard reflects WIN/LOSS
-                    for rec in bot.trade_log:
-                        if rec.get("position_id") == pos["position_id"]:
-                            rec["status"]       = pos["status"]
-                            rec["resolved_pnl"] = f"{pnl:+.4f}"
-                else:
-                    age_hours = age_days * 24
-
-                    # Early warning when approaching force-close threshold
-                    if px < ZERO_PRICE_GUARD and age_hours > 12:
-                        _log(f"  [WATCH] {cid[:20]} px={px:.4f} age={age_hours:.1f}h approaching force-close")
-
-                    # Force-close: price stuck at ~$0 (market likely resolved against us)
-                    force_zero = px < ZERO_PRICE_GUARD and age_hours > ZERO_PRICE_CLOSE_HOURS
-                    # Force-close: position open beyond max allowed duration
-                    force_age  = age_hours > MAX_OPEN_HOURS
-
-                    if force_zero or force_age:
-                        bot._refresh_budget()
-                        close_px   = px if px >= ZERO_PRICE_GUARD else 0.0
-                        proceeds   = pos["total_shares"] * close_px
-                        pnl        = proceeds - pos["total_cost"]
-                        result_tag = "WIN" if pnl >= 0 else "LOSS"
-                        reason     = "ZERO-PRICE" if force_zero else "MAX-AGE"
-                        pos["pnl"]    = pnl
-                        pos["status"] = result_tag
-                        bot.closed_pnl += pnl
-                        if pnl >= 0:
-                            bot.wins       += 1
-                            bot.daily_wins += pnl
-                        else:
-                            bot.losses       += 1
-                            bot.daily_losses += abs(pnl)
-                        trader_name = pos.get("trader", "unknown")
-                        s = bot.trader_stats.setdefault(trader_name, {"wins": 0, "losses": 0})
-                        if pnl >= 0:
-                            s["wins"] += 1
-                        else:
-                            s["losses"] += 1
-                            bot.daily_losses_per_trader[trader_name] = (
-                                bot.daily_losses_per_trader.get(trader_name, 0) + 1
-                            )
-                        _auto_drop_trader(bot, trader_name, s)
-                        bot.status_msg = (
-                            f"[{reason}] {pos['title'][:30]} | "
-                            f"open {age_hours:.0f}h — forced {result_tag} ${pnl:+.2f}"
-                        )
-                        _log(
-                            f"  [{reason}] {cid[:20]}… oidx={oidx} open {age_hours:.0f}h "
-                            f"px={close_px:.4f} — forced close as {result_tag} pnl={pnl:+.4f}"
-                        )
-                        update_csv_status(trader_name, cid, oidx, result_tag, pnl)
-                        bot.store.update_fill_resolution(pos["position_id"], result_tag, pnl)
-                        bot.store.update_position(
-                            pos,
-                            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
-                            close_reason=reason,
-                        )
-                        bot.store.set_trader_stats(trader_name, s["wins"], s["losses"])
-                        bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
-                        bot.store.set_value("closed_pnl", bot.closed_pnl)
-                        bot.store.set_value("wins", bot.wins)
-                        bot.store.set_value("losses", bot.losses)
-                        bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
-                        _check_bankroll_scale(bot)
-                        _validate_runtime_invariants(bot)
-                        for rec in bot.trade_log:
-                            if rec.get("position_id") == pos["position_id"]:
-                                rec["status"]       = result_tag
-                                rec["resolved_pnl"] = f"{pnl:+.4f}"
-                    else:
-                        pos["pnl"] = pos["total_shares"] * px - pos["total_cost"]
-                        bot.store.update_position(
-                            pos,
-                            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
-                        )
-                        _validate_runtime_invariants(bot)
+            resolve_position_snapshot(bot, key, px, resolved)
             time.sleep(0.15)
 
 
