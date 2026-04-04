@@ -292,6 +292,31 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertAlmostEqual(pos["total_cost"], 15.0)
         self.assertAlmostEqual(pos["total_shares"], 40.0)
         self.assertAlmostEqual(pos["pnl"], 5.0)
+        self.assertEqual(pos["close_reason"], "CSV-BACKFILL")
+
+    def test_invariants_skip_csv_backfilled_positions(self):
+        bot = botmod.PaperBot()
+        bot.positions[("legacy", "cond-x", 0)] = {
+            "position_id": "legacy|cond-x|0",
+            "condition_id": "cond-x",
+            "outcome_index": 0,
+            "title": "Legacy Market",
+            "outcome": "YES",
+            "trader": "legacy",
+            "opened_at": botmod.time.time(),
+            "opened_at_utc": "2026-04-03 00:00:00",
+            "total_cost": 100.0,
+            "total_shares": 150.0,
+            "status": "WIN",
+            "pnl": 25.0,
+            "last_price": 1.0,
+            "close_reason": "CSV-BACKFILL",
+        }
+        bot.trader_stats = {"legacy": {"wins": 1, "losses": 0}}
+
+        botmod._validate_runtime_invariants(bot)
+
+        self.assertEqual(bot.store.get_value("invariant_issues", []), [])
 
 
 if __name__ == "__main__":

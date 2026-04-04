@@ -505,6 +505,7 @@ def load_positions_from_store(bot: PaperBot) -> bool:
                 if row["last_price"] is not None
                 else None
             ),
+            "close_reason": row.get("close_reason"),
         }
 
     for fill in state["fills"]:
@@ -605,6 +606,7 @@ def backfill_resolved_positions_from_csv(bot: PaperBot):
             "status": pos["status"],
             "pnl": pos["pnl"],
             "last_price": pos["last_price"],
+            "close_reason": "CSV-BACKFILL",
         }
         bot.store.update_position(bot.positions[key], pos["updated_at_utc"], close_reason="CSV-BACKFILL")
         inserted += 1
@@ -637,6 +639,8 @@ def persist_runtime_snapshot(bot: PaperBot):
 def _validate_runtime_invariants(bot: PaperBot):
     issues = []
     for pos in bot.positions.values():
+        if pos.get("close_reason") == "CSV-BACKFILL":
+            continue
         related = [r for r in bot.trade_log if r.get("position_id") == pos.get("position_id")]
         fill_cost = sum(float(r.get("our_size_usdc", 0) or 0) for r in related)
         fill_shares = sum(float(r.get("copy_shares", 0) or 0) for r in related)
