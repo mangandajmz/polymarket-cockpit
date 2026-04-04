@@ -193,6 +193,7 @@ Set at minimum:
 DASHBOARD_PASSWORD=your_strong_password_here
 CSV_PATH=/home/ubuntu/polymarket-bot/paper_trades.csv
 LOG_PATH=/home/ubuntu/polymarket-bot/bot.log
+STATE_DB_PATH=/home/ubuntu/polymarket-bot/bot_state.db
 DAILY_LOSS_CAP=60.0
 STARTING_BANKROLL=300.0
 BOT_MODE=PAPER
@@ -275,7 +276,7 @@ Dashboard is now live at: **`http://YOUR_VPS_IP:8501`**
 ## Updating the bot
 
 ```bash
-ssh ubuntu@YOUR_VPS_IP "cd /home/ubuntu/polymarket-bot && git pull && pip install -r requirements.txt --no-cache-dir && sudo systemctl restart polymarket-bot polymarket-dash"
+ssh ubuntu@YOUR_VPS_IP "cd /home/ubuntu/polymarket-bot && bash deploy.sh"
 ```
 
 ---

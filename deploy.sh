@@ -1,65 +1,89 @@
 #!/usr/bin/env bash
-# deploy.sh — Pull latest code and restart bot + dashboard services
-# Usage: bash deploy.sh
-# Assumes services named: polymarket-bot   (systemd)
-#                          polymarket-dash  (systemd)
-# Edit SERVICE_BOT / SERVICE_DASH below if your names differ.
+# deploy.sh - Pull latest code and restart bot + dashboard services safely.
 
 set -euo pipefail
 
 SERVICE_BOT="polymarket-bot"
 SERVICE_DASH="polymarket-dash"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DASH_PORT="${DASH_PORT:-8502}"
 
-echo ""
-echo "═══════════════════════════════════════════"
-echo "  Polymarket Bot — Deploy"
-echo "  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-echo "═══════════════════════════════════════════"
-
-# ── 1. Pull latest code ───────────────────────────────────────────────────────
-echo ""
-echo "▶ Pulling latest changes from GitHub..."
 cd "$REPO_DIR"
-git pull origin "$(git rev-parse --abbrev-ref HEAD)"
-echo "  ✓ Code up to date"
 
-# ── 2. Install / upgrade dependencies ────────────────────────────────────────
-echo ""
-echo "▶ Installing dependencies..."
+BRANCH_NAME="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+BUILD_VERSION="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+echo
+echo "==========================================="
+echo "  Polymarket Bot Deploy"
+echo "  $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "==========================================="
+
+echo
+echo "> Pulling latest changes..."
+git pull origin "$BRANCH_NAME"
+BUILD_VERSION="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+echo "  OK: branch $BRANCH_NAME"
+echo "  OK: build  $BUILD_VERSION"
+
+echo
+echo "> Installing dependencies..."
 pip install -q --no-cache-dir --upgrade -r requirements.txt
-echo "  ✓ Dependencies OK"
+echo "  OK: dependencies"
 
-# ── 3. Restart bot service ────────────────────────────────────────────────────
-echo ""
-echo "▶ Restarting bot service ($SERVICE_BOT)..."
+echo
+echo "> Clearing stale listeners on port $DASH_PORT..."
+if command -v fuser >/dev/null 2>&1; then
+    sudo fuser -k "${DASH_PORT}/tcp" >/dev/null 2>&1 || true
+else
+    echo "  WARN: fuser not installed, skipping port cleanup"
+fi
+echo "  OK: port cleanup"
+
+echo
+echo "> Restarting bot service..."
 sudo systemctl restart "$SERVICE_BOT"
 sleep 2
-STATUS=$(systemctl is-active "$SERVICE_BOT" 2>/dev/null || echo "unknown")
-if [ "$STATUS" = "active" ]; then
-    echo "  ✓ $SERVICE_BOT is running"
-else
-    echo "  ✗ $SERVICE_BOT status: $STATUS"
-    echo "    Run: sudo journalctl -u $SERVICE_BOT -n 30"
+BOT_STATUS="$(systemctl is-active "$SERVICE_BOT" 2>/dev/null || echo unknown)"
+if [[ "$BOT_STATUS" != "active" ]]; then
+    echo "  FAIL: $SERVICE_BOT status is $BOT_STATUS"
+    sudo journalctl -u "$SERVICE_BOT" -n 30 --no-pager || true
     exit 1
 fi
+echo "  OK: $SERVICE_BOT is active"
 
-# ── 4. Restart dashboard service ─────────────────────────────────────────────
-echo ""
-echo "▶ Restarting dashboard service ($SERVICE_DASH)..."
+echo
+echo "> Restarting dashboard service..."
 sudo systemctl restart "$SERVICE_DASH"
 sleep 2
-STATUS=$(systemctl is-active "$SERVICE_DASH" 2>/dev/null || echo "unknown")
-if [ "$STATUS" = "active" ]; then
-    echo "  ✓ $SERVICE_DASH is running"
-else
-    echo "  ✗ $SERVICE_DASH status: $STATUS"
-    echo "    Run: sudo journalctl -u $SERVICE_DASH -n 30"
+DASH_STATUS="$(systemctl is-active "$SERVICE_DASH" 2>/dev/null || echo unknown)"
+if [[ "$DASH_STATUS" != "active" ]]; then
+    echo "  FAIL: $SERVICE_DASH status is $DASH_STATUS"
+    sudo journalctl -u "$SERVICE_DASH" -n 30 --no-pager || true
     exit 1
 fi
+echo "  OK: $SERVICE_DASH is active"
 
-echo ""
-echo "═══════════════════════════════════════════"
-echo "  ✓ Deploy complete"
-echo "═══════════════════════════════════════════"
-echo ""
+echo
+echo "> Verifying dashboard listener..."
+if ! sudo ss -ltnp | grep -q ":${DASH_PORT}"; then
+    echo "  FAIL: no listener on port $DASH_PORT"
+    exit 1
+fi
+sudo ss -ltnp | grep ":${DASH_PORT}" || true
+
+echo
+echo "> Recent bot logs..."
+sudo journalctl -u "$SERVICE_BOT" -n 5 --no-pager || true
+
+echo
+echo "> Recent dashboard logs..."
+sudo journalctl -u "$SERVICE_DASH" -n 5 --no-pager || true
+
+echo
+echo "==========================================="
+echo "  Deploy complete"
+echo "  Branch: $BRANCH_NAME"
+echo "  Build : $BUILD_VERSION"
+echo "==========================================="
+echo

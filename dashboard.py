@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -45,6 +46,24 @@ DATA_API  = "https://data-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 TRADERS   = ["majorexploiter", "beachboy4"]
 POSITION_KEYS = ["trader", "condition_id", "outcome_index"]
+
+
+def get_build_version() -> str:
+    env_version = os.getenv("APP_BUILD_VERSION", "").strip()
+    if env_version:
+        return env_version
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=_HERE,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=True,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
 
 CSV_FIELDS = [
     "timestamp", "trader", "market", "outcome", "whale_side",
@@ -745,6 +764,8 @@ with tab_ov:
     with s_lbl:
         st.write("Last heartbeat:")
         st.code(last_seen, language=None)
+    live_build = runtime_kv.get("health", {}).get("build_version") if isinstance(runtime_kv.get("health"), dict) else None
+    st.caption(f"Dashboard build: {get_build_version()} | Bot build: {live_build or 'unknown'}")
     watchlist_health = runtime_kv.get("watchlist_health", {})
     if watchlist_health:
         st.caption(

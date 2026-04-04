@@ -10,7 +10,7 @@ Ratio:     10:1  |  Daily budget: $50  |  Min whale: $150
 Poll:      every 30 seconds
 """
 
-import csv, hashlib, json, os, re, sys, time, threading, statistics
+import csv, hashlib, json, os, re, subprocess, sys, time, threading, statistics
 from datetime import datetime, date, timezone
 from pathlib import Path
 
@@ -133,6 +133,24 @@ def make_trade_event_id(trader_name: str, trade: dict) -> str:
         str(trade.get("price", 0)),
     ])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_build_version() -> str:
+    env_version = os.getenv("APP_BUILD_VERSION", "").strip()
+    if env_version:
+        return env_version
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=True,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
 
 # ── Bot State ─────────────────────────────────────────────────────────────────
 class PaperBot:
@@ -1371,6 +1389,7 @@ def main():
     print(f"  Sizing     : base ${BASE_BET} / max ${MAX_BET}  |  Daily loss cap: ${DAILY_LOSS_CAP}  |  Min whale: ${MIN_WHALE_SIZE}")
     print(f"  Poll cycle : every {POLL_INTERVAL}s  |  Max trade age: {MAX_TRADE_AGE}s")
     print(f"  Trade log  : {CSV_FILE.resolve()}")
+    print(f"  Build      : {get_build_version()}")
     print()
 
     bot = PaperBot()
@@ -1437,6 +1456,7 @@ def main():
 
     _log(f"Price cap: ACTIVE — entries >= ${MAX_ENTRY_PRICE} will be skipped")
     _log(f"Interactive mode: {'ON' if INTERACTIVE_MODE else 'OFF (service mode)'}")
+    _log(f"Build version: {get_build_version()}")
     bot.status_msg = "Live — scanning for qualifying BUY trades..."
 
     print(f"\n  [PAPER MODE] Monitoring started. Press Ctrl+C to stop.\n")
@@ -1472,6 +1492,7 @@ def _sync_health(bot: PaperBot):
         "api_fail_count": bot.api_fail_count,
         "last_addr_refresh": bot.last_addr_refresh,
         "last_heartbeat_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "build_version": get_build_version(),
     })
 
 
