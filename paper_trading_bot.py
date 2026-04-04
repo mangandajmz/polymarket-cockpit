@@ -615,6 +615,24 @@ def backfill_resolved_positions_from_csv(bot: PaperBot):
         _log(f"[BACKFILL] Added {inserted} historical resolved position(s) from CSV into canonical state")
 
 
+def rebuild_trader_stats_from_positions(bot: PaperBot):
+    """Recompute trader stats from canonical closed positions."""
+    rebuilt = {}
+    for pos in bot.positions.values():
+        if pos.get("status") not in ("WIN", "LOSS"):
+            continue
+        trader = pos.get("trader", "unknown")
+        bucket = rebuilt.setdefault(trader, {"wins": 0, "losses": 0})
+        if pos["status"] == "WIN":
+            bucket["wins"] += 1
+        else:
+            bucket["losses"] += 1
+
+    bot.trader_stats = rebuilt
+    for trader, stats in rebuilt.items():
+        bot.store.set_trader_stats(trader, stats["wins"], stats["losses"])
+
+
 def persist_runtime_snapshot(bot: PaperBot):
     for record in bot.trade_log:
         bot.store.upsert_fill(record)
@@ -1472,6 +1490,7 @@ def main():
     if not loaded_from_store:
         load_positions_from_csv(bot)
     backfill_resolved_positions_from_csv(bot)
+    rebuild_trader_stats_from_positions(bot)
     _init_milestones(bot)   # must come after CSV load so closed_pnl is accurate
     if not loaded_from_store:
         persist_runtime_snapshot(bot)
