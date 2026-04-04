@@ -246,6 +246,56 @@ def load_open_positions() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
+def load_opportunities() -> pd.DataFrame:
+    if not STATE_DB_PATH.exists():
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    event_id,
+                    observed_at_utc,
+                    trader,
+                    market,
+                    outcome,
+                    whale_side,
+                    whale_size_usdc,
+                    price,
+                    opportunity_age_sec,
+                    trader_resolved_count,
+                    trader_win_rate,
+                    conviction,
+                    decision,
+                    decision_reason,
+                    bayes_posterior_mean,
+                    bayes_lower_bound,
+                    shadow_model_score,
+                    shadow_model_decision,
+                    resolution_status,
+                    resolved_at_utc
+                FROM opportunities
+                ORDER BY observed_at_utc DESC
+                """,
+                conn,
+            )
+    except Exception as exc:
+        st.error(f"Could not read opportunities from state database: {exc}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for col in [
+        "whale_size_usdc", "price", "opportunity_age_sec", "trader_resolved_count",
+        "trader_win_rate", "conviction", "bayes_posterior_mean", "bayes_lower_bound",
+        "shadow_model_score",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["observed_at_utc"] = pd.to_datetime(df["observed_at_utc"], utc=True, errors="coerce")
+    df["resolved_at_utc"] = pd.to_datetime(df["resolved_at_utc"], utc=True, errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=30)
 def load_position_history() -> pd.DataFrame:
     if not STATE_DB_PATH.exists():
         return pd.DataFrame()
@@ -849,6 +899,7 @@ def parse_log_activity(n_lines: int = 200) -> list[dict]:
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 df    = load_trades()
+opps  = load_opportunities()
 position_history = load_position_history()
 stats = compute_stats(df) if not df.empty else {
     "wins": 0, "losses": 0, "win_rate": 0, "all_time_pnl": 0,
@@ -867,10 +918,11 @@ week_ago = now_utc - timedelta(days=7)
 day_ago  = now_utc - timedelta(days=1)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ov, tab_pos, tab_hist, tab_traders, tab_perf, tab_analytics, tab_markets, tab_risk, tab_logs = st.tabs([
+tab_ov, tab_pos, tab_hist, tab_shadow, tab_traders, tab_perf, tab_analytics, tab_markets, tab_risk, tab_logs = st.tabs([
     "📊 Overview",
     "💼 Positions",
     "📜 Trade History",
+    "🧠 Shadow",
     "👥 Trader Watchlist",
     "📈 Performance",
     "🧠 Analytics",
@@ -992,6 +1044,41 @@ with tab_ov:
         st.error("Invariant warnings detected in bot state.")
         for issue in invariant_issues[:3]:
             st.code(issue, language=None)
+    if not opps.empty:
+        st.divider()
+        st.subheader("Shadow Signals")
+        resolved_opps = opps[opps["resolution_status"].isin(["WIN", "LOSS"])].copy()
+        recommended_take = int(opps["shadow_model_decision"].eq("TAKE").sum())
+        bayes_ready = int((opps["bayes_lower_bound"].fillna(0) * 100 >= MIN_WIN_RATE).sum())
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Logged Opportunities", f"{len(opps):,}")
+        s2.metric("Model TAKE Signals", f"{recommended_take:,}")
+        s3.metric("Bayes >= 60% LCB", f"{bayes_ready:,}")
+        s4.metric("Resolved Opportunities", f"{len(resolved_opps):,}")
+
+        preview = opps.copy()
+        preview["Observed"] = preview["observed_at_utc"].dt.strftime("%Y-%m-%d %H:%M")
+        preview["Observed WR"] = preview["trader_win_rate"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "—")
+        preview["Bayes Mean"] = preview["bayes_posterior_mean"].map(lambda v: f"{v*100:.1f}%" if pd.notna(v) else "—")
+        preview["Bayes LCB"] = preview["bayes_lower_bound"].map(lambda v: f"{v*100:.1f}%" if pd.notna(v) else "—")
+        preview["Model Score"] = preview["shadow_model_score"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "—")
+        preview["Whale $"] = preview["whale_size_usdc"].map(lambda v: f"${v:,.0f}" if pd.notna(v) else "—")
+        st.dataframe(
+            preview[[
+                "Observed", "trader", "market", "decision", "decision_reason",
+                "shadow_model_decision", "Model Score", "Bayes Mean", "Bayes LCB",
+                "Observed WR", "Whale $", "resolution_status",
+            ]].head(12).rename(columns={
+                "trader": "Trader",
+                "market": "Market",
+                "decision": "Heuristic",
+                "decision_reason": "Reason",
+                "shadow_model_decision": "Model",
+                "resolution_status": "Outcome",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 — ACTIVE POSITIONS
@@ -1113,6 +1200,193 @@ with tab_pos:
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — TRADE HISTORY
 # ══════════════════════════════════════════════════════════════════════════════
+with tab_shadow:
+    st.subheader("Shadow Opportunity Review")
+    if opps.empty:
+        st.info("No logged opportunities yet.")
+    else:
+        shadow = opps.copy()
+        shadow["Observed"] = shadow["observed_at_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        shadow["Bayes Mean %"] = shadow["bayes_posterior_mean"] * 100.0
+        shadow["Bayes LCB %"] = shadow["bayes_lower_bound"] * 100.0
+        shadow["Model %"] = shadow["shadow_model_score"] * 100.0
+        shadow["heuristic_vs_model"] = shadow.apply(
+            lambda r: "Agree"
+            if ((str(r.get("decision", "")) == "COPIED" and str(r.get("shadow_model_decision", "")) == "TAKE")
+                or (str(r.get("decision", "")) == "SKIP" and str(r.get("shadow_model_decision", "")) == "SKIP"))
+            else "Disagree",
+            axis=1,
+        )
+
+        top = st.columns(4)
+        top[0].metric("Heuristic COPIED", int(shadow["decision"].eq("COPIED").sum()))
+        top[1].metric("Model TAKE", int(shadow["shadow_model_decision"].eq("TAKE").sum()))
+        top[2].metric("Agreement", f"{shadow['heuristic_vs_model'].eq('Agree').mean()*100:.1f}%")
+        top[3].metric("Resolved Rows", int(shadow["resolution_status"].isin(["WIN", "LOSS"]).sum()))
+
+        resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
+        if not resolved_shadow.empty:
+            resolved_shadow["is_win"] = resolved_shadow["resolution_status"].eq("WIN").astype(int)
+            diag1, diag2 = st.columns(2)
+
+            with diag1:
+                st.markdown("**Model Calibration**")
+                calib = resolved_shadow.dropna(subset=["shadow_model_score"]).copy()
+                if len(calib) >= 8:
+                    calib["score_bucket"] = pd.cut(
+                        calib["shadow_model_score"],
+                        bins=[0.0, 0.45, 0.55, 0.65, 0.75, 1.0],
+                        include_lowest=True,
+                    )
+                    calib_df = (
+                        calib.groupby("score_bucket", observed=False)
+                        .agg(
+                            predicted=("shadow_model_score", "mean"),
+                            actual=("is_win", "mean"),
+                            n=("is_win", "size"),
+                        )
+                        .reset_index()
+                    )
+                    calib_df = calib_df[calib_df["n"] > 0]
+                    if not calib_df.empty:
+                        fig_cal = go.Figure()
+                        fig_cal.add_trace(go.Scatter(
+                            x=calib_df["predicted"] * 100.0,
+                            y=calib_df["actual"] * 100.0,
+                            mode="lines+markers+text",
+                            text=calib_df["n"].map(lambda v: f"n={v}"),
+                            textposition="top center",
+                            name="Observed",
+                            line=dict(color="#00a651", width=3),
+                        ))
+                        fig_cal.add_trace(go.Scatter(
+                            x=[0, 100], y=[0, 100],
+                            mode="lines",
+                            name="Perfect",
+                            line=dict(color="#888", dash="dash"),
+                        ))
+                        fig_cal.update_layout(
+                            title="Predicted vs Actual Win Rate",
+                            template="plotly_dark",
+                            height=320,
+                            margin=dict(l=20, r=20, t=50, b=20),
+                            xaxis_title="Predicted Win Rate (%)",
+                            yaxis_title="Actual Win Rate (%)",
+                            showlegend=False,
+                        )
+                        st.plotly_chart(fig_cal, width="stretch")
+                else:
+                    st.info("Need more resolved model-scored opportunities for calibration.")
+
+            with diag2:
+                st.markdown("**Bayesian Gate Quality**")
+                bayes = resolved_shadow.dropna(subset=["bayes_lower_bound"]).copy()
+                if len(bayes) >= 8:
+                    bayes["lcb_bucket"] = pd.cut(
+                        bayes["bayes_lower_bound"] * 100.0,
+                        bins=[0, 40, 50, 60, 70, 100],
+                        include_lowest=True,
+                    )
+                    bayes_df = (
+                        bayes.groupby("lcb_bucket", observed=False)
+                        .agg(
+                            win_rate=("is_win", "mean"),
+                            n=("is_win", "size"),
+                        )
+                        .reset_index()
+                    )
+                    bayes_df = bayes_df[bayes_df["n"] > 0]
+                    if not bayes_df.empty:
+                        fig_bayes = go.Figure(go.Bar(
+                            x=bayes_df["lcb_bucket"].astype(str),
+                            y=bayes_df["win_rate"] * 100.0,
+                            text=bayes_df["n"].map(lambda v: f"n={v}"),
+                            textposition="outside",
+                            marker_color="#ffb000",
+                        ))
+                        fig_bayes.update_layout(
+                            title="Observed Win Rate by Bayesian LCB Bucket",
+                            template="plotly_dark",
+                            height=320,
+                            margin=dict(l=20, r=20, t=50, b=20),
+                            xaxis_title="Bayesian Lower Bound Bucket (%)",
+                            yaxis_title="Actual Win Rate (%)",
+                            yaxis=dict(range=[0, 100]),
+                        )
+                        st.plotly_chart(fig_bayes, width="stretch")
+                else:
+                    st.info("Need more resolved Bayesian-scored opportunities.")
+
+            st.markdown("**Rolling shadow quality**")
+            rolling = resolved_shadow.sort_values("observed_at_utc").copy()
+            rolling["model_take"] = rolling["shadow_model_decision"].eq("TAKE").astype(int)
+            rolling["model_correct"] = (
+                ((rolling["shadow_model_decision"] == "TAKE") & (rolling["resolution_status"] == "WIN"))
+                | ((rolling["shadow_model_decision"] == "SKIP") & (rolling["resolution_status"] == "LOSS"))
+            ).astype(int)
+            rolling["rolling_correct"] = rolling["model_correct"].rolling(25, min_periods=5).mean() * 100.0
+            rolling["rolling_take_rate"] = rolling["model_take"].rolling(25, min_periods=5).mean() * 100.0
+            fig_roll = go.Figure()
+            fig_roll.add_trace(go.Scatter(
+                x=rolling["observed_at_utc"],
+                y=rolling["rolling_correct"],
+                mode="lines",
+                name="Model correctness",
+                line=dict(color="#00a651", width=3),
+            ))
+            fig_roll.add_trace(go.Scatter(
+                x=rolling["observed_at_utc"],
+                y=rolling["rolling_take_rate"],
+                mode="lines",
+                name="Model take rate",
+                line=dict(color="#1f77b4", width=2, dash="dot"),
+            ))
+            fig_roll.update_layout(
+                template="plotly_dark",
+                height=320,
+                margin=dict(l=20, r=20, t=30, b=20),
+                yaxis_title="Percent",
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_roll, width="stretch")
+
+        disagreed = shadow[shadow["heuristic_vs_model"] == "Disagree"].copy()
+        st.markdown("**Recent disagreements**")
+        if disagreed.empty:
+            st.success("Heuristic and shadow model currently agree on all logged opportunities.")
+        else:
+            st.dataframe(
+                disagreed[[
+                    "Observed", "trader", "market", "decision", "decision_reason",
+                    "shadow_model_decision", "Model %", "Bayes LCB %", "resolution_status"
+                ]].head(50).rename(columns={
+                    "trader": "Trader",
+                    "market": "Market",
+                    "decision": "Heuristic",
+                    "decision_reason": "Reason",
+                    "shadow_model_decision": "Model",
+                    "resolution_status": "Outcome",
+                }),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.markdown("**Latest opportunity ledger**")
+        st.dataframe(
+            shadow[[
+                "Observed", "trader", "market", "decision", "shadow_model_decision",
+                "Bayes Mean %", "Bayes LCB %", "Model %", "resolution_status"
+            ]].head(200).rename(columns={
+                "trader": "Trader",
+                "market": "Market",
+                "decision": "Heuristic",
+                "shadow_model_decision": "Model",
+                "resolution_status": "Outcome",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
+
 with tab_hist:
     st.subheader("Trade History")
 

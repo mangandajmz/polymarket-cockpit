@@ -177,6 +177,73 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertEqual(restored_pos["status"], "WIN")
         self.assertEqual(len(restored.trade_log), 1)
 
+    def test_opportunities_log_skips_and_resolution_updates(self):
+        bot = botmod.PaperBot()
+
+        skipped = self._trade("tx-skip", "BTC to $200k?")
+        copied = self._trade("tx-copy", "Match A Winner")
+        skipped_event = botmod.make_trade_event_id("alice", skipped)
+        copied_event = botmod.make_trade_event_id("alice", copied)
+
+        botmod.process_trade(bot, "alice", skipped)
+        botmod.process_trade(bot, "alice", copied)
+
+        with bot.store._connect() as conn:
+            rows = {
+                row["event_id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM opportunities ORDER BY observed_at_utc"
+                ).fetchall()
+            }
+
+        self.assertEqual(rows[skipped_event]["decision"], "SKIP")
+        self.assertEqual(rows[skipped_event]["decision_reason"], "crypto_market")
+        self.assertEqual(rows[copied_event]["decision"], "COPIED")
+        self.assertEqual(rows[copied_event]["position_id"], "alice|cond-1|0")
+        self.assertIsNotNone(rows[copied_event]["bayes_posterior_mean"])
+        self.assertIsNotNone(rows[copied_event]["bayes_lower_bound"])
+        self.assertIsNotNone(rows[copied_event]["shadow_model_score"])
+        self.assertIn(rows[copied_event]["shadow_model_decision"], ("SKIP", "TAKE"))
+
+        key = ("alice", "cond-1", 0)
+        pos = bot.positions[key]
+        botmod.resolve_position_snapshot(bot, key, px=1.0, resolved=True, now_ts=pos["opened_at"] + 3600)
+
+        with bot.store._connect() as conn:
+            resolved_row = dict(
+                conn.execute(
+                    "SELECT * FROM opportunities WHERE event_id = ?",
+                    (copied_event,),
+                ).fetchone()
+            )
+
+        self.assertEqual(resolved_row["resolution_status"], "WIN")
+        self.assertGreater(float(resolved_row["resolved_pnl"]), 0.0)
+
+    def test_resolve_logged_opportunities_labels_skipped_trade(self):
+        bot = botmod.PaperBot()
+        skipped = self._trade("tx-skip-2", "Match C Winner")
+        skipped_event = botmod.make_trade_event_id("alice", skipped)
+
+        with patch.object(botmod, "MIN_WHALE_SIZE", 5000.0):
+            botmod.process_trade(bot, "alice", skipped)
+
+        with patch.object(botmod, "get_price_resolved", return_value=(1.0, True)):
+            botmod.resolve_logged_opportunities(bot, limit=10)
+
+        with bot.store._connect() as conn:
+            resolved_row = dict(
+                conn.execute(
+                    "SELECT * FROM opportunities WHERE event_id = ?",
+                    (skipped_event,),
+                ).fetchone()
+            )
+
+        self.assertEqual(resolved_row["decision"], "SKIP")
+        self.assertEqual(resolved_row["decision_reason"], "below_min_whale_size")
+        self.assertEqual(resolved_row["resolution_status"], "WIN")
+        self.assertIsNone(resolved_row["resolved_pnl"])
+
     def test_resolve_position_snapshot_marks_win_and_updates_trade_log(self):
         bot = botmod.PaperBot()
         botmod.process_trade(bot, "alice", self._trade("tx-1", "Match A Winner"))

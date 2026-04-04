@@ -16,7 +16,9 @@ from pathlib import Path
 
 import requests
 from api_client import JsonApiClient
+from bayesian_stats import compute_posterior, estimate_beta_prior, rank_trader_posteriors
 from dynamic_watchlist import WatchlistManager, TRADER_BLOCKLIST
+from shadow_model import OnlineLogisticModel
 from state_store import StateStore
 
 try:
@@ -180,13 +182,15 @@ class PaperBot:
         self.daily_losses_per_trader = {}  # trader_name → losses today (reset at midnight UTC)
         self.daily_deploy_per_trader = {}  # trader → $ deployed today
         self.milestones_reached      = set()  # bankroll thresholds already prompted
+        self.shadow_model            = OnlineLogisticModel()
+        self.shadow_trained_events   = set()
 
     def _refresh_budget(self):
         today = utc_today()
         if today != self._budget_date:
-            self.daily_losses            = 0.0
-            self.daily_wins              = 0.0
-            self._budget_date            = today
+            self.daily_losses = 0.0
+            self.daily_wins = 0.0
+            self._budget_date = today
             self.daily_losses_per_trader = {}
             self.daily_deploy_per_trader = {}
         self.store.set_daily_risk(today.isoformat(), self.daily_wins, self.daily_losses)
@@ -213,6 +217,141 @@ class PaperBot:
     @property
     def total_pnl(self):
         return self.closed_pnl + self.unrealised_pnl
+
+
+def _base_game_name(title: str) -> str:
+    return re.sub(
+        r':\s*(O/U|Spread).*$', '', title, flags=re.IGNORECASE
+    ).strip().lower()
+
+
+def _make_opportunity_record(
+    bot: PaperBot,
+    trader_name: str,
+    trade: dict,
+    *,
+    event_id: str,
+    age: int,
+    usdc: float,
+    px: float,
+    cid: str,
+    oidx: int,
+    title: str,
+    outcome: str,
+    side: str,
+    tx: str,
+    ts: int,
+) -> dict:
+    stats = bot.trader_stats.get(trader_name, {"wins": 0, "losses": 0})
+    resolved = stats["wins"] + stats["losses"]
+    wr = (stats["wins"] / resolved * 100) if resolved > 0 else None
+    bankroll = STARTING_BANKROLL + bot.closed_pnl + bot.unrealised_pnl
+    deployed = sum(
+        p["total_cost"]
+        for p in bot.positions.values()
+        if p.get("status") == "OPEN"
+    )
+    deployed_pct = (deployed / bankroll) if bankroll > 0 else None
+    base_game = _base_game_name(title)
+    existing_games = {
+        _base_game_name(p["title"])
+        for p in bot.positions.values()
+        if p.get("status") == "OPEN"
+    }
+    return {
+        "event_id": event_id,
+        "observed_at_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "trader": trader_name,
+        "market": title,
+        "outcome": outcome,
+        "whale_side": side,
+        "whale_size_usdc": usdc,
+        "price": px,
+        "condition_id": cid,
+        "outcome_index": oidx,
+        "transaction_hash": tx,
+        "source_timestamp": ts,
+        "opportunity_age_sec": age,
+        "trader_resolved_count": resolved,
+        "trader_win_rate": wr,
+        "daily_losses_for_trader": bot.daily_losses_per_trader.get(trader_name, 0),
+        "daily_deploy_for_trader": bot.daily_deploy_per_trader.get(trader_name, 0.0),
+        "bankroll": bankroll,
+        "deployed_cap_pct": deployed_pct,
+        "open_positions_count": len(bot.open_positions),
+        "median_whale_size": (
+            statistics.median(bot.whale_sizes)
+            if bot.whale_sizes else None
+        ),
+        "conviction": None,
+        "perf_mult": None,
+        "dynamic_max_bet": None,
+        "recommended_size": None,
+        "copied_size_usdc": None,
+        "copy_shares": None,
+        "position_id": None,
+        "decision": "SEEN",
+        "decision_reason": "candidate_seen",
+        "is_crypto": is_crypto(title),
+        "is_spread": is_spread(title),
+        "is_futures": any(kw in title.lower() for kw in FUTURES_KW),
+        "price_capped": px >= MAX_ENTRY_PRICE,
+        "duplicate_game": base_game in existing_games,
+        "base_game": base_game,
+        "resolution_status": None,
+        "resolved_pnl": None,
+        "resolved_at_utc": None,
+    }
+
+
+def _finalize_opportunity(bot: PaperBot, record: dict, decision: str, reason: str, **updates):
+    record["decision"] = decision
+    record["decision_reason"] = reason
+    record.update(updates)
+    bot.store.upsert_opportunity(record)
+
+
+def _posterior_map(bot: PaperBot) -> dict[str, object]:
+    return {row.trader: row for row in rank_trader_posteriors(bot.trader_stats)}
+
+
+def _shadow_recommendation(bot: PaperBot, opportunity: dict) -> tuple[float, str]:
+    score = bot.shadow_model.predict_proba(opportunity)
+    decision = "TAKE" if bot.shadow_model.examples_seen >= 10 and score >= 0.57 else "SKIP"
+    return score, decision
+
+
+def _augment_opportunity_with_shadow_signals(bot: PaperBot, opportunity: dict):
+    alpha_prior, beta_prior = estimate_beta_prior(bot.trader_stats)
+    stats = bot.trader_stats.get(opportunity["trader"], {"wins": 0, "losses": 0})
+    posterior = compute_posterior(
+        stats.get("wins", 0),
+        stats.get("losses", 0),
+        alpha_prior=alpha_prior,
+        beta_prior=beta_prior,
+        trader=opportunity["trader"],
+    )
+    score, decision = _shadow_recommendation(bot, opportunity)
+    opportunity["bayes_posterior_mean"] = posterior.posterior_mean
+    opportunity["bayes_lower_bound"] = posterior.lower_bound
+    opportunity["shadow_model_score"] = score
+    opportunity["shadow_model_decision"] = decision
+
+
+def _train_shadow_model_on_rows(bot: PaperBot, rows: list[dict]):
+    for row in rows:
+        event_id = row.get("event_id")
+        status = row.get("resolution_status")
+        if not event_id or event_id in bot.shadow_trained_events:
+            continue
+        if status not in ("WIN", "LOSS"):
+            continue
+        bot.shadow_model.update(row, 1 if status == "WIN" else 0)
+        bot.shadow_trained_events.add(event_id)
+
+
+def bootstrap_shadow_model(bot: PaperBot, opportunities: list[dict]):
+    _train_shadow_model_on_rows(bot, opportunities)
 
 
 # ── API Helpers ───────────────────────────────────────────────────────────────
@@ -533,6 +672,7 @@ def load_positions_from_store(bot: PaperBot) -> bool:
         }
         bot.trade_log.append(record)
 
+    bootstrap_shadow_model(bot, state.get("opportunities", []))
     bot.seen_hashes.update(bot.store.load_seen_events())
     return True
 
@@ -750,6 +890,23 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     outcome = trade.get("outcome", str(oidx))
     ts      = int(trade.get("timestamp", 0))
     age     = int(time.time()) - ts
+    opportunity = _make_opportunity_record(
+        bot,
+        trader_name,
+        trade,
+        event_id=event_id,
+        age=age,
+        usdc=usdc,
+        px=px,
+        cid=cid,
+        oidx=oidx,
+        title=title,
+        outcome=outcome,
+        side=side,
+        tx=tx,
+        ts=ts,
+    )
+    _augment_opportunity_with_shadow_signals(bot, opportunity)
 
     # De-duplicate
     with bot.lock:
@@ -764,33 +921,43 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             _log(f"Warning: could not persist seen_hashes: {e}")
 
     # Filters (checked outside lock — pure logic)
-    if side != "BUY":                       return  # BUY trades only
-    if age  >  MAX_TRADE_AGE:               return  # < 5 minutes old
-    if usdc <  MIN_WHALE_SIZE:              return  # min $30 conviction
-    if is_crypto(title):                    return  # no crypto markets
-    if is_spread(title):                    return  # exclude spread markets — 55% win rate vs 100% O/U
+    if side != "BUY":
+        _finalize_opportunity(bot, opportunity, "SKIP", "side_not_buy")
+        return
+    if age  >  MAX_TRADE_AGE:
+        _finalize_opportunity(bot, opportunity, "SKIP", "trade_too_old")
+        return
+    if usdc <  MIN_WHALE_SIZE:
+        _finalize_opportunity(bot, opportunity, "SKIP", "below_min_whale_size")
+        return
+    if is_crypto(title):
+        _finalize_opportunity(bot, opportunity, "SKIP", "crypto_market")
+        return
+    if is_spread(title):
+        _finalize_opportunity(bot, opportunity, "SKIP", "spread_market")
+        return
     # Block futures markets — lock capital for weeks/months
     if any(kw in title.lower() for kw in FUTURES_KW):
         bot.status_msg = f"Skipped {title[:50]} — futures market"
+        _finalize_opportunity(bot, opportunity, "SKIP", "futures_market")
         return
     if px >= MAX_ENTRY_PRICE:
         bot.status_msg = f"Skipped {title[:50]} — price {px:.2f} >= cap {MAX_ENTRY_PRICE}"
+        _finalize_opportunity(bot, opportunity, "SKIP", "price_cap")
         return  # poor risk/reward at near-certainty prices
 
     with bot.lock:
         # Block same-game duplicate — one position per base game at a time.
         # Strips O/U and spread suffixes to find the base game name.
-        base_game = re.sub(
-            r':\s*(O/U|Spread).*$', '', title, flags=re.IGNORECASE
-        ).strip().lower()
+        base_game = _base_game_name(title)
         existing_games = {
-            re.sub(r':\s*(O/U|Spread).*$', '', p["title"], flags=re.IGNORECASE
-                   ).strip().lower()
+            _base_game_name(p["title"])
             for p in bot.positions.values()
             if p.get("status") == "OPEN"
         }
         if base_game in existing_games:
             bot.status_msg = f"Skipped {title[:50]} — already open in this game"
+            _finalize_opportunity(bot, opportunity, "SKIP", "duplicate_game")
             return
 
         # Per-trader win-rate gate
@@ -802,6 +969,14 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
                 bot.status_msg = (
                     f"Skipped {trader_name} — win rate {wr:.1f}% below {MIN_WIN_RATE}%"
                 )
+                _finalize_opportunity(
+                    bot,
+                    opportunity,
+                    "SKIP",
+                    "trader_win_rate_below_cutoff",
+                    trader_resolved_count=resolved,
+                    trader_win_rate=wr,
+                )
                 return
 
         # Per-trader daily loss limit
@@ -810,6 +985,13 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             msg = f"Skipping {trader_name} - daily loss limit reached ({today_losses} losses today)"
             _log(msg)
             bot.status_msg = msg
+            _finalize_opportunity(
+                bot,
+                opportunity,
+                "SKIP",
+                "trader_daily_loss_limit",
+                daily_losses_for_trader=today_losses,
+            )
             return
 
         # Update rolling whale-size window and compute conviction
@@ -829,6 +1011,15 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             )
             _log(msg)
             bot.status_msg = msg
+            _finalize_opportunity(
+                bot,
+                opportunity,
+                "SKIP",
+                "daily_net_loss_cap",
+                median_whale_size=median_size,
+                conviction=conviction,
+                bankroll=STARTING_BANKROLL + bot.closed_pnl + bot.unrealised_pnl,
+            )
             return
 
         # Per-trader daily dollar cap
@@ -837,6 +1028,15 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             bot.status_msg = (
                 f"Skipped {trader_name} — daily trader cap "
                 f"(${trader_today_deploy:.0f} deployed today)"
+            )
+            _finalize_opportunity(
+                bot,
+                opportunity,
+                "SKIP",
+                "trader_daily_deploy_cap",
+                median_whale_size=median_size,
+                conviction=conviction,
+                daily_deploy_for_trader=trader_today_deploy,
             )
             return
 
@@ -850,6 +1050,16 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         # unrealised_pnl included so deployment cap reflects economic reality
         if bankroll > 0 and (deployed / bankroll) >= MAX_DEPLOY_PCT:
             bot.status_msg = f"Deployment cap hit ({deployed:.0f}/{bankroll:.0f} = {deployed/bankroll*100:.1f}%) — skipping trade"
+            _finalize_opportunity(
+                bot,
+                opportunity,
+                "SKIP",
+                "deployment_cap",
+                median_whale_size=median_size,
+                conviction=conviction,
+                bankroll=bankroll,
+                deployed_cap_pct=(deployed / bankroll),
+            )
             return
 
         # --- Bankroll-aware sizing ---
@@ -873,6 +1083,21 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             perf_mult = 0.75   # below standard but not yet dropped — reduce exposure
 
         copy_usdc = min(BASE_BET * conviction * perf_mult, MAX_BET, dynamic_max)
+        if copy_usdc < 0.001:
+            _finalize_opportunity(
+                bot,
+                opportunity,
+                "SKIP",
+                "copy_size_zero",
+                median_whale_size=median_size,
+                conviction=conviction,
+                perf_mult=perf_mult,
+                dynamic_max_bet=dynamic_max,
+                recommended_size=copy_usdc,
+                bankroll=bankroll,
+                deployed_cap_pct=(deployed / bankroll) if bankroll > 0 else None,
+            )
+            return
         copy_shares = copy_usdc / max(px, 0.001)
         bot.daily_deploy_per_trader[trader_name] = (
             bot.daily_deploy_per_trader.get(trader_name, 0) + copy_usdc
@@ -925,6 +1150,26 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         bot.status_msg = (
             f"[NEW TRADE] {trader_name} | {title[:35]} | "
             f"{outcome} @ ${px:.3f} | Whale: ${usdc:,.0f} | Copy: ${copy_usdc:.2f}"
+        )
+        _finalize_opportunity(
+            bot,
+            opportunity,
+            "COPIED",
+            "copied",
+            trader_resolved_count=resolved,
+            trader_win_rate=t_wr if t_total > 0 else None,
+            daily_losses_for_trader=today_losses,
+            daily_deploy_for_trader=bot.daily_deploy_per_trader.get(trader_name, 0.0),
+            bankroll=bankroll,
+            deployed_cap_pct=(deployed / bankroll) if bankroll > 0 else None,
+            median_whale_size=median_size,
+            conviction=conviction,
+            perf_mult=perf_mult,
+            dynamic_max_bet=dynamic_max,
+            recommended_size=copy_usdc,
+            copied_size_usdc=copy_usdc,
+            copy_shares=copy_shares,
+            position_id=position_id,
         )
 
     append_csv(record)
@@ -1096,6 +1341,16 @@ def resolve_position_snapshot(bot: PaperBot, key, px, resolved, now_ts: float | 
             )
             update_csv_status(trader_name, cid, oidx, pos["status"], pnl)
             bot.store.update_fill_resolution(pos["position_id"], pos["status"], pnl)
+            bot.store.update_opportunity_resolution(
+                pos["position_id"],
+                pos["status"],
+                pnl,
+                utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            _train_shadow_model_on_rows(
+                bot,
+                bot.store.load_opportunities_for_position(pos["position_id"]),
+            )
             bot.store.update_position(
                 pos,
                 utc_now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1157,6 +1412,16 @@ def resolve_position_snapshot(bot: PaperBot, key, px, resolved, now_ts: float | 
             )
             update_csv_status(trader_name, cid, oidx, result_tag, pnl)
             bot.store.update_fill_resolution(pos["position_id"], result_tag, pnl)
+            bot.store.update_opportunity_resolution(
+                pos["position_id"],
+                result_tag,
+                pnl,
+                utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            _train_shadow_model_on_rows(
+                bot,
+                bot.store.load_opportunities_for_position(pos["position_id"]),
+            )
             bot.store.update_position(
                 pos,
                 utc_now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1252,6 +1517,45 @@ def resolution_loop(bot: PaperBot):
             px, resolved = get_price_resolved(cid, oidx)
             resolve_position_snapshot(bot, key, px, resolved)
             time.sleep(0.15)
+        resolve_logged_opportunities(bot)
+
+
+def resolve_logged_opportunities(bot: PaperBot, limit: int = 50):
+    """Resolve logged opportunities without positions so skipped signals get labels."""
+    pending = bot.store.load_unresolved_opportunities(limit=limit)
+    if not pending:
+        return
+
+    checked = 0
+    for row in pending:
+        if row.get("position_id"):
+            continue
+        cid = row.get("condition_id", "")
+        if not cid:
+            continue
+        oidx = int(row.get("outcome_index", 0) or 0)
+        px, resolved = get_price_resolved(cid, oidx)
+        checked += 1
+        if not resolved:
+            time.sleep(0.05)
+            continue
+
+        entry_px = float(row.get("price", 0) or 0)
+        status = "WIN" if (px or 0.0) >= entry_px else "LOSS"
+        bot.store.update_opportunity_resolution(
+            None,
+            status,
+            None,
+            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+            event_id=row["event_id"],
+        )
+        row["resolution_status"] = status
+        row["resolved_pnl"] = None
+        _train_shadow_model_on_rows(bot, [row])
+        time.sleep(0.05)
+
+    if checked:
+        _log(f"resolution_loop: checked {checked} logged opportunity label(s)")
 
 
 # ── Dashboard (Rich) ──────────────────────────────────────────────────────────
@@ -1265,12 +1569,15 @@ def make_header(bot: PaperBot) -> Panel:
     )
 
     # Per-trader stat summary
+    posteriors = _posterior_map(bot)
     trader_parts = []
     for name, s in bot.trader_stats.items():
         total = s["wins"] + s["losses"]
         wr = s["wins"] / total * 100 if total else 0.0
-        col = "green" if wr >= MIN_WIN_RATE else "red"
-        trader_parts.append(f"[{col}]{name}: {wr:.0f}% ({total})[/]")
+        post = posteriors.get(name)
+        post_lb = post.lower_bound * 100 if post else 0.0
+        col = "green" if post_lb >= MIN_WIN_RATE else "yellow" if wr >= MIN_WIN_RATE else "red"
+        trader_parts.append(f"[{col}]{name}: {wr:.0f}% / bayes {post_lb:.0f}% ({total})[/]")
     trader_line = "  ".join(trader_parts) if trader_parts else "[dim]no resolved trades yet[/dim]"
 
     grid = Table.grid(padding=(0, 3))
@@ -1450,12 +1757,17 @@ def print_plain_dashboard(bot: PaperBot):
         print()
 
     if bot.trader_stats:
-        print("  Trader Win Rates:")
-        for name, s in bot.trader_stats.items():
-            total = s["wins"] + s["losses"]
-            wr = s["wins"] / total * 100 if total else 0.0
-            flag = " [BELOW THRESHOLD]" if total >= MIN_TRADES_FOR_CUTOFF and wr < MIN_WIN_RATE else ""
-            print(f"    {name:<20} {wr:.1f}%  ({s['wins']}W / {s['losses']}L){flag}")
+        print("  Trader Skill (Observed vs Bayesian 90% LCB):")
+        for row in rank_trader_posteriors(bot.trader_stats):
+            wr = row.observed_win_rate * 100
+            post_mean = row.posterior_mean * 100
+            post_lb = row.lower_bound * 100
+            flag = " [POSTERIOR BELOW THRESHOLD]" if row.total >= MIN_TRADES_FOR_CUTOFF and post_lb < MIN_WIN_RATE else ""
+            print(
+                f"    {row.trader:<20} obs {wr:>5.1f}% | "
+                f"post {post_mean:>5.1f}% | lcb {post_lb:>5.1f}% "
+                f"({row.wins}W / {row.losses}L){flag}"
+            )
         print()
 
     if bot.api_fail_count >= MAX_API_FAILURES:
