@@ -9,6 +9,7 @@ Set .env variables before running (see .env.example).
 import json
 import os
 import re
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -28,6 +29,7 @@ PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "changeme")
 _HERE        = Path(__file__).parent
 CSV_PATH     = Path(os.getenv("CSV_PATH", str(_HERE / "paper_trades.csv")))
 LOG_PATH     = Path(os.getenv("LOG_PATH", str(_HERE / "bot.log")))
+STATE_DB_PATH = Path(os.getenv("STATE_DB_PATH", str(_HERE / "bot_state.db")))
 REFRESH_MS   = int(os.getenv("REFRESH_MS", "30000"))
 # Prefer DAILY_LOSS_CAP (new name); fall back to DAILY_CAP / DAILY_BUDGET for
 # VPS .env files that haven't been updated yet.
@@ -40,7 +42,9 @@ MIN_WIN_RATE      = 60.0  # % threshold — must match paper_trading_bot.py
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 TRADERS   = ["majorexploiter", "beachboy4"]
+POSITION_KEYS = ["trader", "condition_id", "outcome_index"]
 
 CSV_FIELDS = [
     "timestamp", "trader", "market", "outcome", "whale_side",
@@ -163,11 +167,43 @@ if not check_password():
 # ── Data helpers ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=30)
 def load_trades() -> pd.DataFrame:
-    if not CSV_PATH.exists():
-        return pd.DataFrame(columns=CSV_FIELDS)
-    try:
-        df = pd.read_csv(CSV_PATH)
-    except Exception:
+    if STATE_DB_PATH.exists():
+        try:
+            with sqlite3.connect(STATE_DB_PATH) as conn:
+                df = pd.read_sql_query(
+                    """
+                    SELECT
+                        timestamp_utc AS timestamp,
+                        trader,
+                        market,
+                        outcome,
+                        whale_side,
+                        whale_size_usdc,
+                        our_size_usdc,
+                        price,
+                        copy_shares,
+                        conviction,
+                        status,
+                        resolved_pnl,
+                        condition_id,
+                        outcome_index,
+                        event_id,
+                        position_id
+                    FROM copied_fills
+                    ORDER BY timestamp_utc
+                    """,
+                    conn,
+                )
+        except Exception as exc:
+            st.error(f"Could not read state database: {exc}")
+            return pd.DataFrame(columns=CSV_FIELDS)
+    elif CSV_PATH.exists():
+        try:
+            df = pd.read_csv(CSV_PATH)
+        except Exception as exc:
+            st.error(f"Could not read CSV trade log: {exc}")
+            return pd.DataFrame(columns=CSV_FIELDS)
+    else:
         return pd.DataFrame(columns=CSV_FIELDS)
     if df.empty:
         return df
@@ -177,20 +213,58 @@ def load_trades() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=30)
+def load_open_positions() -> pd.DataFrame:
+    if not STATE_DB_PATH.exists():
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    position_id,
+                    trader,
+                    condition_id,
+                    outcome_index,
+                    market,
+                    outcome,
+                    opened_at_utc,
+                    updated_at_utc,
+                    status,
+                    total_cost,
+                    total_shares,
+                    last_price,
+                    pnl,
+                    close_reason
+                FROM positions
+                WHERE status = 'OPEN'
+                ORDER BY opened_at_utc
+                """,
+                conn,
+            )
+    except Exception as exc:
+        st.error(f"Could not read open positions from state database: {exc}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["opened_at_utc"] = pd.to_datetime(df["opened_at_utc"], utc=True, errors="coerce")
+    df["updated_at_utc"] = pd.to_datetime(df["updated_at_utc"], utc=True, errors="coerce")
+    return df
+
+
 @st.cache_data(ttl=60)
 def fetch_price(condition_id: str, outcome_index: int) -> float | None:
     try:
         r = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"condition_ids": condition_id},
+            f"{CLOB_API}/markets/{condition_id}",
             timeout=5,
         )
+        r.raise_for_status()
         data = r.json()
-        m = data[0] if isinstance(data, list) else data
-        prices = m.get("outcomePrices", "[]")
-        if isinstance(prices, str):
-            prices = json.loads(prices)
-        return float(prices[outcome_index])
+        tokens = data.get("tokens") or []
+        if outcome_index >= len(tokens):
+            return None
+        return float(tokens[outcome_index].get("price", 0))
     except Exception:
         return None
 
@@ -281,6 +355,25 @@ def fetch_trader_live_stats(username: str) -> dict:
 
 
 def bot_status() -> tuple[str, str]:
+    if STATE_DB_PATH.exists():
+        try:
+            with sqlite3.connect(STATE_DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT value FROM kv_state WHERE key = 'health'"
+                ).fetchone()
+            if row and row[0]:
+                health = json.loads(row[0])
+                last_str = health.get("last_heartbeat_utc", "unknown")
+                last_dt = pd.to_datetime(last_str, utc=True, errors="coerce")
+                if pd.notna(last_dt):
+                    age = (datetime.now(timezone.utc) - last_dt.to_pydatetime()).total_seconds()
+                    if age < 120:
+                        return "Online", last_str
+                    if age < 600:
+                        return "Idle", last_str
+                    return "Offline", last_str
+        except Exception:
+            pass
     if not LOG_PATH.exists():
         return "Offline", f"Log not found at {LOG_PATH}"
     mtime = LOG_PATH.stat().st_mtime
@@ -318,7 +411,7 @@ def compute_streak(resolved: pd.DataFrame) -> tuple[str, int]:
 
 
 def positions_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Return one row per resolved position, deduped by (condition_id, outcome_index).
+    """Return one row per resolved position, deduped by trader + market outcome.
 
     The bot stamps the total position PnL identically on every CSV row that
     belongs to the same (condition_id, outcome_index) position.  Summing or
@@ -332,20 +425,20 @@ def positions_df(df: pd.DataFrame) -> pd.DataFrame:
     return (
         resolved
         .sort_values("timestamp")
-        .groupby(["condition_id", "outcome_index"], as_index=False)
+        .groupby(POSITION_KEYS, as_index=False)
         .first()
     )
 
 
 def compute_stats(df: pd.DataFrame) -> dict:
     pos = positions_df(df)          # one row per resolved position
-    # Win/loss count: deduplicate by (condition_id, outcome_index).
+    # Win/loss count: deduplicate by trader + market outcome.
     # A position is WIN if ANY row for it has status=WIN; LOSS otherwise.
     # This guards against .first() picking a stale row when statuses differ.
     closed_rows = df[df["status"].isin(["WIN", "LOSS"])]
     if not closed_rows.empty:
         pos_status = (
-            closed_rows.groupby(["condition_id", "outcome_index"])["status"]
+            closed_rows.groupby(POSITION_KEYS)["status"]
             .apply(lambda x: "WIN" if "WIN" in x.values else "LOSS")
         )
         wins   = int((pos_status == "WIN").sum())
@@ -355,7 +448,7 @@ def compute_stats(df: pd.DataFrame) -> dict:
     total    = wins + losses
     win_rate = wins / total * 100 if total else 0.0
 
-    today_df  = df[df["timestamp"].dt.date == date.today()] if not df.empty else df
+    today_df  = df[df["timestamp"].dt.date == datetime.now(timezone.utc).date()] if not df.empty else df
     today_pos = positions_df(today_df)
 
     # Best / worst trade — use actual proportional profit formula for best trade
@@ -364,7 +457,7 @@ def compute_stats(df: pd.DataFrame) -> dict:
         wins_df = df[df["status"] == "WIN"].copy()
         wins_df["actual_profit"] = wins_df["our_size_usdc"] * (1.0 / wins_df["price"] - 1.0)
         best_trade_pnl = float(
-            wins_df.groupby(["condition_id", "outcome_index"])["actual_profit"].sum().max()
+            wins_df.groupby(POSITION_KEYS)["actual_profit"].sum().max()
         ) if not wins_df.empty else 0.0
         best_row  = pos.loc[pos["resolved_pnl"].idxmax()]
         worst_row = pos.loc[pos["resolved_pnl"].idxmin()]
@@ -643,68 +736,92 @@ with tab_pos:
     if df.empty:
         st.info("No trades recorded yet.")
     else:
-        pending = df[df["status"] == "PENDING"].copy()
-
-        if pending.empty:
-            st.success("No active positions — all trades resolved.")
-        else:
-            agg = (
-                pending.groupby(
-                    ["condition_id", "outcome_index", "market", "outcome"],
-                    as_index=False,
-                )
-                .agg(
-                    traders=("trader", lambda s: ", ".join(s.unique())),
-                    total_cost=("our_size_usdc", "sum"),
-                    total_shares=("copy_shares", "sum"),
-                    avg_entry=("price", "mean"),
-                    opened=("timestamp", "min"),
-                )
-            )
-            agg["time_open"] = agg["opened"].apply(
+        open_positions = load_open_positions()
+        if not open_positions.empty:
+            open_positions["time_open"] = open_positions["opened_at_utc"].apply(
                 lambda t: fmt_duration(now_utc - t) if pd.notna(t) else "?"
             )
-
-            fetch_prices = st.toggle("Fetch live prices (slower)", value=True, key="fetch_px")
-
-            if fetch_prices:
-                with st.spinner("Fetching current market prices…"):
-                    curr_prices = [
-                        fetch_price(row.condition_id, int(row.outcome_index))
-                        for row in agg.itertuples()
-                    ]
-                agg["current_px"] = curr_prices
-            else:
-                agg["current_px"] = None
-
-            # Unrealised PnL — deduct Polymarket 2% fee from any profit
-            _proj = agg["total_shares"] * agg["current_px"].fillna(agg["avg_entry"])
-            _raw  = _proj - agg["total_cost"]
-            agg["unreal_pnl"] = _raw.where(_raw <= 0, _raw * 0.98)
-            # Flag positions near worthless (price < $0.05 → ≥95% loss)
-            agg["near_zero"] = agg["current_px"].notna() & (agg["current_px"] < 0.05)
-
             rows = []
-            for _, r in agg.iterrows():
-                pnl       = r["unreal_pnl"]
-                near_zero = bool(r.get("near_zero", False))
-                emoji     = "⚠️" if near_zero else ("🟢" if pnl >= 0 else "🔴")
-                curr      = f"${r['current_px']:.4f}" if pd.notna(r["current_px"]) else "N/A"
-                pnl_str   = f"${pnl:+.2f} ⚠️ Near Zero" if near_zero else f"${pnl:+.2f}"
+            for _, r in open_positions.iterrows():
+                pnl = float(r["pnl"] or 0.0)
+                px = r["last_price"]
+                near_zero = pd.notna(px) and float(px) < 0.05
+                emoji = "⚠️" if near_zero else ("🟢" if pnl >= 0 else "🔴")
+                curr = f"${float(px):.4f}" if pd.notna(px) else "N/A"
+                pnl_str = f"${pnl:+.2f} ⚠️ Near Zero" if near_zero else f"${pnl:+.2f}"
                 rows.append({
-                    "":           emoji,
-                    "Market":     r["market"][:50],
-                    "Outcome":    r["outcome"],
-                    "Trader(s)":  r["traders"],
-                    "Cost ($)":   f"${r['total_cost']:.2f}",
-                    "Avg Entry":  f"${r['avg_entry']:.4f}",
-                    "Current":    curr,
+                    "": emoji,
+                    "Market": str(r["market"])[:50],
+                    "Outcome": r["outcome"],
+                    "Trader(s)": r["trader"],
+                    "Cost ($)": f"${float(r['total_cost']):.2f}",
+                    "Avg Entry": (
+                        f"${(float(r['total_cost']) / max(float(r['total_shares']), 0.0001)):.4f}"
+                    ),
+                    "Current": curr,
                     "Unreal PnL": pnl_str,
-                    "Open For":   r["time_open"],
+                    "Open For": r["time_open"],
                 })
-
             display = pd.DataFrame(rows)
+        else:
+            pending = df[df["status"] == "PENDING"].copy()
+            if pending.empty:
+                st.success("No active positions — all trades resolved.")
+                display = pd.DataFrame()
+            else:
+                agg = (
+                    pending.groupby(
+                        ["trader", "condition_id", "outcome_index", "market", "outcome"],
+                        as_index=False,
+                    )
+                    .agg(
+                        traders=("trader", lambda s: ", ".join(s.unique())),
+                        total_cost=("our_size_usdc", "sum"),
+                        total_shares=("copy_shares", "sum"),
+                        avg_entry=("price", "mean"),
+                        opened=("timestamp", "min"),
+                    )
+                )
+                agg["time_open"] = agg["opened"].apply(
+                    lambda t: fmt_duration(now_utc - t) if pd.notna(t) else "?"
+                )
+                fetch_prices = st.toggle("Fetch live prices (slower)", value=True, key="fetch_px")
+                if fetch_prices:
+                    with st.spinner("Fetching current market prices..."):
+                        curr_prices = [
+                            fetch_price(row.condition_id, int(row.outcome_index))
+                            for row in agg.itertuples()
+                        ]
+                    agg["current_px"] = curr_prices
+                else:
+                    agg["current_px"] = None
+                _proj = agg["total_shares"] * agg["current_px"].fillna(agg["avg_entry"])
+                _raw  = _proj - agg["total_cost"]
+                agg["unreal_pnl"] = _raw.where(_raw <= 0, _raw * 0.98)
+                agg["near_zero"] = agg["current_px"].notna() & (agg["current_px"] < 0.05)
+                rows = []
+                for _, r in agg.iterrows():
+                    pnl = r["unreal_pnl"]
+                    near_zero = bool(r.get("near_zero", False))
+                    emoji = "⚠️" if near_zero else ("🟢" if pnl >= 0 else "🔴")
+                    curr = f"${r['current_px']:.4f}" if pd.notna(r["current_px"]) else "N/A"
+                    pnl_str = f"${pnl:+.2f} ⚠️ Near Zero" if near_zero else f"${pnl:+.2f}"
+                    rows.append({
+                        "": emoji,
+                        "Market": r["market"][:50],
+                        "Outcome": r["outcome"],
+                        "Trader(s)": r["traders"],
+                        "Cost ($)": f"${r['total_cost']:.2f}",
+                        "Avg Entry": f"${r['avg_entry']:.4f}",
+                        "Current": curr,
+                        "Unreal PnL": pnl_str,
+                        "Open For": r["time_open"],
+                    })
+                display = pd.DataFrame(rows)
 
+        if display.empty:
+            st.success("No active positions — all trades resolved.")
+        else:
             def _color_row(row):
                 pnl_cell = row.get("Unreal PnL", "$0")
                 if "Near Zero" in pnl_cell:

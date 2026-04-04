@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Polymarket Paper Trading Bot
 ============================
@@ -8,12 +10,13 @@ Ratio:     10:1  |  Daily budget: $50  |  Min whale: $150
 Poll:      every 30 seconds
 """
 
-import csv, json, os, re, sys, time, threading, statistics
+import csv, hashlib, json, os, re, sys, time, threading, statistics
 from datetime import datetime, date, timezone
 from pathlib import Path
 
 import requests
 from dynamic_watchlist import WatchlistManager, TRADER_BLOCKLIST
+from state_store import StateStore
 
 try:
     from rich.live import Live
@@ -80,6 +83,7 @@ BANKROLL_SCALE_STEPS = [
 # Legacy static list — only used when USE_DYNAMIC_WATCHLIST = False
 TRADERS_TO_COPY  = ["majorexploiter", "beachboy4"]
 CSV_FILE         = Path(os.getenv("CSV_PATH", str(Path(__file__).parent / "paper_trades.csv")))
+STATE_DB_FILE    = Path(os.getenv("STATE_DB_PATH", str(Path(__file__).parent / "bot_state.db")))
 
 CRYPTO_KW = {
     "bitcoin","btc","ethereum","eth","crypto","solana","sol","xrp",
@@ -97,19 +101,51 @@ CSV_FIELDS = [
     "timestamp","trader","market","outcome","whale_side",
     "whale_size_usdc","our_size_usdc","price","copy_shares",
     "conviction","status","resolved_pnl","condition_id","outcome_index",
+    "event_id","position_id",
 ]
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_today() -> date:
+    return utc_now().date()
+
+
+def utc_today_str() -> str:
+    return utc_today().isoformat()
+
+
+def make_position_id(trader_name: str, condition_id: str, outcome_index: int) -> str:
+    return f"{trader_name}|{condition_id}|{outcome_index}"
+
+
+def make_trade_event_id(trader_name: str, trade: dict) -> str:
+    raw = "|".join([
+        trader_name,
+        str(trade.get("transactionHash", "")),
+        str(trade.get("conditionId", "")),
+        str(trade.get("outcomeIndex", 0)),
+        str(trade.get("side", "")),
+        str(trade.get("timestamp", 0)),
+        str(trade.get("usdcSize") or trade.get("size") or 0),
+        str(trade.get("price", 0)),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 # ── Bot State ─────────────────────────────────────────────────────────────────
 class PaperBot:
     def __init__(self):
         self.lock               = threading.Lock()
+        self.store              = StateStore(STATE_DB_FILE)
         self.trader_addrs       = {}        # name → proxyWallet address
-        self.seen_hashes        = set()     # processed tx hashes
-        self.positions          = {}        # (cond_id, oidx) → position dict
+        self.seen_hashes        = set()     # processed event ids
+        self.positions          = {}        # (trader, cond_id, oidx) → position dict
         self.trade_log          = []        # list of trade record dicts
         self.daily_losses       = 0.0      # gross losses today (sum of abs negative pnl)
         self.daily_wins         = 0.0      # gross wins today (sum of positive pnl)
-        self._budget_date       = date.today()
+        self._budget_date       = utc_today()
         self.closed_pnl         = 0.0      # realised PnL only
         self.wins               = 0
         self.losses             = 0
@@ -124,13 +160,15 @@ class PaperBot:
         self.milestones_reached      = set()  # bankroll thresholds already prompted
 
     def _refresh_budget(self):
-        today = date.today()
+        today = utc_today()
         if today != self._budget_date:
             self.daily_losses            = 0.0
             self.daily_wins              = 0.0
             self._budget_date            = today
             self.daily_losses_per_trader = {}
             self.daily_deploy_per_trader = {}
+        self.store.set_daily_risk(today.isoformat(), self.daily_wins, self.daily_losses)
+        self.store.set_value("budget_day_utc", today.isoformat())
 
     @property
     def daily_net_loss(self):
@@ -199,6 +237,7 @@ def address_refresh_loop(bot: PaperBot):
 
 def seed_seen_hashes(bot: PaperBot):
     """Index recent trades so we don't fire on old data at startup."""
+    bot.seen_hashes.update(bot.store.load_seen_events())
     cutoff = int(time.time()) - 3600
     for name, addr in bot.trader_addrs.items():
         data = get(f"{DATA_API}/trades", {
@@ -207,9 +246,7 @@ def seed_seen_hashes(bot: PaperBot):
         if data and isinstance(data, list):
             for t in data:
                 if int(t.get("timestamp", 0)) >= cutoff:
-                    h = t.get("transactionHash", "")
-                    if h:
-                        bot.seen_hashes.add(h)
+                    bot.seen_hashes.add(make_trade_event_id(name, t))
         time.sleep(0.3)
 
     # Merge persisted hashes from previous sessions
@@ -297,7 +334,7 @@ def load_positions_from_csv(bot: PaperBot):
     """Reload open positions, closed PnL, today's net loss state, and whale sizes from CSV on restart."""
     if not CSV_FILE.exists():
         return
-    today_prefix  = date.today().isoformat()   # "YYYY-MM-DD" — matches CSV timestamp prefix
+    today_prefix  = utc_today_str()   # "YYYY-MM-DD" — matches CSV timestamp prefix
     whale_records = []  # (timestamp_str, whale_size_usdc) for restoring conviction median
     # resolved_pnl is stamped identically on every row that shares a (cid, oidx) position.
     # Without deduplication, each multi-row position inflates closed_pnl and win/loss counts.
@@ -309,14 +346,20 @@ def load_positions_from_csv(bot: PaperBot):
                 status  = row.get("status")
                 cid     = row.get("condition_id", "")
                 oidx    = int(row.get("outcome_index", 0))
-                pos_key = (cid, oidx)
+                trader  = row.get("trader", "unknown")
+                pos_key = (trader, cid, oidx)
+                record = dict(row)
+                record["position_id"] = record.get("position_id") or make_position_id(trader, cid, oidx)
+                record["event_id"] = record.get("event_id") or hashlib.sha256(
+                    f"{trader}|{cid}|{oidx}|{row.get('timestamp','')}|{row.get('our_size_usdc','')}".encode("utf-8")
+                ).hexdigest()
+                bot.trade_log.append(record)
 
                 # Restore today's daily_losses and daily_wins — one per position
                 if row.get("timestamp", "").startswith(today_prefix) and status in ("WIN", "LOSS"):
                     if pos_key not in seen_today:
                         seen_today.add(pos_key)
                         pnl = float(row.get("resolved_pnl", 0) or 0)
-                        trader = row.get("trader", "")
                         if status == "WIN":
                             bot.daily_wins += pnl
                         else:
@@ -351,7 +394,6 @@ def load_positions_from_csv(bot: PaperBot):
                     if pos_key not in seen_resolved:
                         seen_resolved.add(pos_key)
                         pnl    = float(row.get("resolved_pnl", 0) or 0)
-                        trader = row.get("trader", "")
                         bot.closed_pnl += pnl
                         if pnl >= 0:
                             bot.wins += 1
@@ -379,12 +421,14 @@ def load_positions_from_csv(bot: PaperBot):
                     ts_str    = row.get("timestamp", "")
                     opened_at = _parse_ts(ts_str)
                     bot.positions[pos_key] = {
+                        "position_id":   row.get("position_id") or make_position_id(trader, cid, oidx),
                         "condition_id":  cid,
                         "outcome_index": oidx,
                         "title":         row.get("market", cid[:30]),
                         "outcome":       row.get("outcome", str(oidx)),
-                        "trader":        row.get("trader", "unknown"),
+                        "trader":        trader,
                         "opened_at":     opened_at,
+                        "opened_at_utc": row.get("timestamp", ""),
                         "total_cost":    0.0,
                         "total_shares":  0.0,
                         "status":        "OPEN",
@@ -394,7 +438,6 @@ def load_positions_from_csv(bot: PaperBot):
                 pos = bot.positions[pos_key]
                 pos["total_cost"]   += cost
                 pos["total_shares"] += shares
-                bot.trade_log.append(dict(row))
     except Exception:
         pass
 
@@ -405,19 +448,118 @@ def load_positions_from_csv(bot: PaperBot):
         bot.whale_sizes = [w for _, w in whale_records[-30:]]
 
 
+def load_positions_from_store(bot: PaperBot) -> bool:
+    state = bot.store.load_runtime_state()
+    if not state["positions"] and not state["fills"]:
+        return False
+
+    bot.closed_pnl = float(state["closed_pnl"])
+    bot.wins = int(state["wins"])
+    bot.losses = int(state["losses"])
+    bot.trader_stats = dict(state["trader_stats"])
+    bot.daily_losses_per_trader = dict(state["daily_losses_per_trader"])
+    bot.daily_deploy_per_trader = dict(state["daily_deploy_per_trader"])
+    bot.milestones_reached = set(state["milestones_reached"])
+    bot.whale_sizes = list(state["whale_sizes"])
+    budget_day = state.get("budget_day_utc") or utc_today_str()
+    try:
+        bot._budget_date = datetime.strptime(budget_day, "%Y-%m-%d").date()
+    except ValueError:
+        bot._budget_date = utc_today()
+    today_risk = state["daily_risk"].get(utc_today_str(), {})
+    bot.daily_wins = float(today_risk.get("gross_wins", 0.0) or 0.0)
+    bot.daily_losses = float(today_risk.get("gross_losses", 0.0) or 0.0)
+
+    for row in state["positions"]:
+        pos_key = (row["trader"], row["condition_id"], int(row["outcome_index"]))
+        opened_at_ts = _parse_ts(row.get("opened_at_utc", ""))
+        bot.positions[pos_key] = {
+            "position_id": row["position_id"],
+            "condition_id": row["condition_id"],
+            "outcome_index": int(row["outcome_index"]),
+            "title": row["market"],
+            "outcome": row["outcome"],
+            "trader": row["trader"],
+            "opened_at": opened_at_ts,
+            "opened_at_utc": row["opened_at_utc"],
+            "total_cost": float(row["total_cost"]),
+            "total_shares": float(row["total_shares"]),
+            "status": row["status"],
+            "pnl": float(row["pnl"]),
+            "last_price": (
+                float(row["last_price"])
+                if row["last_price"] is not None
+                else None
+            ),
+        }
+
+    for fill in state["fills"]:
+        record = {
+            "timestamp": fill["timestamp_utc"],
+            "trader": fill["trader"],
+            "market": fill["market"],
+            "outcome": fill["outcome"],
+            "whale_side": fill["whale_side"],
+            "whale_size_usdc": f"{float(fill['whale_size_usdc']):.2f}",
+            "our_size_usdc": f"{float(fill['our_size_usdc']):.2f}",
+            "price": f"{float(fill['price']):.4f}",
+            "copy_shares": f"{float(fill['copy_shares']):.4f}",
+            "conviction": f"{float(fill['conviction']):.4f}",
+            "status": fill["status"],
+            "resolved_pnl": (
+                f"{float(fill['resolved_pnl']):+.4f}"
+                if fill["resolved_pnl"] is not None
+                else ""
+            ),
+            "condition_id": fill["condition_id"],
+            "outcome_index": str(fill["outcome_index"]),
+            "event_id": fill["event_id"],
+            "position_id": fill["position_id"],
+        }
+        bot.trade_log.append(record)
+
+    bot.seen_hashes.update(bot.store.load_seen_events())
+    return True
+
+
+def persist_runtime_snapshot(bot: PaperBot):
+    for record in bot.trade_log:
+        bot.store.upsert_fill(record)
+    for pos in bot.positions.values():
+        bot.store.update_position(
+            pos,
+            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    for trader, stats in bot.trader_stats.items():
+        bot.store.set_trader_stats(trader, stats["wins"], stats["losses"])
+    bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
+    bot.store.set_value("closed_pnl", bot.closed_pnl)
+    bot.store.set_value("wins", bot.wins)
+    bot.store.set_value("losses", bot.losses)
+    bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
+    bot.store.set_value("daily_deploy_per_trader", bot.daily_deploy_per_trader)
+    bot.store.set_value("milestones_reached", sorted(bot.milestones_reached))
+    bot.store.set_value("whale_sizes", bot.whale_sizes)
+    bot.store.set_value("budget_day_utc", bot._budget_date.isoformat())
+
+
 def append_csv(record: dict):
     row = {k: record.get(k, "") for k in CSV_FIELDS}
     with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(row)
 
 
-def update_csv_status(cond_id: str, oidx: int, status: str, pnl: float):
+def update_csv_status(trader: str, cond_id: str, oidx: int, status: str, pnl: float):
     """Rewrite CSV rows for this position with resolved status/PnL."""
     try:
         rows = []
         with open(CSV_FILE, "r", newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                if row["condition_id"] == cond_id and row["outcome_index"] == str(oidx):
+                if (
+                    row["trader"] == trader and
+                    row["condition_id"] == cond_id and
+                    row["outcome_index"] == str(oidx)
+                ):
                     row["status"]       = status
                     row["resolved_pnl"] = f"{pnl:+.4f}"
                 rows.append(row)
@@ -443,6 +585,7 @@ def is_spread(title: str) -> bool:
 # ── Trade Processing ──────────────────────────────────────────────────────────
 def process_trade(bot: PaperBot, trader_name: str, trade: dict):
     tx      = trade.get("transactionHash", "")
+    event_id = make_trade_event_id(trader_name, trade)
     side    = trade.get("side", "").upper()
     usdc    = float(trade.get("usdcSize") or trade.get("size") or 0)
     px      = float(trade.get("price", 0.001))
@@ -455,9 +598,9 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
 
     # De-duplicate
     with bot.lock:
-        if tx and tx in bot.seen_hashes:
+        if event_id in bot.seen_hashes:
             return
-        bot.seen_hashes.add(tx)
+        bot.seen_hashes.add(event_id)
         # Persist to disk immediately — handles crash/hard-kill restarts
         try:
             with open(SEEN_HASHES_FILE, "w") as f:
@@ -580,15 +723,18 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             bot.daily_deploy_per_trader.get(trader_name, 0) + copy_usdc
         )
 
-        pos_key = (cid, oidx)
+        pos_key = (trader_name, cid, oidx)
+        position_id = make_position_id(trader_name, cid, oidx)
         if pos_key not in bot.positions:
             bot.positions[pos_key] = {
+                "position_id":   position_id,
                 "condition_id":  cid,
                 "outcome_index": oidx,
                 "title":         title,
                 "outcome":       outcome,
                 "trader":        trader_name,
                 "opened_at":     time.time(),
+                "opened_at_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
                 "total_cost":    0.0,
                 "total_shares":  0.0,
                 "status":        "OPEN",
@@ -599,7 +745,7 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         pos["total_cost"]   += copy_usdc
         pos["total_shares"] += copy_shares
 
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        now_str = utc_now().strftime("%Y-%m-%d %H:%M:%S")
         record = {
             "timestamp":       now_str,
             "trader":          trader_name,
@@ -615,6 +761,10 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
             "resolved_pnl":    "",
             "condition_id":    cid,
             "outcome_index":   str(oidx),
+            "event_id":        event_id,
+            "position_id":     position_id,
+            "transaction_hash": tx,
+            "source_timestamp": ts,
         }
         bot.trade_log.append(record)
         bot.status_msg = (
@@ -623,6 +773,10 @@ def process_trade(bot: PaperBot, trader_name: str, trade: dict):
         )
 
     append_csv(record)
+    bot.store.upsert_fill(record)
+    bot.store.update_position(pos, now_str)
+    bot.store.set_value("whale_sizes", bot.whale_sizes)
+    bot.store.set_value("daily_deploy_per_trader", bot.daily_deploy_per_trader)
 
 
 # ── Resolution Checker (background thread) ────────────────────────────────────
@@ -692,6 +846,7 @@ def _check_bankroll_scale(bot: PaperBot):
     for threshold, cfg in BANKROLL_SCALE_STEPS:
         if bankroll >= threshold and threshold not in bot.milestones_reached:
             bot.milestones_reached.add(threshold)
+            bot.store.set_value("milestones_reached", sorted(bot.milestones_reached))
             _log(
                 f"SCALE UP AVAILABLE: Bankroll ${bankroll:.2f} has crossed ${threshold} threshold"
             )
@@ -790,7 +945,7 @@ def resolution_loop(bot: PaperBot):
         _log(f"resolution_loop: checking {len(open_keys)} open position(s)")
 
         for key in open_keys:
-            cid, oidx = key
+            trader_name, cid, oidx = key
             px, resolved = get_price_resolved(cid, oidx)
 
             # Only skip if we have NO price AND the market is genuinely not resolved.
@@ -819,6 +974,7 @@ def resolution_loop(bot: PaperBot):
                     )
 
                 if resolved:
+                    bot._refresh_budget()
                     proceeds = pos["total_shares"] * px
                     pnl      = proceeds - pos["total_cost"]
                     pos["pnl"]    = pnl
@@ -851,11 +1007,23 @@ def resolution_loop(bot: PaperBot):
                         f"px={px:.4f} shares={pos['total_shares']:.4f} "
                         f"cost={pos['total_cost']:.2f} pnl={pnl:+.4f} → {result_tag}"
                     )
-                    update_csv_status(cid, oidx, pos["status"], pnl)
+                    update_csv_status(trader_name, cid, oidx, pos["status"], pnl)
+                    bot.store.update_fill_resolution(pos["position_id"], pos["status"], pnl)
+                    bot.store.update_position(
+                        pos,
+                        utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+                        close_reason="RESOLVED",
+                    )
+                    bot.store.set_trader_stats(trader_name, s["wins"], s["losses"])
+                    bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
+                    bot.store.set_value("closed_pnl", bot.closed_pnl)
+                    bot.store.set_value("wins", bot.wins)
+                    bot.store.set_value("losses", bot.losses)
+                    bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
                     _check_bankroll_scale(bot)
                     # Sync in-memory trade log so the dashboard reflects WIN/LOSS
                     for rec in bot.trade_log:
-                        if rec.get("condition_id") == cid and rec.get("outcome_index") == str(oidx):
+                        if rec.get("position_id") == pos["position_id"]:
                             rec["status"]       = pos["status"]
                             rec["resolved_pnl"] = f"{pnl:+.4f}"
                 else:
@@ -871,6 +1039,7 @@ def resolution_loop(bot: PaperBot):
                     force_age  = age_hours > MAX_OPEN_HOURS
 
                     if force_zero or force_age:
+                        bot._refresh_budget()
                         close_px   = px if px >= ZERO_PRICE_GUARD else 0.0
                         proceeds   = pos["total_shares"] * close_px
                         pnl        = proceeds - pos["total_cost"]
@@ -903,14 +1072,30 @@ def resolution_loop(bot: PaperBot):
                             f"  [{reason}] {cid[:20]}… oidx={oidx} open {age_hours:.0f}h "
                             f"px={close_px:.4f} — forced close as {result_tag} pnl={pnl:+.4f}"
                         )
-                        update_csv_status(cid, oidx, result_tag, pnl)
+                        update_csv_status(trader_name, cid, oidx, result_tag, pnl)
+                        bot.store.update_fill_resolution(pos["position_id"], result_tag, pnl)
+                        bot.store.update_position(
+                            pos,
+                            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+                            close_reason=reason,
+                        )
+                        bot.store.set_trader_stats(trader_name, s["wins"], s["losses"])
+                        bot.store.set_daily_risk(utc_today_str(), bot.daily_wins, bot.daily_losses)
+                        bot.store.set_value("closed_pnl", bot.closed_pnl)
+                        bot.store.set_value("wins", bot.wins)
+                        bot.store.set_value("losses", bot.losses)
+                        bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
                         _check_bankroll_scale(bot)
                         for rec in bot.trade_log:
-                            if rec.get("condition_id") == cid and rec.get("outcome_index") == str(oidx):
+                            if rec.get("position_id") == pos["position_id"]:
                                 rec["status"]       = result_tag
                                 rec["resolved_pnl"] = f"{pnl:+.4f}"
                     else:
                         pos["pnl"] = pos["total_shares"] * px - pos["total_cost"]
+                        bot.store.update_position(
+                            pos,
+                            utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+                        )
             time.sleep(0.15)
 
 
@@ -1071,7 +1256,8 @@ def poll_once(bot: PaperBot):
                 bot.status_msg = (
                     f"[WARN] API unreachable — {bot.api_fail_count} consecutive failures"
                 )
-        bot.last_poll = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        bot.last_poll = utc_now().strftime("%H:%M:%S UTC")
+        _sync_health(bot)
 
 
 # ── Plain-text fallback dashboard ─────────────────────────────────────────────
@@ -1144,8 +1330,12 @@ def main():
     bot = PaperBot()
     migrate_csv()                  # fix stale header before reading or writing
     init_csv()
-    load_positions_from_csv(bot)
+    loaded_from_store = load_positions_from_store(bot)
+    if not loaded_from_store:
+        load_positions_from_csv(bot)
     _init_milestones(bot)   # must come after CSV load so closed_pnl is accurate
+    if not loaded_from_store:
+        persist_runtime_snapshot(bot)
     if bot.positions:
         print(f"  Reloaded {len(bot.positions)} open position(s) from previous run.")
 
@@ -1226,6 +1416,16 @@ def _log(msg: str):
 
 def _write_heartbeat():
     _log("heartbeat")
+
+
+def _sync_health(bot: PaperBot):
+    bot.store.set_value("health", {
+        "status_msg": bot.status_msg,
+        "last_poll": bot.last_poll,
+        "api_fail_count": bot.api_fail_count,
+        "last_addr_refresh": bot.last_addr_refresh,
+        "last_heartbeat_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
 
 
 def _rich_loop(bot: PaperBot):
