@@ -30,10 +30,12 @@ Each candidate trade must pass every filter before being copied:
 | Side | BUY only | Copying exits / redemptions |
 | Age | ≤ 5 minutes | Stale or replayed trades |
 | Whale size | ≥ $1,000 | Low-conviction noise trades |
-| Market type | No crypto keywords | Bitcoin/ETH price-direction bets |
+| Entry price | ≤ 0.75 | Near-certainty bets with poor risk/reward |
+| Market type | No crypto / futures keywords | Bitcoin/ETH bets and championship futures |
 | Trader win rate | ≥ 60% after 10 resolved trades | Copying a trader mid-slump |
 | Daily loss limit | ≤ 2 losses/trader/day | Tilt-following a trader on a bad day |
 | Daily cap | ≤ $60/day total | Runaway spending in a volatile session |
+| Bankroll deployment | ≤ 60% simultaneously | Over-concentration in open positions |
 
 ### 4. Conviction sizing
 When a trade passes all filters, the bot calculates a conviction score:
@@ -47,6 +49,25 @@ A trade 2× the median → `$20` bet. A trade 3× the median → `$30` (capped b
 
 ### 5. Resolution (every 60 seconds)
 `resolution_loop()` checks the Gamma API for every open position. A market is considered settled when `closed == True` and the winning outcome is priced ≥ 0.99. On settlement, PnL is calculated, the position is marked WIN or LOSS, and the CSV is updated.
+
+The resolution loop also auto-closes positions in three edge-case scenarios:
+
+| Trigger | Threshold | Action |
+|---|---|---|
+| Stale flag | Open > 30 days | Logged as `STALE` warning |
+| Zero-price | Price ≈ $0 for ≥ 24 hours | Force-closed as LOSS |
+| Max age | Open ≥ 72 hours regardless of price | Force-closed at current price |
+
+### 6. Analytical layer (shadow model + Bayesian ranking)
+
+Every evaluated trade is recorded to a SQLite database (`bot_state.db` via `state_store.py`) as an *opportunity record*, regardless of whether it is copied. This enables offline analysis and model training.
+
+**Bayesian trader ranking** (`bayesian_stats.py`): uses a Beta-Binomial model with a pooled empirical prior to rank traders by posterior win-rate, shrinking estimates for traders with few resolved trades toward the group mean.
+
+**Shadow model** (`shadow_model.py`): an online logistic regression that trains on each resolved trade and produces a probability score (`shadow_model_score`) for whether a candidate trade will be profitable. The score is logged but does not yet gate trade execution — it runs in shadow mode for observation only.
+
+### 7. Trader blocklist
+`TRADER_BLOCKLIST` in `dynamic_watchlist.py` permanently excludes specific traders from the watchlist regardless of their current win rate or PNL ranking. Entries are matched by lowercase name. Use this to exclude traders whose historical performance is misleading or who have been manually reviewed and rejected.
 
 ---
 
@@ -67,6 +88,9 @@ All values are set at the top of `paper_trading_bot.py`.
 | `WATCHLIST_MIN_WR` | `60.0` | Minimum win rate (%) to qualify for the watchlist |
 | `WATCHLIST_REFRESH_H` | `6` | Hours between watchlist refreshes |
 | `MIN_WIN_RATE` | `60.0` | Per-trader win rate (%) below which trades are skipped |
+| `MAX_ENTRY_PRICE` | `0.75` | Skip trades priced above this — poor risk/reward near certainty |
+| `MAX_DEPLOY_PCT` | `0.60` | Maximum fraction of bankroll deployed in open positions simultaneously |
+| `MAX_DAILY_DEPLOY_PER_TRADER` | `60.0` | Maximum USD deployed to a single trader per calendar day |
 | `POLL_INTERVAL` | `30` | Seconds between trade polling cycles |
 
 ---
@@ -142,17 +166,32 @@ Before switching from paper trading to real money:
 
 ```
 .
-├── paper_trading_bot.py   # Copy-trading engine
-├── dynamic_watchlist.py   # Whale discovery and watchlist management
-├── backtest_configs.py    # Backtester for comparing watchlist configs
-├── dashboard.py           # Streamlit monitoring dashboard
-├── requirements.txt       # Python dependencies
-├── deploy.sh              # VPS deploy / restart script
-├── .env.example           # Environment variable template
+├── paper_trading_bot.py      # Copy-trading engine
+├── dynamic_watchlist.py      # Whale discovery and watchlist management
+├── backtest_configs.py       # Backtester for comparing watchlist configs
+├── dashboard.py              # Streamlit monitoring dashboard
+├── api_client.py             # HTTP client with retries and exponential backoff
+├── bayesian_stats.py         # Beta-Binomial posterior ranking for traders
+├── shadow_model.py           # Online logistic regression trade scorer (shadow mode)
+├── state_store.py            # SQLite-backed state persistence (opportunities, daily risk)
+├── opportunity_replay.py     # CLI tool to replay and analyse opportunity records offline
+├── category_utils.py         # Market category classification (Sports, Politics, Finance…)
+├── health_check.py           # One-shot health summary printed to stdout
+├── fix_pnl_history.py        # Utility to repair malformed PnL records in the CSV
+├── force_resolve.py          # Utility to manually force-close a stale open position
+├── test_api_client.py        # Tests for HTTP client
+├── test_bayesian_stats.py    # Tests for Bayesian statistics module
+├── test_bot_robustness.py    # Integration-style robustness tests for the bot
+├── test_category_utils.py    # Tests for market category classifier
+├── test_opportunity_replay.py# Tests for opportunity replay logic
+├── test_watchlist_hardening.py# Tests for watchlist edge-case hardening
+├── requirements.txt          # Python dependencies
+├── deploy.sh                 # VPS deploy / restart script
+├── .env.example              # Environment variable template
 └── .gitignore
 ```
 
-> `paper_trades.csv`, `bot.log`, and `watchlist_cache.json` are **excluded from git** — they live on the VPS only.
+> `paper_trades.csv`, `bot.log`, `watchlist_cache.json`, and `bot_state.db` are **excluded from git** — they live on the VPS only.
 
 ---
 
