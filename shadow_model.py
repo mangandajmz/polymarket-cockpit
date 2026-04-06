@@ -7,7 +7,10 @@ def _safe_float(value, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
-        return float(value)
+        parsed = float(value)
+        if math.isnan(parsed) or math.isinf(parsed):
+            return default
+        return parsed
     except (TypeError, ValueError):
         return default
 
@@ -51,6 +54,9 @@ class OnlineLogisticModel:
         if self.weights is None:
             self.weights = [0.0] * len(x)
         score = sum(w * xi for w, xi in zip(self.weights, x))
+        if math.isnan(score) or math.isinf(score):
+            self.weights = [0.0] * len(x)
+            score = 0.0
         if score >= 0:
             z = math.exp(-score)
             return 1.0 / (1.0 + z)
@@ -62,8 +68,12 @@ class OnlineLogisticModel:
         if self.weights is None:
             self.weights = [0.0] * len(x)
         p = self.predict_proba(row)
+        if math.isnan(p) or math.isinf(p):
+            p = 0.5
         error = p - float(label)
         for i, xi in enumerate(x):
             grad = error * xi + self.l2 * self.weights[i]
             self.weights[i] -= self.learning_rate * grad
+            if math.isnan(self.weights[i]) or math.isinf(self.weights[i]):
+                self.weights[i] = 0.0
         self.examples_seen += 1
