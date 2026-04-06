@@ -1,10 +1,16 @@
 import unittest
+from datetime import datetime, timezone
 
-from opportunity_replay import normalized_pnl_per_dollar, simulate_event_driven_policy
+from opportunity_replay import _parse_ts, normalized_pnl_per_dollar, simulate_event_driven_policy
 from shadow_model import OnlineLogisticModel
 
 
 class OpportunityReplayTests(unittest.TestCase):
+    def test_parse_ts_accepts_aware_datetimes(self):
+        parsed = _parse_ts(datetime(2026, 4, 5, 12, 0, 0, tzinfo=timezone.utc))
+        self.assertEqual(parsed, datetime(2026, 4, 5, 12, 0, 0))
+        self.assertIsNone(parsed.tzinfo)
+
     def test_normalized_pnl_per_dollar_matches_binary_market_payoff(self):
         win_row = {"price": 0.40, "resolution_status": "WIN"}
         loss_row = {"price": 0.40, "resolution_status": "LOSS"}
@@ -44,6 +50,38 @@ class OpportunityReplayTests(unittest.TestCase):
         self.assertEqual(metrics["trades_taken"], 2)
         self.assertAlmostEqual(metrics["final_bankroll"], 30.0)
         self.assertAlmostEqual(metrics["max_locked_capital"], 10.0)
+
+    def test_event_driven_policy_handles_mixed_timestamp_types(self):
+        rows = [
+            {
+                "event_id": "a",
+                "trader": "alice",
+                "decision": "COPIED",
+                "price": 0.50,
+                "resolution_status": "WIN",
+                "observed_at_utc": datetime(2026, 4, 1, 0, 0, 0, tzinfo=timezone.utc),
+                "resolved_at_utc": datetime(2026, 4, 1, 1, 0, 0, tzinfo=timezone.utc),
+            },
+            {
+                "event_id": "b",
+                "trader": "alice",
+                "decision": "COPIED",
+                "price": 0.50,
+                "resolution_status": "WIN",
+                "observed_at_utc": "2026-04-01 02:00:00",
+                "resolved_at_utc": "2026-04-01 03:00:00",
+            },
+        ]
+
+        metrics = simulate_event_driven_policy(
+            rows,
+            policy_name="current",
+            start_bankroll=10.0,
+            unit_stake=10.0,
+        )
+
+        self.assertEqual(metrics["trades_taken"], 2)
+        self.assertAlmostEqual(metrics["final_bankroll"], 30.0)
 
     def test_online_model_learns_toward_observed_labels(self):
         model = OnlineLogisticModel()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from bayesian_stats import compute_posterior, estimate_beta_prior, rank_trader_posteriors
@@ -23,13 +23,31 @@ def load_opportunities(db_path: Path):
         ]
 
 
+def _normalize_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 def _parse_ts(value: str | None) -> datetime | None:
     if not value:
         return None
+    if isinstance(value, datetime):
+        return _normalize_utc(value)
+    if hasattr(value, "to_pydatetime"):
+        try:
+            return _normalize_utc(value.to_pydatetime())
+        except Exception:
+            pass
     try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
+        return _normalize_utc(datetime.strptime(value, "%Y-%m-%d %H:%M:%S"))
+    except (TypeError, ValueError):
+        try:
+            return _normalize_utc(datetime.fromisoformat(str(value)))
+        except (TypeError, ValueError):
+            return None
 
 
 def normalized_pnl_per_dollar(row: dict) -> float | None:
@@ -222,7 +240,7 @@ def simulate_event_driven_policy(
     ordered = sorted(
         rows,
         key=lambda row: (
-            row.get("observed_at_utc") or "",
+            _parse_ts(row.get("observed_at_utc")) or datetime.min,
             row.get("event_id") or "",
         ),
     )
