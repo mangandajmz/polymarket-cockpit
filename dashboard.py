@@ -367,11 +367,17 @@ def evaluation_summary(report: dict) -> tuple[str, str]:
     model_delta = replay["model"]["bankroll_delta"]
     hybrid_delta = replay["hybrid"]["bankroll_delta"]
     best_model = replay.get("best_model_threshold")
+    best_hybrid = replay.get("best_hybrid_threshold")
 
     if resolved < 100:
         return "Too Early", "Need at least 100 resolved opportunities before trusting the verdict."
     if model_trades == 0:
         return "Cold", "Model is not taking trades in this window yet."
+    if best_hybrid and best_hybrid["final_bankroll"] > replay["current"]["final_bankroll"] and best_hybrid["trades_taken"] > 0:
+        return "Candidate", (
+            f"Model-only is still loose, but a hybrid veto near p>={best_hybrid['model_threshold']:.2f} "
+            "looks like a credible paper-mode candidate."
+        )
     if model_take_rate > 35.0:
         return "Loose", "Model is taking too much of the eligible stream to trust the edge yet."
     if model_brier is not None and model_brier > 0.24:
@@ -1312,6 +1318,7 @@ with tab_shadow:
             calibration = report["calibration"]
             replay = report["replay"]
             diag = replay["model_diagnostics"]
+            best_hybrid = replay.get("best_hybrid_threshold")
             summary_rows.append({
                 "Window": label,
                 "Opps": report["coverage"]["opportunities"],
@@ -1327,6 +1334,10 @@ with tab_shadow:
                 "Current Bk": f"${replay['current']['final_bankroll']:.2f}",
                 "Model Bk": f"${replay['model']['final_bankroll']:.2f}",
                 "Hybrid Bk": f"${replay['hybrid']['final_bankroll']:.2f}",
+                "Best Hybrid": (
+                    "n/a" if not best_hybrid
+                    else f"p>={best_hybrid['model_threshold']:.2f} -> ${best_hybrid['final_bankroll']:.2f}"
+                ),
                 "Model Delta": f"${replay['model']['bankroll_delta']:.2f}",
                 "Eff / $hr": f"{replay['model']['return_per_locked_dollar_hour']:.4f}",
             })
@@ -1347,6 +1358,22 @@ with tab_shadow:
         if sweep_rows:
             st.markdown("**Model Threshold Sweep**")
             st.dataframe(pd.DataFrame(sweep_rows), width="stretch", hide_index=True)
+
+        hybrid_sweep_rows = []
+        for label, report in (("1D", report_1d), ("7D", report_7d)):
+            for row in report["replay"].get("hybrid_threshold_sweep", []):
+                hybrid_sweep_rows.append({
+                    "Window": label,
+                    "Veto Threshold": f"{row['model_threshold']:.2f}",
+                    "Bankroll": f"${row['final_bankroll']:.2f}",
+                    "Delta": f"${row['bankroll_delta']:.2f}",
+                    "Trades": row["trades_taken"],
+                    "ROI/Trade": f"${row['roi_per_trade']:.2f}",
+                    "Eff / $hr": f"{row['return_per_locked_dollar_hour']:.4f}",
+                })
+        if hybrid_sweep_rows:
+            st.markdown("**Hybrid Threshold Sweep**")
+            st.dataframe(pd.DataFrame(hybrid_sweep_rows), width="stretch", hide_index=True)
 
         diag_rows = []
         for label, report in (("1D", report_1d), ("7D", report_7d)):

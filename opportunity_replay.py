@@ -380,6 +380,27 @@ def simulate_model_threshold_sweep(
     return out
 
 
+def simulate_hybrid_threshold_sweep(
+    rows: list[dict],
+    *,
+    thresholds: list[float] | None = None,
+    start_bankroll: float = 300.0,
+    unit_stake: float = 10.0,
+) -> list[dict]:
+    thresholds = thresholds or [0.55, 0.60, 0.65, 0.70]
+    out = []
+    for threshold in thresholds:
+        metrics = simulate_event_driven_policy(
+            rows,
+            policy_name="hybrid",
+            model_threshold=threshold,
+            start_bankroll=start_bankroll,
+            unit_stake=unit_stake,
+        )
+        out.append(metrics)
+    return out
+
+
 def analyze_model_replay(
     rows: list[dict],
     *,

@@ -11,6 +11,7 @@ from opportunity_replay import (
     analyze_model_replay,
     load_opportunities,
     simulate_event_driven_policy,
+    simulate_hybrid_threshold_sweep,
     simulate_model_threshold_sweep,
 )
 
@@ -212,9 +213,15 @@ def build_report(rows: list[dict], *, lookback_days: float) -> dict:
         "hybrid": simulate_event_driven_policy(scoped_eligible, policy_name="hybrid"),
     }
     replay["model_threshold_sweep"] = simulate_model_threshold_sweep(scoped_eligible)
+    replay["hybrid_threshold_sweep"] = simulate_hybrid_threshold_sweep(scoped_eligible)
     replay["model_diagnostics"] = analyze_model_replay(scoped_eligible)
     replay["best_model_threshold"] = max(
         replay["model_threshold_sweep"],
+        key=lambda row: (row["final_bankroll"], row["return_per_locked_dollar_hour"], -row["trades_taken"]),
+        default=None,
+    )
+    replay["best_hybrid_threshold"] = max(
+        replay["hybrid_threshold_sweep"],
         key=lambda row: (row["final_bankroll"], row["return_per_locked_dollar_hour"], -row["trades_taken"]),
         default=None,
     )
@@ -263,6 +270,14 @@ def compact_snapshot(report: dict) -> dict:
         "best_model_threshold": (
             replay["best_model_threshold"]["model_threshold"]
             if replay.get("best_model_threshold") else None
+        ),
+        "best_hybrid_threshold": (
+            replay["best_hybrid_threshold"]["model_threshold"]
+            if replay.get("best_hybrid_threshold") else None
+        ),
+        "best_hybrid_bankroll": (
+            replay["best_hybrid_threshold"]["final_bankroll"]
+            if replay.get("best_hybrid_threshold") else None
         ),
         "top_skip_reasons": coverage["top_skip_reasons"][:5],
         "top_traders": report["traders"][:5],
@@ -339,6 +354,13 @@ def print_report(report: dict):
         for row in replay["model_threshold_sweep"]:
             print(
                 f"    p>={row['model_threshold']:.2f} | bankroll ${row['final_bankroll']:.2f} | "
+                f"trades {row['trades_taken']:>4} | take eff {row['return_per_locked_dollar_hour']:.4f}"
+            )
+    if replay["hybrid_threshold_sweep"]:
+        print("  Hybrid threshold sweep:")
+        for row in replay["hybrid_threshold_sweep"]:
+            print(
+                f"    veto p>={row['model_threshold']:.2f} | bankroll ${row['final_bankroll']:.2f} | "
                 f"trades {row['trades_taken']:>4} | take eff {row['return_per_locked_dollar_hour']:.4f}"
             )
     diag = replay["model_diagnostics"]
