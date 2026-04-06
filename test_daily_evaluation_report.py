@@ -91,6 +91,7 @@ class DailyEvaluationReportTests(unittest.TestCase):
         self.assertIn("model_take_rate", report["selection"])
         self.assertIn("hybrid", report["replay"])
         self.assertIn("model_threshold_sweep", report["replay"])
+        self.assertIn("model_diagnostics", report["replay"])
         self.assertGreaterEqual(report["replay"]["current"]["final_bankroll"], 300.0)
 
 

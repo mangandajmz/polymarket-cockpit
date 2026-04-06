@@ -2,6 +2,7 @@ import unittest
 from datetime import datetime, timezone
 
 from opportunity_replay import (
+    analyze_model_replay,
     _parse_ts,
     normalized_pnl_per_dollar,
     simulate_event_driven_policy,
@@ -145,6 +146,41 @@ class OpportunityReplayTests(unittest.TestCase):
         for row in sweep:
             self.assertIn("bankroll_delta", row)
             self.assertIn("return_per_locked_dollar_hour", row)
+
+    def test_analyze_model_replay_reports_warmup_and_logged_comparison(self):
+        rows = []
+        for idx in range(12):
+            is_win = idx % 2 == 0
+            rows.append({
+                "event_id": f"diag{idx}",
+                "trader": "alice",
+                "decision": "SKIP",
+                "shadow_model_decision": "TAKE" if idx >= 10 else "SKIP",
+                "price": 0.45 if is_win else 0.75,
+                "resolution_status": "WIN" if is_win else "LOSS",
+                "observed_at_utc": f"2026-04-01 {idx:02d}:00:00",
+                "resolved_at_utc": f"2026-04-02 {idx:02d}:00:00",
+                "whale_size_usdc": 1500.0,
+                "whale_side": "BUY",
+                "is_crypto": 0,
+                "is_spread": 0,
+                "is_futures": 0,
+                "price_capped": 0,
+                "opportunity_age_sec": 10,
+                "conviction": 1.2,
+                "trader_win_rate": 60.0,
+                "trader_resolved_count": 30,
+                "bankroll": 300.0,
+                "deployed_cap_pct": 0.1,
+                "daily_losses_for_trader": 0,
+                "open_positions_count": 1,
+            })
+
+        diag = analyze_model_replay(rows)
+        self.assertEqual(diag["parsed_rows"], 12)
+        self.assertEqual(diag["warm_rows"], 2)
+        self.assertEqual(diag["logged_take_count"], 2)
+        self.assertIsNotNone(diag["first_warm_event_id"])
 
 
 if __name__ == "__main__":

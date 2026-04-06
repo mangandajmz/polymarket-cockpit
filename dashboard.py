@@ -1311,6 +1311,7 @@ with tab_shadow:
             selection = report["selection"]
             calibration = report["calibration"]
             replay = report["replay"]
+            diag = replay["model_diagnostics"]
             summary_rows.append({
                 "Window": label,
                 "Opps": report["coverage"]["opportunities"],
@@ -1318,6 +1319,9 @@ with tab_shadow:
                 "Heuristic WR": f"{selection['heuristic'][1]:.1f}%",
                 "Model WR": f"{selection['model'][1]:.1f}%",
                 "Model Take Rate": f"{selection.get('model_take_rate', 0.0):.1f}%",
+                "Warm Rows": diag["warm_rows"],
+                "Replay Take %": f"{diag['replay_take_rate_warm']:.1f}%",
+                "Replay vs Logged": f"{diag['replay_logged_agreement']:.1f}%",
                 "Disagree": f"{selection['disagreement_rate']:.1f}%",
                 "Model Brier": "n/a" if calibration["model_brier"] is None else f"{calibration['model_brier']:.4f}",
                 "Current Bk": f"${replay['current']['final_bankroll']:.2f}",
@@ -1343,6 +1347,41 @@ with tab_shadow:
         if sweep_rows:
             st.markdown("**Model Threshold Sweep**")
             st.dataframe(pd.DataFrame(sweep_rows), width="stretch", hide_index=True)
+
+        diag_rows = []
+        for label, report in (("1D", report_1d), ("7D", report_7d)):
+            diag = report["replay"]["model_diagnostics"]
+            diag_rows.append({
+                "Window": label,
+                "Parsed": diag["parsed_rows"],
+                "Skipped": diag["skipped_rows"],
+                "Warm Rows": diag["warm_rows"],
+                "First Warm At": diag["first_warm_observed_at"] or "n/a",
+                "Avg Score (Warm)": f"{diag['avg_score_warm']:.3f}",
+                "Score Range": f"{diag['min_score_warm']:.3f} - {diag['max_score_warm']:.3f}",
+                "Replay Takes": diag["replay_take_count"],
+                "Logged Takes": diag["logged_take_count"],
+                "Replay Take %": f"{diag['replay_take_rate_warm']:.1f}%",
+                "Logged Take %": f"{diag['logged_take_rate_warm']:.1f}%",
+                "Replay vs Logged": f"{diag['replay_logged_agreement']:.1f}%",
+                "Replay/Logged Diff": diag["replay_logged_disagreements"],
+            })
+        st.markdown("**Replay Diagnostics**")
+        st.dataframe(pd.DataFrame(diag_rows), width="stretch", hide_index=True)
+
+        bucket_rows = []
+        for label, report in (("1D", report_1d), ("7D", report_7d)):
+            buckets = report["replay"]["model_diagnostics"]["score_buckets"]
+            bucket_rows.append({
+                "Window": label,
+                "<50%": buckets["lt_50"],
+                "50-55%": buckets["50_55"],
+                "55-60%": buckets["55_60"],
+                "60-70%": buckets["60_70"],
+                "70%+": buckets["ge_70"],
+            })
+        st.markdown("**Replay Score Distribution (Warm Rows)**")
+        st.dataframe(pd.DataFrame(bucket_rows), width="stretch", hide_index=True)
 
         resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
         if not resolved_shadow.empty:

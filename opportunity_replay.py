@@ -380,6 +380,97 @@ def simulate_model_threshold_sweep(
     return out
 
 
+def analyze_model_replay(
+    rows: list[dict],
+    *,
+    model_threshold: float = 0.57,
+    warmup_examples: int = 10,
+) -> dict:
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            _parse_ts(row.get("observed_at_utc")) or datetime.min,
+            row.get("event_id") or "",
+        ),
+    )
+    model = OnlineLogisticModel()
+    parsed_rows = 0
+    skipped_rows = 0
+    warm_rows = 0
+    replay_take_count = 0
+    logged_take_count = 0
+    replay_logged_agree = 0
+    replay_logged_disagree = 0
+    first_warm_event_id = None
+    first_warm_observed_at = None
+    scores_all: list[float] = []
+    scores_warm: list[float] = []
+    score_buckets = {"lt_50": 0, "50_55": 0, "55_60": 0, "60_70": 0, "ge_70": 0}
+
+    for row in ordered:
+        observed = _parse_ts(row.get("observed_at_utc"))
+        resolved = _parse_ts(row.get("resolved_at_utc"))
+        payoff = normalized_pnl_per_dollar(row)
+        if observed is None or resolved is None or payoff is None:
+            skipped_rows += 1
+            continue
+        parsed_rows += 1
+
+        score = model.predict_proba(row)
+        scores_all.append(score)
+        if model.examples_seen >= warmup_examples:
+            if first_warm_event_id is None:
+                first_warm_event_id = row.get("event_id")
+                first_warm_observed_at = row.get("observed_at_utc")
+            warm_rows += 1
+            scores_warm.append(score)
+            replay_take = score >= model_threshold
+            logged_take = row.get("shadow_model_decision") == "TAKE"
+            replay_take_count += int(replay_take)
+            logged_take_count += int(logged_take)
+            if replay_take == logged_take:
+                replay_logged_agree += 1
+            else:
+                replay_logged_disagree += 1
+
+            if score < 0.50:
+                score_buckets["lt_50"] += 1
+            elif score < 0.55:
+                score_buckets["50_55"] += 1
+            elif score < 0.60:
+                score_buckets["55_60"] += 1
+            elif score < 0.70:
+                score_buckets["60_70"] += 1
+            else:
+                score_buckets["ge_70"] += 1
+
+        model.update(row, 1 if row["resolution_status"] == "WIN" else 0)
+
+    total_cmp = replay_logged_agree + replay_logged_disagree
+    avg_all = (sum(scores_all) / len(scores_all)) if scores_all else 0.0
+    avg_warm = (sum(scores_warm) / len(scores_warm)) if scores_warm else 0.0
+    return {
+        "threshold": model_threshold,
+        "warmup_examples": warmup_examples,
+        "parsed_rows": parsed_rows,
+        "skipped_rows": skipped_rows,
+        "warm_rows": warm_rows,
+        "first_warm_event_id": first_warm_event_id,
+        "first_warm_observed_at": first_warm_observed_at,
+        "avg_score_all": avg_all,
+        "avg_score_warm": avg_warm,
+        "max_score_warm": max(scores_warm) if scores_warm else 0.0,
+        "min_score_warm": min(scores_warm) if scores_warm else 0.0,
+        "replay_take_count": replay_take_count,
+        "logged_take_count": logged_take_count,
+        "replay_take_rate_warm": (replay_take_count / warm_rows * 100.0) if warm_rows else 0.0,
+        "logged_take_rate_warm": (logged_take_count / warm_rows * 100.0) if warm_rows else 0.0,
+        "replay_logged_agreement": (replay_logged_agree / total_cmp * 100.0) if total_cmp else 0.0,
+        "replay_logged_disagreements": replay_logged_disagree,
+        "score_buckets": score_buckets,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Summarize logged whale opportunities from bot_state.db."

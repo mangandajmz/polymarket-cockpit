@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bayesian_stats import rank_trader_posteriors
-from opportunity_replay import load_opportunities, simulate_event_driven_policy, simulate_model_threshold_sweep
+from opportunity_replay import (
+    analyze_model_replay,
+    load_opportunities,
+    simulate_event_driven_policy,
+    simulate_model_threshold_sweep,
+)
 
 
 def parse_ts(value: str | None) -> datetime | None:
@@ -207,6 +212,7 @@ def build_report(rows: list[dict], *, lookback_days: float) -> dict:
         "hybrid": simulate_event_driven_policy(scoped_eligible, policy_name="hybrid"),
     }
     replay["model_threshold_sweep"] = simulate_model_threshold_sweep(scoped_eligible)
+    replay["model_diagnostics"] = analyze_model_replay(scoped_eligible)
     replay["best_model_threshold"] = max(
         replay["model_threshold_sweep"],
         key=lambda row: (row["final_bankroll"], row["return_per_locked_dollar_hour"], -row["trades_taken"]),
@@ -251,6 +257,9 @@ def compact_snapshot(report: dict) -> dict:
         "hybrid_bankroll": replay["hybrid"]["final_bankroll"],
         "model_bankroll_delta": replay["model"]["bankroll_delta"],
         "model_efficiency": replay["model"]["return_per_locked_dollar_hour"],
+        "replay_warm_rows": replay["model_diagnostics"]["warm_rows"],
+        "replay_take_rate_warm": replay["model_diagnostics"]["replay_take_rate_warm"],
+        "replay_logged_agreement": replay["model_diagnostics"]["replay_logged_agreement"],
         "best_model_threshold": (
             replay["best_model_threshold"]["model_threshold"]
             if replay.get("best_model_threshold") else None
@@ -332,6 +341,17 @@ def print_report(report: dict):
                 f"    p>={row['model_threshold']:.2f} | bankroll ${row['final_bankroll']:.2f} | "
                 f"trades {row['trades_taken']:>4} | take eff {row['return_per_locked_dollar_hour']:.4f}"
             )
+    diag = replay["model_diagnostics"]
+    print("  Replay diagnostics:")
+    print(
+        f"    parsed {diag['parsed_rows']} | skipped {diag['skipped_rows']} | "
+        f"warm rows {diag['warm_rows']} | first warm {diag['first_warm_observed_at'] or 'n/a'}"
+    )
+    print(
+        f"    replay takes {diag['replay_take_count']} ({diag['replay_take_rate_warm']:.1f}%) | "
+        f"logged takes {diag['logged_take_count']} ({diag['logged_take_rate_warm']:.1f}%) | "
+        f"agreement {diag['replay_logged_agreement']:.1f}%"
+    )
 
     if report["traders"]:
         print("")
