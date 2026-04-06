@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bayesian_stats import rank_trader_posteriors
@@ -14,23 +14,31 @@ def parse_ts(value: str | None) -> datetime | None:
     if not value:
         return None
     if isinstance(value, datetime):
-        return value
+        return normalize_utc(value)
     if hasattr(value, "to_pydatetime"):
         try:
-            return value.to_pydatetime()
+            return normalize_utc(value.to_pydatetime())
         except Exception:
             pass
     try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        return normalize_utc(datetime.strptime(value, "%Y-%m-%d %H:%M:%S"))
     except (TypeError, ValueError):
         try:
-            return datetime.fromisoformat(str(value))
+            return normalize_utc(datetime.fromisoformat(str(value)))
         except (TypeError, ValueError):
             return None
 
 
+def normalize_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 def filter_rows(rows: list[dict], *, lookback_days: float, now: datetime | None = None) -> tuple[list[dict], datetime]:
-    now = now or datetime.utcnow()
+    now = normalize_utc(now or datetime.utcnow())
     cutoff = now - timedelta(days=lookback_days)
     kept = []
     for row in rows:

@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from daily_evaluation_report import build_report, filter_rows, parse_ts
 
@@ -9,6 +9,12 @@ class DailyEvaluationReportTests(unittest.TestCase):
         value = datetime(2026, 4, 5, 12, 30, 0)
         self.assertEqual(parse_ts(value), value)
 
+    def test_parse_ts_normalizes_aware_values_to_naive_utc(self):
+        value = datetime(2026, 4, 5, 12, 30, 0, tzinfo=timezone.utc)
+        parsed = parse_ts(value)
+        self.assertEqual(parsed, datetime(2026, 4, 5, 12, 30, 0))
+        self.assertIsNone(parsed.tzinfo)
+
     def test_filter_rows_respects_lookback(self):
         rows = [
             {"event_id": "old", "observed_at_utc": "2026-04-03 00:00:00"},
@@ -17,6 +23,15 @@ class DailyEvaluationReportTests(unittest.TestCase):
         kept, cutoff = filter_rows(rows, lookback_days=1.0, now=datetime(2026, 4, 5, 12, 0, 0))
         self.assertEqual(cutoff.strftime("%Y-%m-%d %H:%M:%S"), "2026-04-04 12:00:00")
         self.assertEqual([row["event_id"] for row in kept], ["new"])
+
+    def test_filter_rows_handles_mixed_naive_and_aware_timestamps(self):
+        rows = [
+            {"event_id": "old", "observed_at_utc": datetime(2026, 4, 4, 18, 59, 59, tzinfo=timezone.utc)},
+            {"event_id": "new", "observed_at_utc": datetime(2026, 4, 4, 19, 0, 1, tzinfo=timezone.utc)},
+            {"event_id": "naive", "observed_at_utc": "2026-04-04 20:00:00"},
+        ]
+        kept, _ = filter_rows(rows, lookback_days=1.0, now=datetime(2026, 4, 5, 19, 0, 0))
+        self.assertEqual([row["event_id"] for row in kept], ["new", "naive"])
 
     def test_build_report_counts_selection_and_replay_inputs(self):
         now = datetime.utcnow()
