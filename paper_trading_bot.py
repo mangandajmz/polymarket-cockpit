@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 from api_client import JsonApiClient
 from bayesian_stats import compute_posterior, estimate_beta_prior, rank_trader_posteriors
+from daily_evaluation_report import build_report, compact_snapshot
 from dynamic_watchlist import WatchlistManager, TRADER_BLOCKLIST
 from shadow_model import OnlineLogisticModel
 from state_store import StateStore
@@ -354,6 +355,18 @@ def bootstrap_shadow_model(bot: PaperBot, opportunities: list[dict]):
     _train_shadow_model_on_rows(bot, opportunities)
 
 
+def _sync_evaluation_snapshots(bot: PaperBot):
+    try:
+        rows = bot.store.load_runtime_state().get("opportunities", [])
+        if not rows:
+            return
+        for days, key in ((1.0, "evaluation_snapshot_1d"), (7.0, "evaluation_snapshot_7d")):
+            report = build_report(rows, lookback_days=days)
+            bot.store.set_value(key, compact_snapshot(report))
+    except Exception as exc:
+        _log(f"[EVAL] Could not sync evaluation snapshots: {exc}")
+
+
 # ── API Helpers ───────────────────────────────────────────────────────────────
 def get(url, params=None, timeout=10, retries=3):
     return HTTP.get_json(url, params=params, timeout=timeout, retries=retries)
@@ -673,6 +686,7 @@ def load_positions_from_store(bot: PaperBot) -> bool:
         bot.trade_log.append(record)
 
     bootstrap_shadow_model(bot, state.get("opportunities", []))
+    _sync_evaluation_snapshots(bot)
     bot.seen_hashes.update(bot.store.load_seen_events())
     return True
 
@@ -1364,6 +1378,7 @@ def resolve_position_snapshot(bot: PaperBot, key, px, resolved, now_ts: float | 
             bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
             _check_bankroll_scale(bot)
             _validate_runtime_invariants(bot)
+            _sync_evaluation_snapshots(bot)
             for rec in bot.trade_log:
                 if rec.get("position_id") == pos["position_id"]:
                     rec["status"] = pos["status"]
@@ -1435,6 +1450,7 @@ def resolve_position_snapshot(bot: PaperBot, key, px, resolved, now_ts: float | 
             bot.store.set_value("daily_losses_per_trader", bot.daily_losses_per_trader)
             _check_bankroll_scale(bot)
             _validate_runtime_invariants(bot)
+            _sync_evaluation_snapshots(bot)
             for rec in bot.trade_log:
                 if rec.get("position_id") == pos["position_id"]:
                     rec["status"] = result_tag
@@ -1552,6 +1568,7 @@ def resolve_logged_opportunities(bot: PaperBot, limit: int = 50):
         row["resolution_status"] = status
         row["resolved_pnl"] = None
         _train_shadow_model_on_rows(bot, [row])
+        _sync_evaluation_snapshots(bot)
         time.sleep(0.05)
 
     if checked:

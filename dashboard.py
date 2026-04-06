@@ -21,6 +21,7 @@ import requests
 import streamlit as st
 from api_client import JsonApiClient
 from category_utils import classify_market, classify_market_details
+from daily_evaluation_report import build_report
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -351,6 +352,31 @@ def load_runtime_kv() -> dict:
         except Exception:
             out[key] = value
     return out
+
+
+def evaluation_summary(report: dict) -> tuple[str, str]:
+    coverage = report["coverage"]
+    selection = report["selection"]
+    calibration = report["calibration"]
+    resolved = coverage["resolved"]
+    model_trades, model_wr = selection["model"]
+    heuristic_trades, heuristic_wr = selection["heuristic"]
+    model_brier = calibration["model_brier"]
+
+    if resolved < 8:
+        return "Too Early", "Not enough resolved opportunities yet."
+    if model_trades == 0:
+        return "Cold", "Model is not taking trades in this window yet."
+    if model_brier is not None and model_brier > 0.30:
+        return "Weak", "Model calibration is still poor in this window."
+    if model_wr >= heuristic_wr and model_trades >= max(3, heuristic_trades * 0.3):
+        return "Promising", "Model is matching or beating heuristic on a meaningful sample."
+    return "Mixed", "Signals are usable, but not yet clearly better than heuristic."
+
+
+@st.cache_data(ttl=30)
+def compute_eval_report(opp_rows: list[dict], days: float) -> dict:
+    return build_report(opp_rows, lookback_days=days)
 
 
 @st.cache_data(ttl=60)
@@ -1205,6 +1231,9 @@ with tab_shadow:
     if opps.empty:
         st.info("No logged opportunities yet.")
     else:
+        opp_rows = opps.to_dict("records")
+        report_1d = compute_eval_report(opp_rows, 1.0)
+        report_7d = compute_eval_report(opp_rows, 7.0)
         shadow = opps.copy()
         shadow["Observed"] = shadow["observed_at_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
         shadow["Bayes Mean %"] = shadow["bayes_posterior_mean"] * 100.0
@@ -1223,6 +1252,64 @@ with tab_shadow:
         top[1].metric("Model TAKE", int(shadow["shadow_model_decision"].eq("TAKE").sum()))
         top[2].metric("Agreement", f"{shadow['heuristic_vs_model'].eq('Agree').mean()*100:.1f}%")
         top[3].metric("Resolved Rows", int(shadow["resolution_status"].isin(["WIN", "LOSS"]).sum()))
+
+        st.markdown("**Automatic evaluation summary**")
+        verdict_1d, note_1d = evaluation_summary(report_1d)
+        verdict_7d, note_7d = evaluation_summary(report_7d)
+        runtime_kv = load_runtime_kv()
+        snap_1d = runtime_kv.get("evaluation_snapshot_1d", {}) if isinstance(runtime_kv.get("evaluation_snapshot_1d"), dict) else {}
+        snap_7d = runtime_kv.get("evaluation_snapshot_7d", {}) if isinstance(runtime_kv.get("evaluation_snapshot_7d"), dict) else {}
+        sum1, sum2 = st.columns(2)
+        with sum1:
+            st.markdown("**Last 1 Day**")
+            st.metric("Verdict", verdict_1d)
+            st.caption(note_1d)
+            s = report_1d["selection"]
+            c = report_1d["coverage"]
+            st.write(
+                f"Resolved `{c['resolved']}` | "
+                f"Heuristic `{s['heuristic'][0]}` @ `{s['heuristic'][1]:.1f}%` | "
+                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%`"
+            )
+            if snap_1d:
+                st.caption(
+                    f"Snapshot: {snap_1d.get('generated_at_utc', 'unknown')} UTC | "
+                    f"Model Brier {snap_1d.get('model_brier', 'n/a')}"
+                )
+        with sum2:
+            st.markdown("**Last 7 Days**")
+            st.metric("Verdict", verdict_7d)
+            st.caption(note_7d)
+            s = report_7d["selection"]
+            c = report_7d["coverage"]
+            st.write(
+                f"Resolved `{c['resolved']}` | "
+                f"Heuristic `{s['heuristic'][0]}` @ `{s['heuristic'][1]:.1f}%` | "
+                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%`"
+            )
+            if snap_7d:
+                st.caption(
+                    f"Snapshot: {snap_7d.get('generated_at_utc', 'unknown')} UTC | "
+                    f"Model Brier {snap_7d.get('model_brier', 'n/a')}"
+                )
+
+        summary_rows = []
+        for label, report in (("1D", report_1d), ("7D", report_7d)):
+            selection = report["selection"]
+            calibration = report["calibration"]
+            replay = report["replay"]
+            summary_rows.append({
+                "Window": label,
+                "Opps": report["coverage"]["opportunities"],
+                "Resolved": report["coverage"]["resolved"],
+                "Heuristic WR": f"{selection['heuristic'][1]:.1f}%",
+                "Model WR": f"{selection['model'][1]:.1f}%",
+                "Disagree": f"{selection['disagreement_rate']:.1f}%",
+                "Model Brier": "n/a" if calibration["model_brier"] is None else f"{calibration['model_brier']:.4f}",
+                "Current Bk": f"${replay['current']['final_bankroll']:.2f}",
+                "Model Bk": f"${replay['model']['final_bankroll']:.2f}",
+            })
+        st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
 
         resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
         if not resolved_shadow.empty:
