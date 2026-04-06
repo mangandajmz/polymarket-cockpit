@@ -1,7 +1,7 @@
 # Polymarket Copy Trading Bot
 
 A paper-trading (and eventually live) copy-trading bot for [Polymarket](https://polymarket.com).
-It automatically discovers high-performing traders, mirrors their qualifying BUY trades at a conviction-scaled size, and logs everything to a CSV.
+It automatically discovers high-performing traders, mirrors their qualifying BUY trades at a conviction-scaled size, and logs both fills and opportunity-level research data to SQLite.
 A Streamlit dashboard lets you monitor performance from any browser.
 
 > **Current mode: PAPER TRADING — no real money, no wallet connected.**
@@ -10,7 +10,7 @@ A Streamlit dashboard lets you monitor performance from any browser.
 
 ## Overview
 
-The bot watches the top monthly-PNL traders on Polymarket in real time. When a qualifying whale makes a large BUY, the bot copies it immediately at a fraction of the size — scaled by how big that trade is relative to the whale's recent history. All simulated trades, PnL, and market outcomes are logged to `paper_trades.csv` and displayed on a live Streamlit dashboard.
+The bot watches the top monthly-PNL traders on Polymarket in real time. When a qualifying whale makes a large BUY, the bot copies it immediately at a conviction-scaled size. All simulated trades, PnL, and market outcomes are logged to `paper_trades.csv`, while every observed candidate trade is also recorded to `bot_state.db` as an opportunity record for offline analysis, shadow modeling, replay, and dashboard diagnostics.
 
 ---
 
@@ -58,13 +58,17 @@ The resolution loop also auto-closes positions in three edge-case scenarios:
 | Zero-price | Price ≈ $0 for ≥ 24 hours | Force-closed as LOSS |
 | Max age | Open ≥ 72 hours regardless of price | Force-closed at current price |
 
-### 6. Analytical layer (shadow model + Bayesian ranking)
+### 6. Analytical layer (opportunity logging + Bayesian ranking + shadow model)
 
 Every evaluated trade is recorded to a SQLite database (`bot_state.db` via `state_store.py`) as an *opportunity record*, regardless of whether it is copied. This enables offline analysis and model training.
 
 **Bayesian trader ranking** (`bayesian_stats.py`): uses a Beta-Binomial model with a pooled empirical prior to rank traders by posterior win-rate, shrinking estimates for traders with few resolved trades toward the group mean.
 
-**Shadow model** (`shadow_model.py`): an online logistic regression that trains on each resolved trade and produces a probability score (`shadow_model_score`) for whether a candidate trade will be profitable. The score is logged but does not yet gate trade execution — it runs in shadow mode for observation only.
+**Shadow model** (`shadow_model.py`): an online logistic regression that trains on each resolved trade and produces a probability score (`shadow_model_score`) for whether a candidate trade will be profitable. The score is logged but does not gate live trade execution.
+
+**Replay and evaluation** (`opportunity_replay.py`, `daily_evaluation_report.py`): the bot now supports event-driven replay, threshold sweeps, Bayesian comparisons, calibration diagnostics, and automatic 1-day / 7-day evaluation snapshots shown in the dashboard.
+
+**Hybrid veto tracking**: the current rollout candidate is a paper-only hybrid rule where the heuristic still decides what gets copied, while a model threshold (`p >= 0.70`) is tracked as a hypothetical ALLOW / VETO filter. This is logged for analysis only; it does not currently block execution.
 
 ### 7. Trader blocklist
 `TRADER_BLOCKLIST` in `dynamic_watchlist.py` permanently excludes specific traders from the watchlist regardless of their current win rate or PNL ranking. Entries are matched by lowercase name. Use this to exclude traders whose historical performance is misleading or who have been manually reviewed and rejected.
@@ -92,6 +96,18 @@ All values are set at the top of `paper_trading_bot.py`.
 | `MAX_DEPLOY_PCT` | `0.60` | Maximum fraction of bankroll deployed in open positions simultaneously |
 | `MAX_DAILY_DEPLOY_PER_TRADER` | `60.0` | Maximum USD deployed to a single trader per calendar day |
 | `POLL_INTERVAL` | `30` | Seconds between trade polling cycles |
+
+---
+
+## What is live vs shadow
+
+The current deployed behavior is intentionally staged:
+
+- **Live paper execution**: the rule-based heuristic still decides whether a trade is copied.
+- **Shadow analytics**: Bayesian trader scores, model probabilities, replay results, and threshold sweeps are logged and shown in the dashboard.
+- **Paper-only hybrid veto**: each copied heuristic trade is tagged with whether a `p >= 0.70` model filter would have allowed or vetoed it, but this does not yet affect execution.
+
+This means the dashboard may show a model or hybrid policy outperforming the current heuristic in replay before any live behavior changes. That is expected and is the purpose of the research stack.
 
 ---
 
@@ -156,6 +172,7 @@ Before switching from paper trading to real money:
 - [ ] **Set `STARTING_BANKROLL`** to your actual deposit amount in USDC.
 - [ ] **Verify `DAILY_LOSS_CAP`** is 15–20% of your bankroll. At $300 bankroll the default $60 cap is 20%. Adjust down if you prefer slower drawdown.
 - [ ] **Run paper mode for ≥ 48 hours** and review `paper_trades.csv` — check that all whale sizes are above $1,000, conviction scores look reasonable (0.5–3.0 range is normal), and no single trader is dominating losses.
+- [ ] **Review the Shadow tab** — confirm model-only remains shadow-only, check the 7-day evaluation card, and compare `ALLOW` vs `VETO` win rates for the paper-only hybrid veto layer.
 - [ ] **Audit the last 20 resolved trades** for market quality — are they politics/sports/finance or noise? Tighten `CRYPTO_KW` if unexpected market types are slipping through.
 - [ ] **Connect wallet and set `LIVE_MODE = True`** on the `live` branch only. Never merge live-mode code to `main`.
 - [ ] Start with `DAILY_LOSS_CAP` at 50% of the paper-mode value for the first 48 hours live.
@@ -175,6 +192,7 @@ Before switching from paper trading to real money:
 ├── shadow_model.py           # Online logistic regression trade scorer (shadow mode)
 ├── state_store.py            # SQLite-backed state persistence (opportunities, daily risk)
 ├── opportunity_replay.py     # CLI tool to replay and analyse opportunity records offline
+├── daily_evaluation_report.py# Daily / rolling evaluation summaries from opportunity data
 ├── category_utils.py         # Market category classification (Sports, Politics, Finance…)
 ├── health_check.py           # One-shot health summary printed to stdout
 ├── fix_pnl_history.py        # Utility to repair malformed PnL records in the CSV
@@ -184,6 +202,7 @@ Before switching from paper trading to real money:
 ├── test_bot_robustness.py    # Integration-style robustness tests for the bot
 ├── test_category_utils.py    # Tests for market category classifier
 ├── test_opportunity_replay.py# Tests for opportunity replay logic
+├── test_shadow_model.py      # Tests for model numeric stability and finite scoring
 ├── test_watchlist_hardening.py# Tests for watchlist edge-case hardening
 ├── requirements.txt          # Python dependencies
 ├── deploy.sh                 # VPS deploy / restart script
@@ -286,7 +305,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/polymarket-bot
 ExecStart=/usr/bin/python3 -m streamlit run dashboard.py \
-    --server.port 8501 \
+    --server.port 8502 \
     --server.address 0.0.0.0 \
     --server.headless true
 Restart=on-failure
@@ -305,10 +324,10 @@ sudo systemctl start polymarket-dash
 ### 7. Open the firewall
 
 ```bash
-sudo ufw allow 8501/tcp
+sudo ufw allow 8502/tcp
 ```
 
-Dashboard is now live at: **`http://YOUR_VPS_IP:8501`**
+Dashboard is now live at: **`http://YOUR_VPS_IP:8502`**
 
 ---
 
@@ -324,9 +343,11 @@ ssh ubuntu@YOUR_VPS_IP "cd /home/ubuntu/polymarket-bot && bash deploy.sh"
 
 | What | How |
 |---|---|
-| Dashboard | `http://YOUR_VPS_IP:8501` |
+| Dashboard | `http://YOUR_VPS_IP:8502` |
 | Bot logs (live) | `sudo journalctl -u polymarket-bot -f` |
 | Trade CSV | `tail -f paper_trades.csv` |
+| Opportunity DB | `sqlite3 bot_state.db "SELECT COUNT(*) FROM opportunities;"` |
+| Daily evaluation | `python3 daily_evaluation_report.py --db bot_state.db --days 7` |
 | Health summary | `python3 health_check.py` |
 | Service status | `sudo systemctl status polymarket-bot polymarket-dash` |
 
