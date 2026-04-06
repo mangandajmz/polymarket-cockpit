@@ -13,10 +13,20 @@ from opportunity_replay import load_opportunities, simulate_event_driven_policy
 def parse_ts(value: str | None) -> datetime | None:
     if not value:
         return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "to_pydatetime"):
+        try:
+            return value.to_pydatetime()
+        except Exception:
+            pass
     try:
         return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
 
 
 def filter_rows(rows: list[dict], *, lookback_days: float, now: datetime | None = None) -> tuple[list[dict], datetime]:

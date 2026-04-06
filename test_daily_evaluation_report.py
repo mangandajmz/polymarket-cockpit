@@ -1,10 +1,14 @@
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from daily_evaluation_report import build_report, filter_rows
+from daily_evaluation_report import build_report, filter_rows, parse_ts
 
 
 class DailyEvaluationReportTests(unittest.TestCase):
+    def test_parse_ts_accepts_datetime_like_values(self):
+        value = datetime(2026, 4, 5, 12, 30, 0)
+        self.assertEqual(parse_ts(value), value)
+
     def test_filter_rows_respects_lookback(self):
         rows = [
             {"event_id": "old", "observed_at_utc": "2026-04-03 00:00:00"},
@@ -15,11 +19,16 @@ class DailyEvaluationReportTests(unittest.TestCase):
         self.assertEqual([row["event_id"] for row in kept], ["new"])
 
     def test_build_report_counts_selection_and_replay_inputs(self):
+        now = datetime.utcnow()
+        t0 = now.replace(microsecond=0, second=0, minute=0)
+        t1 = t0 + timedelta(hours=1)
+        t2 = t0 + timedelta(hours=2)
+        t3 = t0 + timedelta(hours=3)
         rows = [
             {
                 "event_id": "a",
-                "observed_at_utc": "2026-04-05 00:00:00",
-                "resolved_at_utc": "2026-04-05 01:00:00",
+                "observed_at_utc": t0.strftime("%Y-%m-%d %H:%M:%S"),
+                "resolved_at_utc": t1.strftime("%Y-%m-%d %H:%M:%S"),
                 "trader": "alice",
                 "decision": "COPIED",
                 "decision_reason": "copied",
@@ -38,8 +47,8 @@ class DailyEvaluationReportTests(unittest.TestCase):
             },
             {
                 "event_id": "b",
-                "observed_at_utc": "2026-04-05 02:00:00",
-                "resolved_at_utc": "2026-04-05 03:00:00",
+                "observed_at_utc": t2.strftime("%Y-%m-%d %H:%M:%S"),
+                "resolved_at_utc": t3.strftime("%Y-%m-%d %H:%M:%S"),
                 "trader": "bob",
                 "decision": "SKIP",
                 "decision_reason": "price_cap",
