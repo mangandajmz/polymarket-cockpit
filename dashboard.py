@@ -358,20 +358,31 @@ def evaluation_summary(report: dict) -> tuple[str, str]:
     coverage = report["coverage"]
     selection = report["selection"]
     calibration = report["calibration"]
+    replay = report["replay"]
     resolved = coverage["resolved"]
     model_trades, model_wr = selection["model"]
-    heuristic_trades, heuristic_wr = selection["heuristic"]
+    _, heuristic_wr = selection["heuristic"]
     model_brier = calibration["model_brier"]
+    model_take_rate = selection.get("model_take_rate", 0.0)
+    model_delta = replay["model"]["bankroll_delta"]
+    hybrid_delta = replay["hybrid"]["bankroll_delta"]
+    best_model = replay.get("best_model_threshold")
 
-    if resolved < 8:
-        return "Too Early", "Not enough resolved opportunities yet."
+    if resolved < 100:
+        return "Too Early", "Need at least 100 resolved opportunities before trusting the verdict."
     if model_trades == 0:
         return "Cold", "Model is not taking trades in this window yet."
-    if model_brier is not None and model_brier > 0.30:
-        return "Weak", "Model calibration is still poor in this window."
-    if model_wr >= heuristic_wr and model_trades >= max(3, heuristic_trades * 0.3):
-        return "Promising", "Model is matching or beating heuristic on a meaningful sample."
-    return "Mixed", "Signals are usable, but not yet clearly better than heuristic."
+    if model_take_rate > 35.0:
+        return "Loose", "Model is taking too much of the eligible stream to trust the edge yet."
+    if model_brier is not None and model_brier > 0.24:
+        return "Weak", "Model calibration is still too weak for execution-facing use."
+    if model_delta <= 0 and hybrid_delta <= 0:
+        return "Weak", "Shadow replay is not improving bankroll versus the current baseline."
+    if best_model and best_model["final_bankroll"] <= replay["current"]["final_bankroll"]:
+        return "Mixed", "Threshold tuning helps, but no model threshold is clearly beating the current replay."
+    if model_wr >= heuristic_wr and hybrid_delta > 0 and model_take_rate <= 20.0:
+        return "Promising", "Model is selective and replay-positive versus the current baseline."
+    return "Mixed", "The model is learning signal, but it is not yet selective or replay-positive enough."
 
 
 @st.cache_data(ttl=30)
@@ -1269,7 +1280,8 @@ with tab_shadow:
             st.write(
                 f"Resolved `{c['resolved']}` | "
                 f"Heuristic `{s['heuristic'][0]}` @ `{s['heuristic'][1]:.1f}%` | "
-                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%`"
+                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%` | "
+                f"Take rate `{s.get('model_take_rate', 0.0):.1f}%`"
             )
             if snap_1d:
                 st.caption(
@@ -1285,7 +1297,8 @@ with tab_shadow:
             st.write(
                 f"Resolved `{c['resolved']}` | "
                 f"Heuristic `{s['heuristic'][0]}` @ `{s['heuristic'][1]:.1f}%` | "
-                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%`"
+                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%` | "
+                f"Take rate `{s.get('model_take_rate', 0.0):.1f}%`"
             )
             if snap_7d:
                 st.caption(
@@ -1304,12 +1317,32 @@ with tab_shadow:
                 "Resolved": report["coverage"]["resolved"],
                 "Heuristic WR": f"{selection['heuristic'][1]:.1f}%",
                 "Model WR": f"{selection['model'][1]:.1f}%",
+                "Model Take Rate": f"{selection.get('model_take_rate', 0.0):.1f}%",
                 "Disagree": f"{selection['disagreement_rate']:.1f}%",
                 "Model Brier": "n/a" if calibration["model_brier"] is None else f"{calibration['model_brier']:.4f}",
                 "Current Bk": f"${replay['current']['final_bankroll']:.2f}",
                 "Model Bk": f"${replay['model']['final_bankroll']:.2f}",
+                "Hybrid Bk": f"${replay['hybrid']['final_bankroll']:.2f}",
+                "Model Delta": f"${replay['model']['bankroll_delta']:.2f}",
+                "Eff / $hr": f"{replay['model']['return_per_locked_dollar_hour']:.4f}",
             })
         st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+
+        sweep_rows = []
+        for label, report in (("1D", report_1d), ("7D", report_7d)):
+            for row in report["replay"].get("model_threshold_sweep", []):
+                sweep_rows.append({
+                    "Window": label,
+                    "Threshold": f"{row['model_threshold']:.2f}",
+                    "Bankroll": f"${row['final_bankroll']:.2f}",
+                    "Delta": f"${row['bankroll_delta']:.2f}",
+                    "Trades": row["trades_taken"],
+                    "ROI/Trade": f"${row['roi_per_trade']:.2f}",
+                    "Eff / $hr": f"{row['return_per_locked_dollar_hour']:.4f}",
+                })
+        if sweep_rows:
+            st.markdown("**Model Threshold Sweep**")
+            st.dataframe(pd.DataFrame(sweep_rows), width="stretch", hide_index=True)
 
         resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
         if not resolved_shadow.empty:

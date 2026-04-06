@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bayesian_stats import rank_trader_posteriors
-from opportunity_replay import load_opportunities, simulate_event_driven_policy
+from opportunity_replay import load_opportunities, simulate_event_driven_policy, simulate_model_threshold_sweep
 
 
 def parse_ts(value: str | None) -> datetime | None:
@@ -71,6 +71,12 @@ def win_rate(rows: list[dict], take_fn) -> tuple[int, float]:
         return 0, 0.0
     wins = sum(1 for row in taken if row.get("resolution_status") == "WIN")
     return len(taken), wins / len(taken) * 100.0
+
+
+def take_rate(total_eligible: int, trades_taken: int) -> float:
+    if total_eligible <= 0:
+        return 0.0
+    return trades_taken / total_eligible * 100.0
 
 
 def disagreement_rate(rows: list[dict]) -> float:
@@ -181,7 +187,11 @@ def build_report(rows: list[dict], *, lookback_days: float) -> dict:
         "bayes": win_rate(scoped_eligible, lambda row: (float(row.get("bayes_lower_bound") or 0.0) * 100.0) >= 60.0),
         "model": win_rate(scoped_eligible, lambda row: row.get("shadow_model_decision") == "TAKE"),
         "disagreement_rate": disagreement_rate(scoped_rows),
+        "eligible_resolved": len(scoped_eligible),
     }
+    selection["heuristic_take_rate"] = take_rate(selection["eligible_resolved"], selection["heuristic"][0])
+    selection["bayes_take_rate"] = take_rate(selection["eligible_resolved"], selection["bayes"][0])
+    selection["model_take_rate"] = take_rate(selection["eligible_resolved"], selection["model"][0])
 
     calibration = {
         "model_brier": brier_score(scoped_rows, "shadow_model_score"),
@@ -194,7 +204,14 @@ def build_report(rows: list[dict], *, lookback_days: float) -> dict:
         "current": simulate_event_driven_policy(scoped_eligible, policy_name="current"),
         "bayes": simulate_event_driven_policy(scoped_eligible, policy_name="bayes"),
         "model": simulate_event_driven_policy(scoped_eligible, policy_name="model"),
+        "hybrid": simulate_event_driven_policy(scoped_eligible, policy_name="hybrid"),
     }
+    replay["model_threshold_sweep"] = simulate_model_threshold_sweep(scoped_eligible)
+    replay["best_model_threshold"] = max(
+        replay["model_threshold_sweep"],
+        key=lambda row: (row["final_bankroll"], row["return_per_locked_dollar_hour"], -row["trades_taken"]),
+        default=None,
+    )
 
     return {
         "coverage": coverage,
@@ -224,12 +241,20 @@ def compact_snapshot(report: dict) -> dict:
         "bayes_wr": selection["bayes"][1],
         "model_trades": selection["model"][0],
         "model_wr": selection["model"][1],
+        "model_take_rate": selection["model_take_rate"],
         "disagreement_rate": selection["disagreement_rate"],
         "model_brier": calibration["model_brier"],
         "bayes_brier": calibration["bayes_brier"],
         "current_bankroll": replay["current"]["final_bankroll"],
         "bayes_bankroll": replay["bayes"]["final_bankroll"],
         "model_bankroll": replay["model"]["final_bankroll"],
+        "hybrid_bankroll": replay["hybrid"]["final_bankroll"],
+        "model_bankroll_delta": replay["model"]["bankroll_delta"],
+        "model_efficiency": replay["model"]["return_per_locked_dollar_hour"],
+        "best_model_threshold": (
+            replay["best_model_threshold"]["model_threshold"]
+            if replay.get("best_model_threshold") else None
+        ),
         "top_skip_reasons": coverage["top_skip_reasons"][:5],
         "top_traders": report["traders"][:5],
     }
@@ -272,7 +297,10 @@ def print_report(report: dict):
     print("Selection Quality")
     for name, label in (("heuristic", "Heuristic"), ("bayes", "Bayesian gate"), ("model", "Predictive model")):
         trades, wr = selection[name]
-        print(f"  {label:<16} trades {trades:>4} | win rate {fmt_pct(wr)}")
+        print(
+            f"  {label:<16} trades {trades:>4} | win rate {fmt_pct(wr)} | "
+            f"take rate {fmt_pct(selection[f'{name}_take_rate'])}"
+        )
     print(f"  Disagreement rate: {fmt_pct(selection['disagreement_rate'])}")
 
     print("")
@@ -290,12 +318,20 @@ def print_report(report: dict):
 
     print("")
     print("Replay")
-    for key, label in (("current", "Current"), ("bayes", "Bayes"), ("model", "Model")):
+    for key, label in (("current", "Current"), ("bayes", "Bayes"), ("model", "Model"), ("hybrid", "Hybrid")):
         row = replay[key]
         print(
             f"  {label:<8} bankroll ${row['start_bankroll']:.2f} -> ${row['final_bankroll']:.2f} | "
-            f"trades {row['trades_taken']:>4} | max locked ${row['max_locked_capital']:.2f}"
+            f"trades {row['trades_taken']:>4} | max locked ${row['max_locked_capital']:.2f} | "
+            f"roi/trade ${row['roi_per_trade']:.2f} | eff {row['return_per_locked_dollar_hour']:.4f}"
         )
+    if replay["model_threshold_sweep"]:
+        print("  Model threshold sweep:")
+        for row in replay["model_threshold_sweep"]:
+            print(
+                f"    p>={row['model_threshold']:.2f} | bankroll ${row['final_bankroll']:.2f} | "
+                f"trades {row['trades_taken']:>4} | take eff {row['return_per_locked_dollar_hour']:.4f}"
+            )
 
     if report["traders"]:
         print("")

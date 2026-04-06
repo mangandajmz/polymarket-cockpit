@@ -88,6 +88,9 @@ class DailyEvaluationReportTests(unittest.TestCase):
         self.assertEqual(report["selection"]["heuristic"][0], 1)
         self.assertEqual(report["selection"]["bayes"][0], 1)
         self.assertEqual(report["selection"]["model"][0], 1)
+        self.assertIn("model_take_rate", report["selection"])
+        self.assertIn("hybrid", report["replay"])
+        self.assertIn("model_threshold_sweep", report["replay"])
         self.assertGreaterEqual(report["replay"]["current"]["final_bankroll"], 300.0)
 
 

@@ -1,7 +1,12 @@
 import unittest
 from datetime import datetime, timezone
 
-from opportunity_replay import _parse_ts, normalized_pnl_per_dollar, simulate_event_driven_policy
+from opportunity_replay import (
+    _parse_ts,
+    normalized_pnl_per_dollar,
+    simulate_event_driven_policy,
+    simulate_model_threshold_sweep,
+)
 from shadow_model import OnlineLogisticModel
 
 
@@ -106,6 +111,40 @@ class OpportunityReplayTests(unittest.TestCase):
         after_loss = model.predict_proba(loss_row)
         self.assertGreater(after_win, after_loss)
         self.assertEqual(model.examples_seen, 50)
+
+    def test_threshold_sweep_returns_metrics_per_threshold(self):
+        rows = []
+        for idx in range(20):
+            is_win = idx % 2 == 0
+            rows.append({
+                "event_id": f"e{idx}",
+                "trader": "alice" if idx < 10 else "bob",
+                "decision": "SKIP",
+                "price": 0.45 if is_win else 0.75,
+                "resolution_status": "WIN" if is_win else "LOSS",
+                "observed_at_utc": f"2026-04-01 {idx:02d}:00:00",
+                "resolved_at_utc": f"2026-04-02 {idx:02d}:00:00",
+                "whale_size_usdc": 1500.0,
+                "whale_side": "BUY",
+                "is_crypto": 0,
+                "is_spread": 0,
+                "is_futures": 0,
+                "price_capped": 0,
+                "opportunity_age_sec": 10,
+                "conviction": 1.2,
+                "trader_win_rate": 60.0,
+                "trader_resolved_count": 30,
+                "bankroll": 300.0,
+                "deployed_cap_pct": 0.1,
+                "daily_losses_for_trader": 0,
+                "open_positions_count": 1,
+            })
+
+        sweep = simulate_model_threshold_sweep(rows, thresholds=[0.55, 0.65])
+        self.assertEqual([row["model_threshold"] for row in sweep], [0.55, 0.65])
+        for row in sweep:
+            self.assertIn("bankroll_delta", row)
+            self.assertIn("return_per_locked_dollar_hour", row)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,37 @@ def hold_hours(row: dict) -> float | None:
     return max(0.0, (resolved - observed).total_seconds() / 3600.0)
 
 
+def _replay_metrics(
+    *,
+    policy_name: str,
+    start_bankroll: float,
+    bankroll: float,
+    trades_taken: int,
+    max_locked: float,
+    total_locked_dollar_hours: float,
+    total_hold_hours: float,
+    avg_score: float,
+    model_threshold: float | None = None,
+) -> dict:
+    bankroll_delta = bankroll - start_bankroll
+    return {
+        "policy_name": policy_name,
+        "start_bankroll": start_bankroll,
+        "final_bankroll": bankroll,
+        "bankroll_delta": bankroll_delta,
+        "trades_taken": trades_taken,
+        "max_locked_capital": max_locked,
+        "total_locked_dollar_hours": total_locked_dollar_hours,
+        "return_per_locked_dollar_hour": (
+            bankroll_delta / total_locked_dollar_hours if total_locked_dollar_hours > 0 else 0.0
+        ),
+        "avg_hold_hours": (total_hold_hours / trades_taken) if trades_taken else 0.0,
+        "roi_per_trade": (bankroll_delta / trades_taken) if trades_taken else 0.0,
+        "avg_score": avg_score,
+        "model_threshold": model_threshold,
+    }
+
+
 def summarize(rows: list[dict]):
     total = len(rows)
     copied = [row for row in rows if row["decision"] == "COPIED"]
@@ -210,6 +241,12 @@ def _policy_take_row(
 ) -> bool:
     if policy_name == "current":
         return row.get("decision") == "COPIED"
+    if policy_name == "hybrid":
+        if row.get("decision") != "COPIED":
+            return False
+        if model is None or model.examples_seen < 10:
+            return False
+        return model.predict_proba(row) >= model_threshold
     if policy_name == "model":
         if model is None or model.examples_seen < 10:
             return False
@@ -251,7 +288,9 @@ def simulate_event_driven_policy(
     trades_taken = 0
     max_locked = 0.0
     scores: list[float] = []
-    model = OnlineLogisticModel() if policy_name == "model" else None
+    total_locked_dollar_hours = 0.0
+    total_hold_hours = 0.0
+    model = OnlineLogisticModel() if policy_name in ("model", "hybrid") else None
 
     for row in ordered:
         observed = _parse_ts(row.get("observed_at_utc"))
@@ -263,6 +302,7 @@ def simulate_event_driven_policy(
         releasable = [pos for pos in open_positions if pos["resolved_at"] <= observed]
         if releasable:
             for pos in releasable:
+                total_locked_dollar_hours += pos["stake"] * pos.get("hold_hours", 0.0)
                 bankroll += pos["stake"] + pos["stake"] * pos["payoff"]
             open_positions = [pos for pos in open_positions if pos["resolved_at"] > observed]
 
@@ -279,13 +319,16 @@ def simulate_event_driven_policy(
         if model is not None:
             scores.append(model.predict_proba(row))
         if take_trade and bankroll >= unit_stake:
+            hold = max(0.0, (resolved - observed).total_seconds() / 3600.0)
             bankroll -= unit_stake
             open_positions.append({
                 "resolved_at": resolved,
                 "stake": unit_stake,
                 "payoff": payoff,
+                "hold_hours": hold,
             })
             trades_taken += 1
+            total_hold_hours += hold
 
         locked_capital = sum(pos["stake"] for pos in open_positions)
         max_locked = max(max_locked, locked_capital)
@@ -300,16 +343,41 @@ def simulate_event_driven_policy(
             model.update(row, 1 if row["resolution_status"] == "WIN" else 0)
 
     for pos in sorted(open_positions, key=lambda item: item["resolved_at"]):
+        total_locked_dollar_hours += pos["stake"] * pos.get("hold_hours", 0.0)
         bankroll += pos["stake"] + pos["stake"] * pos["payoff"]
 
-    return {
-        "policy_name": policy_name,
-        "start_bankroll": start_bankroll,
-        "final_bankroll": bankroll,
-        "trades_taken": trades_taken,
-        "max_locked_capital": max_locked,
-        "avg_score": (sum(scores) / len(scores)) if scores else 0.0,
-    }
+    return _replay_metrics(
+        policy_name=policy_name,
+        start_bankroll=start_bankroll,
+        bankroll=bankroll,
+        trades_taken=trades_taken,
+        max_locked=max_locked,
+        total_locked_dollar_hours=total_locked_dollar_hours,
+        total_hold_hours=total_hold_hours,
+        avg_score=(sum(scores) / len(scores)) if scores else 0.0,
+        model_threshold=model_threshold if policy_name in ("model", "hybrid") else None,
+    )
+
+
+def simulate_model_threshold_sweep(
+    rows: list[dict],
+    *,
+    thresholds: list[float] | None = None,
+    start_bankroll: float = 300.0,
+    unit_stake: float = 10.0,
+) -> list[dict]:
+    thresholds = thresholds or [0.55, 0.60, 0.65, 0.70]
+    out = []
+    for threshold in thresholds:
+        metrics = simulate_event_driven_policy(
+            rows,
+            policy_name="model",
+            model_threshold=threshold,
+            start_bankroll=start_bankroll,
+            unit_stake=unit_stake,
+        )
+        out.append(metrics)
+    return out
 
 
 def main():
