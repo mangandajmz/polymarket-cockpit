@@ -118,6 +118,9 @@ class StateStore:
                     bayes_lower_bound REAL,
                     shadow_model_score REAL,
                     shadow_model_decision TEXT,
+                    hybrid_veto_threshold REAL,
+                    hybrid_veto_decision TEXT,
+                    hybrid_veto_reason TEXT,
                     resolution_status TEXT,
                     resolved_pnl REAL,
                     resolved_at_utc TEXT
@@ -143,6 +146,9 @@ class StateStore:
             "bayes_lower_bound": "REAL",
             "shadow_model_score": "REAL",
             "shadow_model_decision": "TEXT",
+            "hybrid_veto_threshold": "REAL",
+            "hybrid_veto_decision": "TEXT",
+            "hybrid_veto_reason": "TEXT",
         }
         with self._connect() as conn:
             cols = {
@@ -377,6 +383,13 @@ class StateStore:
                 else None
             ),
             "shadow_model_decision": record.get("shadow_model_decision"),
+            "hybrid_veto_threshold": (
+                float(record.get("hybrid_veto_threshold"))
+                if record.get("hybrid_veto_threshold") is not None
+                else None
+            ),
+            "hybrid_veto_decision": record.get("hybrid_veto_decision"),
+            "hybrid_veto_reason": record.get("hybrid_veto_reason"),
             "resolution_status": record.get("resolution_status"),
             "resolved_pnl": (
                 float(record.get("resolved_pnl"))
@@ -398,7 +411,8 @@ class StateStore:
                     copied_size_usdc, copy_shares, position_id, decision, decision_reason,
                     is_crypto, is_spread, is_futures, price_capped, duplicate_game,
                     bayes_posterior_mean, bayes_lower_bound, shadow_model_score, shadow_model_decision,
-                    base_game, resolution_status, resolved_pnl, resolved_at_utc
+                    base_game, hybrid_veto_threshold, hybrid_veto_decision, hybrid_veto_reason,
+                    resolution_status, resolved_pnl, resolved_at_utc
                 ) VALUES (
                     :event_id, :observed_at_utc, :trader, :market, :outcome, :whale_side,
                     :whale_size_usdc, :price, :condition_id, :outcome_index, :transaction_hash,
@@ -409,7 +423,8 @@ class StateStore:
                     :copied_size_usdc, :copy_shares, :position_id, :decision, :decision_reason,
                     :is_crypto, :is_spread, :is_futures, :price_capped, :duplicate_game,
                     :bayes_posterior_mean, :bayes_lower_bound, :shadow_model_score, :shadow_model_decision,
-                    :base_game, :resolution_status, :resolved_pnl, :resolved_at_utc
+                    :base_game, :hybrid_veto_threshold, :hybrid_veto_decision, :hybrid_veto_reason,
+                    :resolution_status, :resolved_pnl, :resolved_at_utc
                 )
                 ON CONFLICT(event_id) DO UPDATE SET
                     observed_at_utc=excluded.observed_at_utc,
@@ -451,6 +466,9 @@ class StateStore:
                     shadow_model_score=excluded.shadow_model_score,
                     shadow_model_decision=excluded.shadow_model_decision,
                     base_game=excluded.base_game,
+                    hybrid_veto_threshold=excluded.hybrid_veto_threshold,
+                    hybrid_veto_decision=excluded.hybrid_veto_decision,
+                    hybrid_veto_reason=excluded.hybrid_veto_reason,
                     resolution_status=excluded.resolution_status,
                     resolved_pnl=excluded.resolved_pnl,
                     resolved_at_utc=excluded.resolved_at_utc

@@ -198,12 +198,17 @@ class BotRobustnessTests(unittest.TestCase):
 
         self.assertEqual(rows[skipped_event]["decision"], "SKIP")
         self.assertEqual(rows[skipped_event]["decision_reason"], "crypto_market")
+        self.assertEqual(rows[skipped_event]["hybrid_veto_decision"], "NO_ACTION")
+        self.assertEqual(rows[skipped_event]["hybrid_veto_reason"], "heuristic_not_copied")
         self.assertEqual(rows[copied_event]["decision"], "COPIED")
         self.assertEqual(rows[copied_event]["position_id"], "alice|cond-1|0")
         self.assertIsNotNone(rows[copied_event]["bayes_posterior_mean"])
         self.assertIsNotNone(rows[copied_event]["bayes_lower_bound"])
         self.assertIsNotNone(rows[copied_event]["shadow_model_score"])
         self.assertIn(rows[copied_event]["shadow_model_decision"], ("SKIP", "TAKE"))
+        self.assertEqual(rows[copied_event]["hybrid_veto_threshold"], 0.70)
+        self.assertIn(rows[copied_event]["hybrid_veto_decision"], ("ALLOW", "VETO"))
+        self.assertIn(rows[copied_event]["hybrid_veto_reason"], ("score_above_threshold", "score_below_threshold", "model_warmup"))
 
         key = ("alice", "cond-1", 0)
         pos = bot.positions[key]
@@ -241,6 +246,7 @@ class BotRobustnessTests(unittest.TestCase):
 
         self.assertEqual(resolved_row["decision"], "SKIP")
         self.assertEqual(resolved_row["decision_reason"], "below_min_whale_size")
+        self.assertEqual(resolved_row["hybrid_veto_decision"], "NO_ACTION")
         self.assertEqual(resolved_row["resolution_status"], "WIN")
         self.assertIsNone(resolved_row["resolved_pnl"])
 

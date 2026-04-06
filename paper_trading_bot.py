@@ -309,6 +309,7 @@ def _finalize_opportunity(bot: PaperBot, record: dict, decision: str, reason: st
     record["decision"] = decision
     record["decision_reason"] = reason
     record.update(updates)
+    record.update(_hybrid_veto_fields(bot, record, decision))
     bot.store.upsert_opportunity(record)
 
 
@@ -320,6 +321,34 @@ def _shadow_recommendation(bot: PaperBot, opportunity: dict) -> tuple[float, str
     score = bot.shadow_model.predict_proba(opportunity)
     decision = "TAKE" if bot.shadow_model.examples_seen >= 10 and score >= 0.57 else "SKIP"
     return score, decision
+
+
+def _hybrid_veto_fields(bot: PaperBot, opportunity: dict, heuristic_decision: str) -> dict:
+    threshold = 0.70
+    score = float(opportunity.get("shadow_model_score") or 0.0)
+    if heuristic_decision != "COPIED":
+        return {
+            "hybrid_veto_threshold": threshold,
+            "hybrid_veto_decision": "NO_ACTION",
+            "hybrid_veto_reason": "heuristic_not_copied",
+        }
+    if bot.shadow_model.examples_seen < 10:
+        return {
+            "hybrid_veto_threshold": threshold,
+            "hybrid_veto_decision": "VETO",
+            "hybrid_veto_reason": "model_warmup",
+        }
+    if score >= threshold:
+        return {
+            "hybrid_veto_threshold": threshold,
+            "hybrid_veto_decision": "ALLOW",
+            "hybrid_veto_reason": "score_above_threshold",
+        }
+    return {
+        "hybrid_veto_threshold": threshold,
+        "hybrid_veto_decision": "VETO",
+        "hybrid_veto_reason": "score_below_threshold",
+    }
 
 
 def _augment_opportunity_with_shadow_signals(bot: PaperBot, opportunity: dict):

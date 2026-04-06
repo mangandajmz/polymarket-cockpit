@@ -273,6 +273,9 @@ def load_opportunities() -> pd.DataFrame:
                     bayes_lower_bound,
                     shadow_model_score,
                     shadow_model_decision,
+                    hybrid_veto_threshold,
+                    hybrid_veto_decision,
+                    hybrid_veto_reason,
                     resolution_status,
                     resolved_at_utc
                 FROM opportunities
@@ -288,7 +291,7 @@ def load_opportunities() -> pd.DataFrame:
     for col in [
         "whale_size_usdc", "price", "opportunity_age_sec", "trader_resolved_count",
         "trader_win_rate", "conviction", "bayes_posterior_mean", "bayes_lower_bound",
-        "shadow_model_score",
+        "shadow_model_score", "hybrid_veto_threshold",
     ]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["observed_at_utc"] = pd.to_datetime(df["observed_at_utc"], utc=True, errors="coerce")
@@ -1256,6 +1259,7 @@ with tab_shadow:
         shadow["Bayes Mean %"] = shadow["bayes_posterior_mean"] * 100.0
         shadow["Bayes LCB %"] = shadow["bayes_lower_bound"] * 100.0
         shadow["Model %"] = shadow["shadow_model_score"] * 100.0
+        shadow["Hybrid Veto"] = shadow["hybrid_veto_decision"].fillna("NO_ACTION")
         shadow["heuristic_vs_model"] = shadow.apply(
             lambda r: "Agree"
             if ((str(r.get("decision", "")) == "COPIED" and str(r.get("shadow_model_decision", "")) == "TAKE")
@@ -1269,6 +1273,20 @@ with tab_shadow:
         top[1].metric("Model TAKE", int(shadow["shadow_model_decision"].eq("TAKE").sum()))
         top[2].metric("Agreement", f"{shadow['heuristic_vs_model'].eq('Agree').mean()*100:.1f}%")
         top[3].metric("Resolved Rows", int(shadow["resolution_status"].isin(["WIN", "LOSS"]).sum()))
+
+        copied_shadow = shadow[shadow["decision"].eq("COPIED")].copy()
+        if not copied_shadow.empty:
+            copied_shadow["is_resolved"] = copied_shadow["resolution_status"].isin(["WIN", "LOSS"])
+            copied_shadow["is_win"] = copied_shadow["resolution_status"].eq("WIN")
+            veto_cols = st.columns(4)
+            veto_cols[0].metric("Hybrid ALLOW", int(copied_shadow["Hybrid Veto"].eq("ALLOW").sum()))
+            veto_cols[1].metric("Hybrid VETO", int(copied_shadow["Hybrid Veto"].eq("VETO").sum()))
+            allowed = copied_shadow[copied_shadow["Hybrid Veto"].eq("ALLOW") & copied_shadow["is_resolved"]]
+            vetoed = copied_shadow[copied_shadow["Hybrid Veto"].eq("VETO") & copied_shadow["is_resolved"]]
+            allow_wr = allowed["is_win"].mean() * 100.0 if not allowed.empty else 0.0
+            veto_wr = vetoed["is_win"].mean() * 100.0 if not vetoed.empty else 0.0
+            veto_cols[2].metric("ALLOW WR", f"{allow_wr:.1f}%")
+            veto_cols[3].metric("VETO WR", f"{veto_wr:.1f}%")
 
         st.markdown("**Automatic evaluation summary**")
         verdict_1d, note_1d = evaluation_summary(report_1d)
@@ -1374,6 +1392,23 @@ with tab_shadow:
         if hybrid_sweep_rows:
             st.markdown("**Hybrid Threshold Sweep**")
             st.dataframe(pd.DataFrame(hybrid_sweep_rows), width="stretch", hide_index=True)
+
+        if not copied_shadow.empty:
+            outcome_rows = []
+            for label, subset in (("ALLOW", copied_shadow[copied_shadow["Hybrid Veto"].eq("ALLOW")]),
+                                  ("VETO", copied_shadow[copied_shadow["Hybrid Veto"].eq("VETO")])):
+                resolved_subset = subset[subset["is_resolved"]]
+                win_rate = resolved_subset["is_win"].mean() * 100.0 if not resolved_subset.empty else 0.0
+                outcome_rows.append({
+                    "Bucket": label,
+                    "Copied Trades": len(subset),
+                    "Resolved": int(resolved_subset.shape[0]),
+                    "Win Rate": f"{win_rate:.1f}%",
+                    "Avg Model %": f"{subset['Model %'].mean():.1f}%" if not subset.empty else "n/a",
+                    "Top Reason": subset["hybrid_veto_reason"].mode().iat[0] if not subset.empty and subset["hybrid_veto_reason"].notna().any() else "n/a",
+                })
+            st.markdown("**Hybrid Veto Outcomes On Heuristic Trades**")
+            st.dataframe(pd.DataFrame(outcome_rows), width="stretch", hide_index=True)
 
         diag_rows = []
         for label, report in (("1D", report_1d), ("7D", report_7d)):
@@ -1544,13 +1579,14 @@ with tab_shadow:
             st.dataframe(
                 disagreed[[
                     "Observed", "trader", "market", "decision", "decision_reason",
-                    "shadow_model_decision", "Model %", "Bayes LCB %", "resolution_status"
+                    "shadow_model_decision", "Hybrid Veto", "Model %", "Bayes LCB %", "resolution_status"
                 ]].head(50).rename(columns={
                     "trader": "Trader",
                     "market": "Market",
                     "decision": "Heuristic",
                     "decision_reason": "Reason",
                     "shadow_model_decision": "Model",
+                    "Hybrid Veto": "Hybrid",
                     "resolution_status": "Outcome",
                 }),
                 width="stretch",
@@ -1561,12 +1597,13 @@ with tab_shadow:
         st.dataframe(
             shadow[[
                 "Observed", "trader", "market", "decision", "shadow_model_decision",
-                "Bayes Mean %", "Bayes LCB %", "Model %", "resolution_status"
+                "Hybrid Veto", "Bayes Mean %", "Bayes LCB %", "Model %", "resolution_status"
             ]].head(200).rename(columns={
                 "trader": "Trader",
                 "market": "Market",
                 "decision": "Heuristic",
                 "shadow_model_decision": "Model",
+                "Hybrid Veto": "Hybrid",
                 "resolution_status": "Outcome",
             }),
             width="stretch",
