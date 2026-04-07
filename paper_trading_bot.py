@@ -384,6 +384,37 @@ def bootstrap_shadow_model(bot: PaperBot, opportunities: list[dict]):
     _train_shadow_model_on_rows(bot, opportunities)
 
 
+def backfill_hybrid_veto_labels(bot: PaperBot, opportunities: list[dict]) -> int:
+    updated = 0
+    for row in opportunities:
+        if row.get("hybrid_veto_decision"):
+            continue
+        row = dict(row)
+        decision = str(row.get("decision", ""))
+        score = row.get("shadow_model_score")
+        if decision != "COPIED":
+            row["hybrid_veto_threshold"] = 0.70
+            row["hybrid_veto_decision"] = "NO_ACTION"
+            row["hybrid_veto_reason"] = "heuristic_not_copied"
+        elif score is None:
+            row["hybrid_veto_threshold"] = 0.70
+            row["hybrid_veto_decision"] = "VETO"
+            row["hybrid_veto_reason"] = "missing_shadow_score"
+        elif float(score) >= 0.70:
+            row["hybrid_veto_threshold"] = 0.70
+            row["hybrid_veto_decision"] = "ALLOW"
+            row["hybrid_veto_reason"] = "score_above_threshold"
+        else:
+            row["hybrid_veto_threshold"] = 0.70
+            row["hybrid_veto_decision"] = "VETO"
+            row["hybrid_veto_reason"] = "score_below_threshold"
+        bot.store.upsert_opportunity(row)
+        updated += 1
+    if updated:
+        _log(f"[HYBRID] Backfilled hybrid veto labels for {updated} opportunity row(s)")
+    return updated
+
+
 def _sync_evaluation_snapshots(bot: PaperBot):
     try:
         rows = bot.store.load_runtime_state().get("opportunities", [])
@@ -715,6 +746,7 @@ def load_positions_from_store(bot: PaperBot) -> bool:
         bot.trade_log.append(record)
 
     bootstrap_shadow_model(bot, state.get("opportunities", []))
+    backfill_hybrid_veto_labels(bot, state.get("opportunities", []))
     _sync_evaluation_snapshots(bot)
     bot.seen_hashes.update(bot.store.load_seen_events())
     return True
