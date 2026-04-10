@@ -21,6 +21,10 @@ from daily_evaluation_report import build_report, compact_snapshot
 from dynamic_watchlist import WatchlistManager, TRADER_BLOCKLIST
 from shadow_model import OnlineLogisticModel
 from state_store import StateStore
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 try:
     from rich.live import Live
@@ -36,17 +40,30 @@ except ImportError:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+if load_dotenv is not None:
+    load_dotenv()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_API         = "https://data-api.polymarket.com/v1"
 GAMMA_API        = "https://gamma-api.polymarket.com"
 CLOB_API         = "https://clob.polymarket.com"
 COPY_RATIO             = 0.10    # 1/10th of whale trade size (legacy, not used for sizing)
-DAILY_LOSS_CAP         = 60.0   # max net loss (losses minus wins) per calendar day before halting new trades
+DAILY_LOSS_CAP         = _env_float("DAILY_LOSS_CAP", 60.0)   # max net loss (losses minus wins) per calendar day before halting new trades
 BASE_BET               = 10.0   # base bet size in USD
 MAX_BET                = 30.0   # maximum bet size per trade in USD
 MAX_ENTRY_PRICE        = 0.75   # skip near-certainty bets — poor R/R above this price
 MAX_DEPLOY_PCT         = 0.60   # never deploy more than 60% of bankroll simultaneously
-STARTING_BANKROLL      = 300.0  # starting simulated bankroll in USD
+STARTING_BANKROLL      = _env_float("STARTING_BANKROLL", 300.0)  # starting simulated bankroll in USD
 MIN_WHALE_SIZE         = 1000.0 # minimum whale USDC size to copy
 MAX_TRADE_AGE          = 300    # 5 minutes in seconds
 POLL_INTERVAL          = 30     # seconds between wallet polls
@@ -676,80 +693,80 @@ def load_positions_from_csv(bot: PaperBot):
 
 def load_positions_from_store(bot: PaperBot) -> bool:
     state = bot.store.load_runtime_state()
-    if not state["positions"] and not state["fills"]:
-        return False
+    has_runtime_state = bool(state["positions"] or state["fills"])
 
-    bot.closed_pnl = float(state["closed_pnl"])
-    bot.wins = int(state["wins"])
-    bot.losses = int(state["losses"])
-    bot.trader_stats = dict(state["trader_stats"])
-    bot.daily_losses_per_trader = dict(state["daily_losses_per_trader"])
-    bot.daily_deploy_per_trader = dict(state["daily_deploy_per_trader"])
-    bot.milestones_reached = set(state["milestones_reached"])
-    bot.whale_sizes = list(state["whale_sizes"])
-    budget_day = state.get("budget_day_utc") or utc_today_str()
-    try:
-        bot._budget_date = datetime.strptime(budget_day, "%Y-%m-%d").date()
-    except ValueError:
-        bot._budget_date = utc_today()
-    today_risk = state["daily_risk"].get(utc_today_str(), {})
-    bot.daily_wins = float(today_risk.get("gross_wins", 0.0) or 0.0)
-    bot.daily_losses = float(today_risk.get("gross_losses", 0.0) or 0.0)
+    if has_runtime_state:
+        bot.closed_pnl = float(state["closed_pnl"])
+        bot.wins = int(state["wins"])
+        bot.losses = int(state["losses"])
+        bot.trader_stats = dict(state["trader_stats"])
+        bot.daily_losses_per_trader = dict(state["daily_losses_per_trader"])
+        bot.daily_deploy_per_trader = dict(state["daily_deploy_per_trader"])
+        bot.milestones_reached = set(state["milestones_reached"])
+        bot.whale_sizes = list(state["whale_sizes"])
+        budget_day = state.get("budget_day_utc") or utc_today_str()
+        try:
+            bot._budget_date = datetime.strptime(budget_day, "%Y-%m-%d").date()
+        except ValueError:
+            bot._budget_date = utc_today()
+        today_risk = state["daily_risk"].get(utc_today_str(), {})
+        bot.daily_wins = float(today_risk.get("gross_wins", 0.0) or 0.0)
+        bot.daily_losses = float(today_risk.get("gross_losses", 0.0) or 0.0)
 
-    for row in state["positions"]:
-        pos_key = (row["trader"], row["condition_id"], int(row["outcome_index"]))
-        opened_at_ts = _parse_ts(row.get("opened_at_utc", ""))
-        bot.positions[pos_key] = {
-            "position_id": row["position_id"],
-            "condition_id": row["condition_id"],
-            "outcome_index": int(row["outcome_index"]),
-            "title": row["market"],
-            "outcome": row["outcome"],
-            "trader": row["trader"],
-            "opened_at": opened_at_ts,
-            "opened_at_utc": row["opened_at_utc"],
-            "total_cost": float(row["total_cost"]),
-            "total_shares": float(row["total_shares"]),
-            "status": row["status"],
-            "pnl": float(row["pnl"]),
-            "last_price": (
-                float(row["last_price"])
-                if row["last_price"] is not None
-                else None
-            ),
-            "close_reason": row.get("close_reason"),
-        }
+        for row in state["positions"]:
+            pos_key = (row["trader"], row["condition_id"], int(row["outcome_index"]))
+            opened_at_ts = _parse_ts(row.get("opened_at_utc", ""))
+            bot.positions[pos_key] = {
+                "position_id": row["position_id"],
+                "condition_id": row["condition_id"],
+                "outcome_index": int(row["outcome_index"]),
+                "title": row["market"],
+                "outcome": row["outcome"],
+                "trader": row["trader"],
+                "opened_at": opened_at_ts,
+                "opened_at_utc": row["opened_at_utc"],
+                "total_cost": float(row["total_cost"]),
+                "total_shares": float(row["total_shares"]),
+                "status": row["status"],
+                "pnl": float(row["pnl"]),
+                "last_price": (
+                    float(row["last_price"])
+                    if row["last_price"] is not None
+                    else None
+                ),
+                "close_reason": row.get("close_reason"),
+            }
 
-    for fill in state["fills"]:
-        record = {
-            "timestamp": fill["timestamp_utc"],
-            "trader": fill["trader"],
-            "market": fill["market"],
-            "outcome": fill["outcome"],
-            "whale_side": fill["whale_side"],
-            "whale_size_usdc": f"{float(fill['whale_size_usdc']):.2f}",
-            "our_size_usdc": f"{float(fill['our_size_usdc']):.2f}",
-            "price": f"{float(fill['price']):.4f}",
-            "copy_shares": f"{float(fill['copy_shares']):.4f}",
-            "conviction": f"{float(fill['conviction']):.4f}",
-            "status": fill["status"],
-            "resolved_pnl": (
-                f"{float(fill['resolved_pnl']):+.4f}"
-                if fill["resolved_pnl"] is not None
-                else ""
-            ),
-            "condition_id": fill["condition_id"],
-            "outcome_index": str(fill["outcome_index"]),
-            "event_id": fill["event_id"],
-            "position_id": fill["position_id"],
-        }
-        bot.trade_log.append(record)
+        for fill in state["fills"]:
+            record = {
+                "timestamp": fill["timestamp_utc"],
+                "trader": fill["trader"],
+                "market": fill["market"],
+                "outcome": fill["outcome"],
+                "whale_side": fill["whale_side"],
+                "whale_size_usdc": f"{float(fill['whale_size_usdc']):.2f}",
+                "our_size_usdc": f"{float(fill['our_size_usdc']):.2f}",
+                "price": f"{float(fill['price']):.4f}",
+                "copy_shares": f"{float(fill['copy_shares']):.4f}",
+                "conviction": f"{float(fill['conviction']):.4f}",
+                "status": fill["status"],
+                "resolved_pnl": (
+                    f"{float(fill['resolved_pnl']):+.4f}"
+                    if fill["resolved_pnl"] is not None
+                    else ""
+                ),
+                "condition_id": fill["condition_id"],
+                "outcome_index": str(fill["outcome_index"]),
+                "event_id": fill["event_id"],
+                "position_id": fill["position_id"],
+            }
+            bot.trade_log.append(record)
 
     bootstrap_shadow_model(bot, state.get("opportunities", []))
     backfill_hybrid_veto_labels(bot, state.get("opportunities", []))
     _sync_evaluation_snapshots(bot)
     bot.seen_hashes.update(bot.store.load_seen_events())
-    return True
+    return has_runtime_state
 
 
 def backfill_resolved_positions_from_csv(bot: PaperBot):
@@ -1951,7 +1968,7 @@ def main():
         _plain_loop(bot)
 
 
-LOG_FILE = Path("bot.log")
+LOG_FILE = Path(os.getenv("LOG_PATH", str(Path(__file__).parent / "bot.log")))
 
 
 def _log(msg: str):

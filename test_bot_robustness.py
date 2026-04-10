@@ -177,6 +177,64 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertEqual(restored_pos["status"], "WIN")
         self.assertEqual(len(restored.trade_log), 1)
 
+    def test_store_only_opportunities_still_bootstrap_shadow_model(self):
+        bot = botmod.PaperBot()
+        bot.store.upsert_opportunity({
+            "event_id": "opp-only-1",
+            "observed_at_utc": "2026-04-05 00:00:00",
+            "trader": "alice",
+            "market": "Match A Winner",
+            "outcome": "Team A",
+            "whale_side": "BUY",
+            "whale_size_usdc": 1500.0,
+            "price": 0.55,
+            "condition_id": "cond-1",
+            "outcome_index": 0,
+            "transaction_hash": "tx-opp-only",
+            "source_timestamp": 0,
+            "opportunity_age_sec": 10,
+            "trader_resolved_count": 5,
+            "trader_win_rate": 60.0,
+            "daily_losses_for_trader": 0,
+            "daily_deploy_for_trader": 0.0,
+            "bankroll": 300.0,
+            "deployed_cap_pct": 0.0,
+            "open_positions_count": 0,
+            "median_whale_size": 1200.0,
+            "conviction": 1.2,
+            "perf_mult": 1.0,
+            "dynamic_max_bet": 20.0,
+            "recommended_size": 12.0,
+            "copied_size_usdc": None,
+            "copy_shares": None,
+            "position_id": None,
+            "decision": "SKIP",
+            "decision_reason": "test_only_opportunity",
+            "is_crypto": 0,
+            "is_spread": 0,
+            "is_futures": 0,
+            "price_capped": 0,
+            "duplicate_game": 0,
+            "base_game": "match a winner",
+            "bayes_posterior_mean": 0.60,
+            "bayes_lower_bound": 0.52,
+            "shadow_model_score": 0.73,
+            "shadow_model_decision": "TAKE",
+            "hybrid_veto_threshold": 0.70,
+            "hybrid_veto_decision": "NO_ACTION",
+            "hybrid_veto_reason": "heuristic_not_copied",
+            "resolution_status": "WIN",
+            "resolved_pnl": None,
+            "resolved_at_utc": "2026-04-05 01:00:00",
+        })
+
+        restored = botmod.PaperBot()
+        loaded = botmod.load_positions_from_store(restored)
+
+        self.assertFalse(loaded)
+        self.assertEqual(restored.shadow_model.examples_seen, 1)
+        self.assertIn("opp-only-1", restored.shadow_trained_events)
+
     def test_opportunities_log_skips_and_resolution_updates(self):
         bot = botmod.PaperBot()
 

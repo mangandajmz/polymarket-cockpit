@@ -33,9 +33,9 @@ from api_client import JsonApiClient
 
 # ── Module-level API config ───────────────────────────────────────────────────
 _DATA_API   = "https://data-api.polymarket.com/v1"
-_GAMMA_API  = "https://gamma-api.polymarket.com"
+_CLOB_API   = "https://clob.polymarket.com"
 _WR_SAMPLE  = 10    # positions to price per candidate (speed vs accuracy trade-off)
-_REQ_PAUSE  = 0.25  # seconds between Gamma API calls during WR estimation
+_REQ_PAUSE  = 0.25  # seconds between CLOB API calls during WR estimation
 
 CACHE_FILE  = Path("watchlist_cache.json")
 
@@ -57,6 +57,19 @@ def _req(url, params=None, retries=3):
 
 def _valid_addr(addr: str) -> bool:
     return isinstance(addr, str) and addr.startswith("0x") and len(addr) >= 10
+
+
+def _fetch_market_price(condition_id: str, outcome_index: int) -> float | None:
+    data = _req(f"{_CLOB_API}/markets/{condition_id}")
+    if not isinstance(data, dict):
+        return None
+    tokens = data.get("tokens") or []
+    if outcome_index < 0 or outcome_index >= len(tokens):
+        return None
+    try:
+        return float(tokens[outcome_index].get("price", 0.0))
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Permanent address cache ───────────────────────────────────────────────────
@@ -217,29 +230,10 @@ def _estimate_win_rate(address: str, sample: int = _WR_SAMPLE) -> float:
 
     wins = losses = 0
     for pos in sampled:
-        mkt = _req(_GAMMA_API + "/markets", {"condition_ids": pos["cond_id"]})
+        px = _fetch_market_price(pos["cond_id"], pos["oidx"])
         time.sleep(_REQ_PAUSE)
-        if not mkt:
+        if px is None:
             continue
-
-        m = next(
-            (x for x in mkt if x.get("conditionId") == pos["cond_id"]),
-            mkt[0],
-        ) if isinstance(mkt, list) else mkt
-
-        prices_raw = m.get("outcomePrices", "[]")
-        if isinstance(prices_raw, str):
-            try:
-                prices = json.loads(prices_raw)
-            except Exception:
-                continue
-        else:
-            prices = prices_raw or []
-
-        try:
-            px = float(prices[pos["oidx"]])
-        except (IndexError, TypeError, ValueError):
-            px = 0.5
 
         open_shares = max(pos["shares"], 0.0)
         open_val    = open_shares * px if open_shares > 0.01 else 0.0

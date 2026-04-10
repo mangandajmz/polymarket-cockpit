@@ -136,6 +136,8 @@ class StateStore:
                     ON opportunities(observed_at_utc);
                 CREATE INDEX IF NOT EXISTS idx_opportunities_position_id
                     ON opportunities(position_id);
+                CREATE INDEX IF NOT EXISTS idx_opportunities_resolution_observed
+                    ON opportunities(resolution_status, observed_at_utc);
                 """
             )
         self._ensure_opportunity_columns()

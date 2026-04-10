@@ -72,6 +72,47 @@ class WatchlistHardeningTests(unittest.TestCase):
             dw._estimate_win_rate = original_wr
             dw.AddressCache = original_cache
 
+    def test_estimate_win_rate_uses_condition_specific_clob_prices(self):
+        original_req = dw._req
+        try:
+            calls = []
+
+            def fake_req(url, params=None, retries=3):
+                calls.append((url, params))
+                if url == dw._DATA_API + "/trades":
+                    return [
+                        {
+                            "side": "BUY",
+                            "usdcSize": 100.0,
+                            "price": 0.40,
+                            "conditionId": "cond-win",
+                            "outcomeIndex": 0,
+                            "timestamp": 2,
+                        },
+                        {
+                            "side": "BUY",
+                            "usdcSize": 100.0,
+                            "price": 0.70,
+                            "conditionId": "cond-loss",
+                            "outcomeIndex": 0,
+                            "timestamp": 1,
+                        },
+                    ]
+                if url == f"{dw._CLOB_API}/markets/cond-win":
+                    return {"tokens": [{"price": 1.0}, {"price": 0.0}]}
+                if url == f"{dw._CLOB_API}/markets/cond-loss":
+                    return {"tokens": [{"price": 0.20}, {"price": 0.80}]}
+                raise AssertionError(f"Unexpected request: {url} {params}")
+
+            dw._req = fake_req
+            wr = dw._estimate_win_rate("0xabc", sample=2)
+
+            self.assertEqual(wr, 50.0)
+            self.assertIn((f"{dw._CLOB_API}/markets/cond-win", None), calls)
+            self.assertIn((f"{dw._CLOB_API}/markets/cond-loss", None), calls)
+        finally:
+            dw._req = original_req
+
 
 if __name__ == "__main__":
     unittest.main()

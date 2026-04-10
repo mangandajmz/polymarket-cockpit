@@ -43,6 +43,7 @@ DAILY_LOSS_CAP = float(
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "300.0"))
 BOT_MODE          = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
 MIN_WIN_RATE      = 60.0  # % threshold — must match paper_trading_bot.py
+OPPORTUNITY_LEDGER_LIMIT = int(os.getenv("OPPORTUNITY_LEDGER_LIMIT", "2500"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
@@ -247,7 +248,7 @@ def load_open_positions() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
-def load_opportunities() -> pd.DataFrame:
+def load_opportunities(limit: int = OPPORTUNITY_LEDGER_LIMIT) -> pd.DataFrame:
     if not STATE_DB_PATH.exists():
         return pd.DataFrame()
     try:
@@ -280,8 +281,10 @@ def load_opportunities() -> pd.DataFrame:
                     resolved_at_utc
                 FROM opportunities
                 ORDER BY observed_at_utc DESC
+                LIMIT ?
                 """,
                 conn,
+                params=(limit,),
             )
     except Exception as exc:
         st.error(f"Could not read opportunities from state database: {exc}")
@@ -297,6 +300,50 @@ def load_opportunities() -> pd.DataFrame:
     df["observed_at_utc"] = pd.to_datetime(df["observed_at_utc"], utc=True, errors="coerce")
     df["resolved_at_utc"] = pd.to_datetime(df["resolved_at_utc"], utc=True, errors="coerce")
     return df
+
+
+@st.cache_data(ttl=30)
+def load_opportunity_metrics() -> dict:
+    if not STATE_DB_PATH.exists():
+        return {}
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN decision = 'COPIED' THEN 1 ELSE 0 END) AS heuristic_copied,
+                    SUM(CASE WHEN shadow_model_decision = 'TAKE' THEN 1 ELSE 0 END) AS model_take,
+                    SUM(CASE WHEN bayes_lower_bound >= ? THEN 1 ELSE 0 END) AS bayes_ready,
+                    SUM(CASE WHEN resolution_status IN ('WIN', 'LOSS') THEN 1 ELSE 0 END) AS resolved_rows,
+                    SUM(
+                        CASE
+                            WHEN (decision = 'COPIED' AND shadow_model_decision = 'TAKE')
+                              OR (decision = 'SKIP' AND shadow_model_decision = 'SKIP')
+                            THEN 1
+                            ELSE 0
+                        END
+                    ) AS agreement_rows
+                FROM opportunities
+                """,
+                (MIN_WIN_RATE / 100.0,),
+            ).fetchone()
+    except Exception:
+        return {}
+
+    if row is None:
+        return {}
+    total = int(row["total"] or 0)
+    agreement_rows = int(row["agreement_rows"] or 0)
+    return {
+        "total": total,
+        "heuristic_copied": int(row["heuristic_copied"] or 0),
+        "model_take": int(row["model_take"] or 0),
+        "bayes_ready": int(row["bayes_ready"] or 0),
+        "resolved_rows": int(row["resolved_rows"] or 0),
+        "agreement_pct": (agreement_rows / total * 100.0) if total else 0.0,
+    }
 
 
 @st.cache_data(ttl=30)
@@ -390,6 +437,39 @@ def evaluation_summary(report: dict) -> tuple[str, str]:
     if best_model and best_model["final_bankroll"] <= replay["current"]["final_bankroll"]:
         return "Mixed", "Threshold tuning helps, but no model threshold is clearly beating the current replay."
     if model_wr >= heuristic_wr and hybrid_delta > 0 and model_take_rate <= 20.0:
+        return "Promising", "Model is selective and replay-positive versus the current baseline."
+    return "Mixed", "The model is learning signal, but it is not yet selective or replay-positive enough."
+
+
+def evaluation_summary_snapshot(snapshot: dict) -> tuple[str, str]:
+    resolved = int(snapshot.get("resolved", 0) or 0)
+    model_trades = int(snapshot.get("model_trades", 0) or 0)
+    heuristic_wr = float(snapshot.get("heuristic_wr", 0.0) or 0.0)
+    model_wr = float(snapshot.get("model_wr", 0.0) or 0.0)
+    model_brier = snapshot.get("model_brier")
+    model_take_rate = float(snapshot.get("model_take_rate", 0.0) or 0.0)
+    current_bankroll = float(snapshot.get("current_bankroll", 0.0) or 0.0)
+    model_bankroll = float(snapshot.get("model_bankroll", 0.0) or 0.0)
+    hybrid_bankroll = float(snapshot.get("hybrid_bankroll", 0.0) or 0.0)
+    best_hybrid_threshold = snapshot.get("best_hybrid_threshold")
+    best_hybrid_bankroll = float(snapshot.get("best_hybrid_bankroll", 0.0) or 0.0)
+
+    if resolved < 100:
+        return "Too Early", "Need at least 100 resolved opportunities before trusting the verdict."
+    if model_trades == 0:
+        return "Cold", "Model is not taking trades in this window yet."
+    if best_hybrid_threshold is not None and best_hybrid_bankroll > current_bankroll:
+        return "Candidate", (
+            f"Model-only is still loose, but a hybrid veto near p>={best_hybrid_threshold:.2f} "
+            "looks like a credible paper-mode candidate."
+        )
+    if model_take_rate > 35.0:
+        return "Loose", "Model is taking too much of the eligible stream to trust the edge yet."
+    if model_brier is not None and float(model_brier) > 0.24:
+        return "Weak", "Model calibration is still too weak for execution-facing use."
+    if model_bankroll <= current_bankroll and hybrid_bankroll <= current_bankroll:
+        return "Weak", "Shadow replay is not improving bankroll versus the current baseline."
+    if model_wr >= heuristic_wr and hybrid_bankroll > current_bankroll and model_take_rate <= 20.0:
         return "Promising", "Model is selective and replay-positive versus the current baseline."
     return "Mixed", "The model is learning signal, but it is not yet selective or replay-positive enough."
 
@@ -945,6 +1025,8 @@ def parse_log_activity(n_lines: int = 200) -> list[dict]:
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 df    = load_trades()
+runtime_kv = load_runtime_kv()
+opp_metrics = load_opportunity_metrics()
 opps  = load_opportunities()
 position_history = load_position_history()
 stats = compute_stats(df) if not df.empty else {
@@ -1067,7 +1149,6 @@ with tab_ov:
     # Bot status
     st.subheader("Bot Status")
     status_str, last_seen = bot_status()
-    runtime_kv = load_runtime_kv()
     icon = {"Online": "🟢", "Idle": "🟡", "Offline": "🔴"}.get(status_str, "⚪")
     s_col, s_lbl = st.columns(2)
     with s_col:
@@ -1094,13 +1175,13 @@ with tab_ov:
         st.divider()
         st.subheader("Shadow Signals")
         resolved_opps = opps[opps["resolution_status"].isin(["WIN", "LOSS"])].copy()
-        recommended_take = int(opps["shadow_model_decision"].eq("TAKE").sum())
-        bayes_ready = int((opps["bayes_lower_bound"].fillna(0) * 100 >= MIN_WIN_RATE).sum())
+        recommended_take = int(opp_metrics.get("model_take", opps["shadow_model_decision"].eq("TAKE").sum()))
+        bayes_ready = int(opp_metrics.get("bayes_ready", (opps["bayes_lower_bound"].fillna(0) * 100 >= MIN_WIN_RATE).sum()))
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Logged Opportunities", f"{len(opps):,}")
+        s1.metric("Logged Opportunities", f"{int(opp_metrics.get('total', len(opps))):,}")
         s2.metric("Model TAKE Signals", f"{recommended_take:,}")
         s3.metric("Bayes >= 60% LCB", f"{bayes_ready:,}")
-        s4.metric("Resolved Opportunities", f"{len(resolved_opps):,}")
+        s4.metric("Resolved Opportunities", f"{int(opp_metrics.get('resolved_rows', len(resolved_opps))):,}")
 
         preview = opps.copy()
         preview["Observed"] = preview["observed_at_utc"].dt.strftime("%Y-%m-%d %H:%M")
@@ -1124,6 +1205,9 @@ with tab_ov:
             }),
             width="stretch",
             hide_index=True,
+        )
+        st.caption(
+            f"Showing the latest {min(len(opps), OPPORTUNITY_LEDGER_LIMIT):,} opportunities for fast monitoring."
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1251,28 +1335,21 @@ with tab_shadow:
     if opps.empty:
         st.info("No logged opportunities yet.")
     else:
-        opp_rows = opps.to_dict("records")
-        report_1d = compute_eval_report(opp_rows, 1.0)
-        report_7d = compute_eval_report(opp_rows, 7.0)
         shadow = opps.copy()
         shadow["Observed"] = shadow["observed_at_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
         shadow["Bayes Mean %"] = shadow["bayes_posterior_mean"] * 100.0
         shadow["Bayes LCB %"] = shadow["bayes_lower_bound"] * 100.0
         shadow["Model %"] = shadow["shadow_model_score"] * 100.0
         shadow["Hybrid Veto"] = shadow["hybrid_veto_decision"].fillna("NO_ACTION")
-        shadow["heuristic_vs_model"] = shadow.apply(
-            lambda r: "Agree"
-            if ((str(r.get("decision", "")) == "COPIED" and str(r.get("shadow_model_decision", "")) == "TAKE")
-                or (str(r.get("decision", "")) == "SKIP" and str(r.get("shadow_model_decision", "")) == "SKIP"))
-            else "Disagree",
-            axis=1,
-        )
+        heuristic_take = shadow["decision"].eq("COPIED")
+        model_take = shadow["shadow_model_decision"].eq("TAKE")
+        shadow["heuristic_vs_model"] = (heuristic_take == model_take).map({True: "Agree", False: "Disagree"})
 
         top = st.columns(4)
-        top[0].metric("Heuristic COPIED", int(shadow["decision"].eq("COPIED").sum()))
-        top[1].metric("Model TAKE", int(shadow["shadow_model_decision"].eq("TAKE").sum()))
-        top[2].metric("Agreement", f"{shadow['heuristic_vs_model'].eq('Agree').mean()*100:.1f}%")
-        top[3].metric("Resolved Rows", int(shadow["resolution_status"].isin(["WIN", "LOSS"]).sum()))
+        top[0].metric("Heuristic COPIED", int(opp_metrics.get("heuristic_copied", shadow["decision"].eq("COPIED").sum())))
+        top[1].metric("Model TAKE", int(opp_metrics.get("model_take", shadow["shadow_model_decision"].eq("TAKE").sum())))
+        top[2].metric("Agreement", f"{float(opp_metrics.get('agreement_pct', shadow['heuristic_vs_model'].eq('Agree').mean() * 100.0)):.1f}%")
+        top[3].metric("Resolved Rows", int(opp_metrics.get("resolved_rows", shadow["resolution_status"].isin(["WIN", "LOSS"]).sum())))
 
         copied_shadow = shadow[shadow["decision"].eq("COPIED")].copy()
         if not copied_shadow.empty:
@@ -1289,25 +1366,22 @@ with tab_shadow:
             veto_cols[3].metric("VETO WR", f"{veto_wr:.1f}%")
 
         st.markdown("**Automatic evaluation summary**")
-        verdict_1d, note_1d = evaluation_summary(report_1d)
-        verdict_7d, note_7d = evaluation_summary(report_7d)
-        runtime_kv = load_runtime_kv()
         snap_1d = runtime_kv.get("evaluation_snapshot_1d", {}) if isinstance(runtime_kv.get("evaluation_snapshot_1d"), dict) else {}
         snap_7d = runtime_kv.get("evaluation_snapshot_7d", {}) if isinstance(runtime_kv.get("evaluation_snapshot_7d"), dict) else {}
+        verdict_1d, note_1d = evaluation_summary_snapshot(snap_1d) if snap_1d else ("Missing", "No 1-day snapshot has been written yet.")
+        verdict_7d, note_7d = evaluation_summary_snapshot(snap_7d) if snap_7d else ("Missing", "No 7-day snapshot has been written yet.")
         sum1, sum2 = st.columns(2)
         with sum1:
             st.markdown("**Last 1 Day**")
             st.metric("Verdict", verdict_1d)
             st.caption(note_1d)
-            s = report_1d["selection"]
-            c = report_1d["coverage"]
-            st.write(
-                f"Resolved `{c['resolved']}` | "
-                f"Heuristic `{s['heuristic'][0]}` @ `{s['heuristic'][1]:.1f}%` | "
-                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%` | "
-                f"Take rate `{s.get('model_take_rate', 0.0):.1f}%`"
-            )
             if snap_1d:
+                st.write(
+                    f"Resolved `{int(snap_1d.get('resolved', 0) or 0)}` | "
+                    f"Heuristic `{int(snap_1d.get('heuristic_trades', 0) or 0)}` @ `{float(snap_1d.get('heuristic_wr', 0.0) or 0.0):.1f}%` | "
+                    f"Model `{int(snap_1d.get('model_trades', 0) or 0)}` @ `{float(snap_1d.get('model_wr', 0.0) or 0.0):.1f}%` | "
+                    f"Take rate `{float(snap_1d.get('model_take_rate', 0.0) or 0.0):.1f}%`"
+                )
                 st.caption(
                     f"Snapshot: {snap_1d.get('generated_at_utc', 'unknown')} UTC | "
                     f"Model Brier {snap_1d.get('model_brier', 'n/a')}"
@@ -1316,82 +1390,129 @@ with tab_shadow:
             st.markdown("**Last 7 Days**")
             st.metric("Verdict", verdict_7d)
             st.caption(note_7d)
-            s = report_7d["selection"]
-            c = report_7d["coverage"]
-            st.write(
-                f"Resolved `{c['resolved']}` | "
-                f"Heuristic `{s['heuristic'][0]}` @ `{s['heuristic'][1]:.1f}%` | "
-                f"Model `{s['model'][0]}` @ `{s['model'][1]:.1f}%` | "
-                f"Take rate `{s.get('model_take_rate', 0.0):.1f}%`"
-            )
             if snap_7d:
+                st.write(
+                    f"Resolved `{int(snap_7d.get('resolved', 0) or 0)}` | "
+                    f"Heuristic `{int(snap_7d.get('heuristic_trades', 0) or 0)}` @ `{float(snap_7d.get('heuristic_wr', 0.0) or 0.0):.1f}%` | "
+                    f"Model `{int(snap_7d.get('model_trades', 0) or 0)}` @ `{float(snap_7d.get('model_wr', 0.0) or 0.0):.1f}%` | "
+                    f"Take rate `{float(snap_7d.get('model_take_rate', 0.0) or 0.0):.1f}%`"
+                )
                 st.caption(
                     f"Snapshot: {snap_7d.get('generated_at_utc', 'unknown')} UTC | "
                     f"Model Brier {snap_7d.get('model_brier', 'n/a')}"
                 )
 
-        summary_rows = []
-        for label, report in (("1D", report_1d), ("7D", report_7d)):
-            selection = report["selection"]
-            calibration = report["calibration"]
-            replay = report["replay"]
-            diag = replay["model_diagnostics"]
-            best_hybrid = replay.get("best_hybrid_threshold")
-            summary_rows.append({
+        snapshot_rows = []
+        for label, snapshot in (("1D", snap_1d), ("7D", snap_7d)):
+            if not snapshot:
+                continue
+            best_hybrid = snapshot.get("best_hybrid_threshold")
+            best_hybrid_bankroll = snapshot.get("best_hybrid_bankroll")
+            snapshot_rows.append({
                 "Window": label,
-                "Opps": report["coverage"]["opportunities"],
-                "Resolved": report["coverage"]["resolved"],
-                "Heuristic WR": f"{selection['heuristic'][1]:.1f}%",
-                "Model WR": f"{selection['model'][1]:.1f}%",
-                "Model Take Rate": f"{selection.get('model_take_rate', 0.0):.1f}%",
-                "Warm Rows": diag["warm_rows"],
-                "Replay Take %": f"{diag['replay_take_rate_warm']:.1f}%",
-                "Replay vs Logged": f"{diag['replay_logged_agreement']:.1f}%",
-                "Disagree": f"{selection['disagreement_rate']:.1f}%",
-                "Model Brier": "n/a" if calibration["model_brier"] is None else f"{calibration['model_brier']:.4f}",
-                "Current Bk": f"${replay['current']['final_bankroll']:.2f}",
-                "Model Bk": f"${replay['model']['final_bankroll']:.2f}",
-                "Hybrid Bk": f"${replay['hybrid']['final_bankroll']:.2f}",
+                "Opps": int(snapshot.get("opportunities", 0) or 0),
+                "Resolved": int(snapshot.get("resolved", 0) or 0),
+                "Heuristic WR": f"{float(snapshot.get('heuristic_wr', 0.0) or 0.0):.1f}%",
+                "Model WR": f"{float(snapshot.get('model_wr', 0.0) or 0.0):.1f}%",
+                "Model Take Rate": f"{float(snapshot.get('model_take_rate', 0.0) or 0.0):.1f}%",
+                "Warm Rows": int(snapshot.get("replay_warm_rows", 0) or 0),
+                "Replay Take %": f"{float(snapshot.get('replay_take_rate_warm', 0.0) or 0.0):.1f}%",
+                "Replay vs Logged": f"{float(snapshot.get('replay_logged_agreement', 0.0) or 0.0):.1f}%",
+                "Disagree": f"{float(snapshot.get('disagreement_rate', 0.0) or 0.0):.1f}%",
+                "Model Brier": "n/a" if snapshot.get("model_brier") is None else f"{float(snapshot.get('model_brier')):.4f}",
+                "Current Bk": f"${float(snapshot.get('current_bankroll', 0.0) or 0.0):.2f}",
+                "Model Bk": f"${float(snapshot.get('model_bankroll', 0.0) or 0.0):.2f}",
+                "Hybrid Bk": f"${float(snapshot.get('hybrid_bankroll', 0.0) or 0.0):.2f}",
                 "Best Hybrid": (
-                    "n/a" if not best_hybrid
-                    else f"p>={best_hybrid['model_threshold']:.2f} -> ${best_hybrid['final_bankroll']:.2f}"
+                    "n/a" if best_hybrid is None or best_hybrid_bankroll is None
+                    else f"p>={float(best_hybrid):.2f} -> ${float(best_hybrid_bankroll):.2f}"
                 ),
-                "Model Delta": f"${replay['model']['bankroll_delta']:.2f}",
-                "Eff / $hr": f"{replay['model']['return_per_locked_dollar_hour']:.4f}",
+                "Model Delta": f"${float(snapshot.get('model_bankroll_delta', 0.0) or 0.0):.2f}",
+                "Eff / $hr": f"{float(snapshot.get('model_efficiency', 0.0) or 0.0):.4f}",
             })
-        st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+        if snapshot_rows:
+            st.dataframe(pd.DataFrame(snapshot_rows), width="stretch", hide_index=True)
 
-        sweep_rows = []
-        for label, report in (("1D", report_1d), ("7D", report_7d)):
-            for row in report["replay"].get("model_threshold_sweep", []):
-                sweep_rows.append({
-                    "Window": label,
-                    "Threshold": f"{row['model_threshold']:.2f}",
-                    "Bankroll": f"${row['final_bankroll']:.2f}",
-                    "Delta": f"${row['bankroll_delta']:.2f}",
-                    "Trades": row["trades_taken"],
-                    "ROI/Trade": f"${row['roi_per_trade']:.2f}",
-                    "Eff / $hr": f"{row['return_per_locked_dollar_hour']:.4f}",
-                })
-        if sweep_rows:
-            st.markdown("**Model Threshold Sweep**")
-            st.dataframe(pd.DataFrame(sweep_rows), width="stretch", hide_index=True)
+        run_deep_replay = st.checkbox(
+            "Run full replay analysis on the recent opportunity window",
+            value=False,
+            key="shadow_deep_replay",
+        )
+        st.caption(
+            "Fast mode uses bot-written snapshots plus the latest opportunity window. "
+            "Enable full replay only when you need a fresh deep dive."
+        )
+        if run_deep_replay:
+            opp_rows = opps.to_dict("records")
+            report_1d = compute_eval_report(opp_rows, 1.0)
+            report_7d = compute_eval_report(opp_rows, 7.0)
 
-        hybrid_sweep_rows = []
-        for label, report in (("1D", report_1d), ("7D", report_7d)):
-            for row in report["replay"].get("hybrid_threshold_sweep", []):
-                hybrid_sweep_rows.append({
+            sweep_rows = []
+            for label, report in (("1D", report_1d), ("7D", report_7d)):
+                for row in report["replay"].get("model_threshold_sweep", []):
+                    sweep_rows.append({
+                        "Window": label,
+                        "Threshold": f"{row['model_threshold']:.2f}",
+                        "Bankroll": f"${row['final_bankroll']:.2f}",
+                        "Delta": f"${row['bankroll_delta']:.2f}",
+                        "Trades": row["trades_taken"],
+                        "ROI/Trade": f"${row['roi_per_trade']:.2f}",
+                        "Eff / $hr": f"{row['return_per_locked_dollar_hour']:.4f}",
+                    })
+            if sweep_rows:
+                st.markdown("**Model Threshold Sweep**")
+                st.dataframe(pd.DataFrame(sweep_rows), width="stretch", hide_index=True)
+
+            hybrid_sweep_rows = []
+            for label, report in (("1D", report_1d), ("7D", report_7d)):
+                for row in report["replay"].get("hybrid_threshold_sweep", []):
+                    hybrid_sweep_rows.append({
+                        "Window": label,
+                        "Veto Threshold": f"{row['model_threshold']:.2f}",
+                        "Bankroll": f"${row['final_bankroll']:.2f}",
+                        "Delta": f"${row['bankroll_delta']:.2f}",
+                        "Trades": row["trades_taken"],
+                        "ROI/Trade": f"${row['roi_per_trade']:.2f}",
+                        "Eff / $hr": f"{row['return_per_locked_dollar_hour']:.4f}",
+                    })
+            if hybrid_sweep_rows:
+                st.markdown("**Hybrid Threshold Sweep**")
+                st.dataframe(pd.DataFrame(hybrid_sweep_rows), width="stretch", hide_index=True)
+
+            diag_rows = []
+            for label, report in (("1D", report_1d), ("7D", report_7d)):
+                diag = report["replay"]["model_diagnostics"]
+                diag_rows.append({
                     "Window": label,
-                    "Veto Threshold": f"{row['model_threshold']:.2f}",
-                    "Bankroll": f"${row['final_bankroll']:.2f}",
-                    "Delta": f"${row['bankroll_delta']:.2f}",
-                    "Trades": row["trades_taken"],
-                    "ROI/Trade": f"${row['roi_per_trade']:.2f}",
-                    "Eff / $hr": f"{row['return_per_locked_dollar_hour']:.4f}",
+                    "Parsed": diag["parsed_rows"],
+                    "Skipped": diag["skipped_rows"],
+                    "Warm Rows": diag["warm_rows"],
+                    "First Warm At": diag["first_warm_observed_at"] or "n/a",
+                    "Avg Score (Warm)": f"{diag['avg_score_warm']:.3f}",
+                    "Score Range": f"{diag['min_score_warm']:.3f} - {diag['max_score_warm']:.3f}",
+                    "Replay Takes": diag["replay_take_count"],
+                    "Logged Takes": diag["logged_take_count"],
+                    "Replay Take %": f"{diag['replay_take_rate_warm']:.1f}%",
+                    "Logged Take %": f"{diag['logged_take_rate_warm']:.1f}%",
+                    "Replay vs Logged": f"{diag['replay_logged_agreement']:.1f}%",
+                    "Replay/Logged Diff": diag["replay_logged_disagreements"],
                 })
-        if hybrid_sweep_rows:
-            st.markdown("**Hybrid Threshold Sweep**")
-            st.dataframe(pd.DataFrame(hybrid_sweep_rows), width="stretch", hide_index=True)
+            st.markdown("**Replay Diagnostics**")
+            st.dataframe(pd.DataFrame(diag_rows), width="stretch", hide_index=True)
+
+            bucket_rows = []
+            for label, report in (("1D", report_1d), ("7D", report_7d)):
+                buckets = report["replay"]["model_diagnostics"]["score_buckets"]
+                bucket_rows.append({
+                    "Window": label,
+                    "<50%": buckets["lt_50"],
+                    "50-55%": buckets["50_55"],
+                    "55-60%": buckets["55_60"],
+                    "60-70%": buckets["60_70"],
+                    "70%+": buckets["ge_70"],
+                })
+            st.markdown("**Replay Score Distribution (Warm Rows)**")
+            st.dataframe(pd.DataFrame(bucket_rows), width="stretch", hide_index=True)
 
         if not copied_shadow.empty:
             outcome_rows = []
@@ -1409,41 +1530,6 @@ with tab_shadow:
                 })
             st.markdown("**Hybrid Veto Outcomes On Heuristic Trades**")
             st.dataframe(pd.DataFrame(outcome_rows), width="stretch", hide_index=True)
-
-        diag_rows = []
-        for label, report in (("1D", report_1d), ("7D", report_7d)):
-            diag = report["replay"]["model_diagnostics"]
-            diag_rows.append({
-                "Window": label,
-                "Parsed": diag["parsed_rows"],
-                "Skipped": diag["skipped_rows"],
-                "Warm Rows": diag["warm_rows"],
-                "First Warm At": diag["first_warm_observed_at"] or "n/a",
-                "Avg Score (Warm)": f"{diag['avg_score_warm']:.3f}",
-                "Score Range": f"{diag['min_score_warm']:.3f} - {diag['max_score_warm']:.3f}",
-                "Replay Takes": diag["replay_take_count"],
-                "Logged Takes": diag["logged_take_count"],
-                "Replay Take %": f"{diag['replay_take_rate_warm']:.1f}%",
-                "Logged Take %": f"{diag['logged_take_rate_warm']:.1f}%",
-                "Replay vs Logged": f"{diag['replay_logged_agreement']:.1f}%",
-                "Replay/Logged Diff": diag["replay_logged_disagreements"],
-            })
-        st.markdown("**Replay Diagnostics**")
-        st.dataframe(pd.DataFrame(diag_rows), width="stretch", hide_index=True)
-
-        bucket_rows = []
-        for label, report in (("1D", report_1d), ("7D", report_7d)):
-            buckets = report["replay"]["model_diagnostics"]["score_buckets"]
-            bucket_rows.append({
-                "Window": label,
-                "<50%": buckets["lt_50"],
-                "50-55%": buckets["50_55"],
-                "55-60%": buckets["55_60"],
-                "60-70%": buckets["60_70"],
-                "70%+": buckets["ge_70"],
-            })
-        st.markdown("**Replay Score Distribution (Warm Rows)**")
-        st.dataframe(pd.DataFrame(bucket_rows), width="stretch", hide_index=True)
 
         resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
         if not resolved_shadow.empty:
