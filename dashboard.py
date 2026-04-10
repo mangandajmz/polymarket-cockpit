@@ -278,6 +278,7 @@ def load_opportunities(limit: int = OPPORTUNITY_LEDGER_LIMIT) -> pd.DataFrame:
                     hybrid_veto_decision,
                     hybrid_veto_reason,
                     resolution_status,
+                    resolved_pnl,
                     resolved_at_utc
                 FROM opportunities
                 ORDER BY observed_at_utc DESC
@@ -294,7 +295,7 @@ def load_opportunities(limit: int = OPPORTUNITY_LEDGER_LIMIT) -> pd.DataFrame:
     for col in [
         "whale_size_usdc", "price", "opportunity_age_sec", "trader_resolved_count",
         "trader_win_rate", "conviction", "bayes_posterior_mean", "bayes_lower_bound",
-        "shadow_model_score", "hybrid_veto_threshold",
+        "shadow_model_score", "hybrid_veto_threshold", "resolved_pnl",
     ]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["observed_at_utc"] = pd.to_datetime(df["observed_at_utc"], utc=True, errors="coerce")
@@ -472,6 +473,132 @@ def evaluation_summary_snapshot(snapshot: dict) -> tuple[str, str]:
     if model_wr >= heuristic_wr and hybrid_bankroll > current_bankroll and model_take_rate <= 20.0:
         return "Promising", "Model is selective and replay-positive versus the current baseline."
     return "Mixed", "The model is learning signal, but it is not yet selective or replay-positive enough."
+
+
+def summarize_hybrid_veto(copied_shadow: pd.DataFrame) -> dict:
+    if copied_shadow.empty:
+        return {
+            "summary": {},
+            "bucket_table": pd.DataFrame(),
+            "trader_table": pd.DataFrame(),
+            "recent_vetoes": pd.DataFrame(),
+            "curve": pd.DataFrame(),
+            "reason_table": pd.DataFrame(),
+        }
+
+    working = copied_shadow.copy()
+    working["resolved_pnl"] = pd.to_numeric(working.get("resolved_pnl"), errors="coerce")
+    working["is_resolved"] = working["resolution_status"].isin(["WIN", "LOSS"])
+    working["is_win"] = working["resolution_status"].eq("WIN")
+
+    resolved = working[working["is_resolved"]].copy()
+    allow_all = working[working["Hybrid Veto"].eq("ALLOW")].copy()
+    veto_all = working[working["Hybrid Veto"].eq("VETO")].copy()
+    allow_resolved = resolved[resolved["Hybrid Veto"].eq("ALLOW")].copy()
+    veto_resolved = resolved[resolved["Hybrid Veto"].eq("VETO")].copy()
+
+    veto_negative = veto_resolved[veto_resolved["resolved_pnl"] < 0]["resolved_pnl"]
+    veto_positive = veto_resolved[veto_resolved["resolved_pnl"] > 0]["resolved_pnl"]
+    current_pnl = float(resolved["resolved_pnl"].sum()) if not resolved.empty else 0.0
+    hybrid_pnl = float(allow_resolved["resolved_pnl"].sum()) if not allow_resolved.empty else 0.0
+    veto_edge = hybrid_pnl - current_pnl
+
+    summary = {
+        "scored_trades": int(len(working)),
+        "resolved_trades": int(len(resolved)),
+        "allow_count": int(len(allow_all)),
+        "veto_count": int(len(veto_all)),
+        "veto_rate": (len(veto_all) / len(working) * 100.0) if len(working) else 0.0,
+        "allow_resolved": int(len(allow_resolved)),
+        "veto_resolved": int(len(veto_resolved)),
+        "allow_wr": allow_resolved["is_win"].mean() * 100.0 if not allow_resolved.empty else 0.0,
+        "veto_wr": veto_resolved["is_win"].mean() * 100.0 if not veto_resolved.empty else 0.0,
+        "allow_pnl": float(allow_resolved["resolved_pnl"].sum()) if not allow_resolved.empty else 0.0,
+        "veto_pnl": float(veto_resolved["resolved_pnl"].sum()) if not veto_resolved.empty else 0.0,
+        "current_pnl": current_pnl,
+        "hybrid_pnl": hybrid_pnl,
+        "veto_edge": veto_edge,
+        "losses_avoided": abs(float(veto_negative.sum())) if not veto_negative.empty else 0.0,
+        "missed_profit": float(veto_positive.sum()) if not veto_positive.empty else 0.0,
+    }
+
+    bucket_rows = []
+    for label, subset in (("ALLOW", allow_all), ("VETO", veto_all)):
+        resolved_subset = subset[subset["is_resolved"]]
+        bucket_rows.append({
+            "Bucket": label,
+            "Copied Trades": len(subset),
+            "Share": f"{(len(subset) / len(working) * 100.0):.1f}%" if len(working) else "0.0%",
+            "Resolved": int(len(resolved_subset)),
+            "Win Rate": f"{(resolved_subset['is_win'].mean() * 100.0):.1f}%" if not resolved_subset.empty else "n/a",
+            "Total PnL": f"${float(resolved_subset['resolved_pnl'].sum()) if not resolved_subset.empty else 0.0:+.2f}",
+            "Avg PnL": f"${float(resolved_subset['resolved_pnl'].mean()) if not resolved_subset.empty else 0.0:+.2f}",
+            "Avg Model %": f"{subset['Model %'].mean():.1f}%" if not subset.empty else "n/a",
+            "Top Reason": subset["hybrid_veto_reason"].mode().iat[0] if not subset.empty and subset["hybrid_veto_reason"].notna().any() else "n/a",
+        })
+    bucket_table = pd.DataFrame(bucket_rows)
+
+    trader_rows = []
+    for trader, grp in working.groupby("trader"):
+        trader_allow = grp[grp["Hybrid Veto"].eq("ALLOW")]
+        trader_veto = grp[grp["Hybrid Veto"].eq("VETO")]
+        trader_allow_resolved = trader_allow[trader_allow["is_resolved"]]
+        trader_veto_resolved = trader_veto[trader_veto["is_resolved"]]
+        if trader_allow.empty and trader_veto.empty:
+            continue
+        trader_rows.append({
+            "Trader": trader,
+            "Copied": int(len(grp)),
+            "ALLOW": int(len(trader_allow)),
+            "VETO": int(len(trader_veto)),
+            "Veto Rate": (len(trader_veto) / len(grp) * 100.0) if len(grp) else 0.0,
+            "ALLOW WR": trader_allow_resolved["is_win"].mean() * 100.0 if not trader_allow_resolved.empty else None,
+            "VETO WR": trader_veto_resolved["is_win"].mean() * 100.0 if not trader_veto_resolved.empty else None,
+            "ALLOW PnL": float(trader_allow_resolved["resolved_pnl"].sum()) if not trader_allow_resolved.empty else 0.0,
+            "VETO PnL": float(trader_veto_resolved["resolved_pnl"].sum()) if not trader_veto_resolved.empty else 0.0,
+            "Net Veto Edge": -(float(trader_veto_resolved["resolved_pnl"].sum()) if not trader_veto_resolved.empty else 0.0),
+        })
+    trader_table = pd.DataFrame(trader_rows)
+    if not trader_table.empty:
+        trader_table = trader_table.sort_values(["Net Veto Edge", "VETO"], ascending=[False, False])
+
+    recent_vetoes = working[working["Hybrid Veto"].eq("VETO")].copy()
+    if not recent_vetoes.empty:
+        recent_vetoes = recent_vetoes.sort_values("observed_at_utc", ascending=False)
+        recent_vetoes["Observed"] = recent_vetoes["observed_at_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    reason_table = pd.DataFrame()
+    if not veto_all.empty:
+        reason_table = (
+            veto_all.groupby("hybrid_veto_reason", dropna=False)
+            .agg(
+                Trades=("event_id", "count"),
+                Avg_Model_Pct=("Model %", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"hybrid_veto_reason": "Reason", "Avg_Model_Pct": "Avg Model %"})
+            .sort_values("Trades", ascending=False)
+        )
+
+    curve = pd.DataFrame()
+    if not resolved.empty:
+        curve = resolved.sort_values("observed_at_utc").copy()
+        curve["current_cum_pnl"] = curve["resolved_pnl"].cumsum()
+        curve["hybrid_realized_pnl"] = curve.apply(
+            lambda row: row["resolved_pnl"] if row["Hybrid Veto"] == "ALLOW" else 0.0,
+            axis=1,
+        )
+        curve["hybrid_cum_pnl"] = curve["hybrid_realized_pnl"].cumsum()
+        curve["veto_edge_cum"] = curve["hybrid_cum_pnl"] - curve["current_cum_pnl"]
+
+    return {
+        "summary": summary,
+        "bucket_table": bucket_table,
+        "trader_table": trader_table,
+        "recent_vetoes": recent_vetoes,
+        "curve": curve,
+        "reason_table": reason_table,
+    }
 
 
 @st.cache_data(ttl=30)
@@ -1352,18 +1479,34 @@ with tab_shadow:
         top[3].metric("Resolved Rows", int(opp_metrics.get("resolved_rows", shadow["resolution_status"].isin(["WIN", "LOSS"]).sum())))
 
         copied_shadow = shadow[shadow["decision"].eq("COPIED")].copy()
+        veto_analysis = summarize_hybrid_veto(copied_shadow) if not copied_shadow.empty else {}
         if not copied_shadow.empty:
-            copied_shadow["is_resolved"] = copied_shadow["resolution_status"].isin(["WIN", "LOSS"])
-            copied_shadow["is_win"] = copied_shadow["resolution_status"].eq("WIN")
-            veto_cols = st.columns(4)
-            veto_cols[0].metric("Hybrid ALLOW", int(copied_shadow["Hybrid Veto"].eq("ALLOW").sum()))
-            veto_cols[1].metric("Hybrid VETO", int(copied_shadow["Hybrid Veto"].eq("VETO").sum()))
-            allowed = copied_shadow[copied_shadow["Hybrid Veto"].eq("ALLOW") & copied_shadow["is_resolved"]]
-            vetoed = copied_shadow[copied_shadow["Hybrid Veto"].eq("VETO") & copied_shadow["is_resolved"]]
-            allow_wr = allowed["is_win"].mean() * 100.0 if not allowed.empty else 0.0
-            veto_wr = vetoed["is_win"].mean() * 100.0 if not vetoed.empty else 0.0
-            veto_cols[2].metric("ALLOW WR", f"{allow_wr:.1f}%")
-            veto_cols[3].metric("VETO WR", f"{veto_wr:.1f}%")
+            summary = veto_analysis["summary"]
+            st.markdown("**Hybrid Veto Behavior**")
+            veto_top = st.columns(5)
+            veto_top[0].metric("Scored Heuristic Trades", int(summary.get("scored_trades", 0)))
+            veto_top[1].metric("Veto Rate", f"{float(summary.get('veto_rate', 0.0)):.1f}%")
+            veto_top[2].metric("ALLOW WR", f"{float(summary.get('allow_wr', 0.0)):.1f}%")
+            veto_top[3].metric("VETO WR", f"{float(summary.get('veto_wr', 0.0)):.1f}%")
+            veto_top[4].metric("Net Veto Edge", f"${float(summary.get('veto_edge', 0.0)):+.2f}")
+
+            veto_mid = st.columns(5)
+            veto_mid[0].metric("ALLOW PnL", f"${float(summary.get('allow_pnl', 0.0)):+.2f}")
+            veto_mid[1].metric("VETO PnL", f"${float(summary.get('veto_pnl', 0.0)):+.2f}")
+            veto_mid[2].metric("Losses Avoided", f"${float(summary.get('losses_avoided', 0.0)):.2f}")
+            veto_mid[3].metric("Missed Profit", f"${float(summary.get('missed_profit', 0.0)):.2f}")
+            veto_mid[4].metric(
+                "Hybrid vs Current",
+                f"${float(summary.get('hybrid_pnl', 0.0)):+.2f}",
+                delta=f"{float(summary.get('veto_edge', 0.0)):+.2f} vs current",
+            )
+
+            if summary.get("veto_edge", 0.0) > 0 and summary.get("allow_wr", 0.0) > summary.get("veto_wr", 0.0):
+                st.caption("The veto is currently adding value: vetoed heuristic trades are underperforming allowed ones.")
+            elif summary.get("veto_edge", 0.0) < 0:
+                st.caption("The veto is currently costing money over this window. Treat it as research-only until that reverses.")
+            else:
+                st.caption("The veto signal is mixed. Keep monitoring the separation between ALLOW and VETO buckets.")
 
         st.markdown("**Automatic evaluation summary**")
         snap_1d = runtime_kv.get("evaluation_snapshot_1d", {}) if isinstance(runtime_kv.get("evaluation_snapshot_1d"), dict) else {}
@@ -1515,21 +1658,87 @@ with tab_shadow:
             st.dataframe(pd.DataFrame(bucket_rows), width="stretch", hide_index=True)
 
         if not copied_shadow.empty:
-            outcome_rows = []
-            for label, subset in (("ALLOW", copied_shadow[copied_shadow["Hybrid Veto"].eq("ALLOW")]),
-                                  ("VETO", copied_shadow[copied_shadow["Hybrid Veto"].eq("VETO")])):
-                resolved_subset = subset[subset["is_resolved"]]
-                win_rate = resolved_subset["is_win"].mean() * 100.0 if not resolved_subset.empty else 0.0
-                outcome_rows.append({
-                    "Bucket": label,
-                    "Copied Trades": len(subset),
-                    "Resolved": int(resolved_subset.shape[0]),
-                    "Win Rate": f"{win_rate:.1f}%",
-                    "Avg Model %": f"{subset['Model %'].mean():.1f}%" if not subset.empty else "n/a",
-                    "Top Reason": subset["hybrid_veto_reason"].mode().iat[0] if not subset.empty and subset["hybrid_veto_reason"].notna().any() else "n/a",
-                })
             st.markdown("**Hybrid Veto Outcomes On Heuristic Trades**")
-            st.dataframe(pd.DataFrame(outcome_rows), width="stretch", hide_index=True)
+            st.dataframe(veto_analysis["bucket_table"], width="stretch", hide_index=True)
+
+            fig_veto = None
+            curve = veto_analysis["curve"]
+            if not curve.empty:
+                fig_veto = go.Figure()
+                fig_veto.add_trace(go.Scatter(
+                    x=curve["observed_at_utc"],
+                    y=curve["current_cum_pnl"],
+                    mode="lines",
+                    name="Current heuristic",
+                    line=dict(color="#888", width=2),
+                ))
+                fig_veto.add_trace(go.Scatter(
+                    x=curve["observed_at_utc"],
+                    y=curve["hybrid_cum_pnl"],
+                    mode="lines",
+                    name="Hybrid veto",
+                    line=dict(color="#00a651", width=3),
+                ))
+                fig_veto.add_trace(go.Scatter(
+                    x=curve["observed_at_utc"],
+                    y=curve["veto_edge_cum"],
+                    mode="lines",
+                    name="Veto edge vs current",
+                    line=dict(color="#ffb000", width=2, dash="dot"),
+                    yaxis="y2",
+                ))
+                fig_veto.update_layout(
+                    title="Hybrid Veto PnL vs Current Heuristic",
+                    template="plotly_dark",
+                    height=360,
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    hovermode="x unified",
+                    yaxis=dict(title="Cumulative PnL ($)"),
+                    yaxis2=dict(title="Edge ($)", overlaying="y", side="right"),
+                )
+                st.plotly_chart(fig_veto, width="stretch")
+
+            veto_left, veto_right = st.columns(2)
+            with veto_left:
+                st.markdown("**Veto By Trader**")
+                trader_table = veto_analysis["trader_table"].copy()
+                if trader_table.empty:
+                    st.info("No trader-level veto data yet.")
+                else:
+                    for col in ["Veto Rate", "ALLOW WR", "VETO WR"]:
+                        trader_table[col] = trader_table[col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "n/a")
+                    for col in ["ALLOW PnL", "VETO PnL", "Net Veto Edge"]:
+                        trader_table[col] = trader_table[col].map(lambda v: f"${v:+.2f}")
+                    st.dataframe(trader_table.head(12), width="stretch", hide_index=True)
+
+            with veto_right:
+                st.markdown("**Veto Reasons On Copied Trades**")
+                reason_table = veto_analysis["reason_table"].copy()
+                if reason_table.empty:
+                    st.info("No veto reasons recorded yet.")
+                else:
+                    reason_table["Avg Model %"] = reason_table["Avg Model %"].map(lambda v: f"{v:.1f}%")
+                    st.dataframe(reason_table, width="stretch", hide_index=True)
+
+            st.markdown("**Recent VETO Decisions**")
+            recent_vetoes = veto_analysis["recent_vetoes"].copy()
+            if recent_vetoes.empty:
+                st.info("No vetoed heuristic trades yet.")
+            else:
+                recent_vetoes["Resolved PnL"] = recent_vetoes["resolved_pnl"].map(lambda v: f"${v:+.2f}" if pd.notna(v) else "—")
+                st.dataframe(
+                    recent_vetoes[[
+                        "Observed", "trader", "market", "hybrid_veto_reason",
+                        "Model %", "Bayes LCB %", "resolution_status", "Resolved PnL"
+                    ]].head(50).rename(columns={
+                        "trader": "Trader",
+                        "market": "Market",
+                        "hybrid_veto_reason": "Reason",
+                        "resolution_status": "Outcome",
+                    }),
+                    width="stretch",
+                    hide_index=True,
+                )
 
         resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
         if not resolved_shadow.empty:
