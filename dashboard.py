@@ -348,6 +348,45 @@ def load_opportunity_metrics() -> dict:
 
 
 @st.cache_data(ttl=30)
+def load_copied_opportunities() -> pd.DataFrame:
+    if not STATE_DB_PATH.exists():
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    event_id,
+                    observed_at_utc,
+                    trader,
+                    market,
+                    decision,
+                    bayes_lower_bound,
+                    shadow_model_score,
+                    hybrid_veto_decision,
+                    hybrid_veto_reason,
+                    resolution_status,
+                    resolved_pnl
+                FROM opportunities
+                WHERE decision = 'COPIED'
+                ORDER BY observed_at_utc DESC
+                """,
+                conn,
+            )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for col in ["bayes_lower_bound", "shadow_model_score", "resolved_pnl"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["observed_at_utc"] = pd.to_datetime(df["observed_at_utc"], utc=True, errors="coerce")
+    df["Hybrid Veto"] = df["hybrid_veto_decision"].fillna("NO_ACTION")
+    df["Model %"] = df["shadow_model_score"] * 100.0
+    df["Bayes LCB %"] = df["bayes_lower_bound"] * 100.0
+    return df
+
+
+@st.cache_data(ttl=30)
 def load_position_history() -> pd.DataFrame:
     if not STATE_DB_PATH.exists():
         return pd.DataFrame()
@@ -1155,6 +1194,7 @@ df    = load_trades()
 runtime_kv = load_runtime_kv()
 opp_metrics = load_opportunity_metrics()
 opps  = load_opportunities()
+copied_opps = load_copied_opportunities()
 position_history = load_position_history()
 stats = compute_stats(df) if not df.empty else {
     "wins": 0, "losses": 0, "win_rate": 0, "all_time_pnl": 0,
@@ -1478,7 +1518,7 @@ with tab_shadow:
         top[2].metric("Agreement", f"{float(opp_metrics.get('agreement_pct', shadow['heuristic_vs_model'].eq('Agree').mean() * 100.0)):.1f}%")
         top[3].metric("Resolved Rows", int(opp_metrics.get("resolved_rows", shadow["resolution_status"].isin(["WIN", "LOSS"]).sum())))
 
-        copied_shadow = shadow[shadow["decision"].eq("COPIED")].copy()
+        copied_shadow = copied_opps.copy()
         veto_analysis = summarize_hybrid_veto(copied_shadow) if not copied_shadow.empty else {}
         if not copied_shadow.empty:
             summary = veto_analysis["summary"]
@@ -1739,6 +1779,8 @@ with tab_shadow:
                     width="stretch",
                     hide_index=True,
                 )
+        else:
+            st.info("No copied heuristic trades are available yet for veto analysis.")
 
         resolved_shadow = shadow[shadow["resolution_status"].isin(["WIN", "LOSS"])].copy()
         if not resolved_shadow.empty:
