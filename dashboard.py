@@ -42,8 +42,10 @@ DAILY_LOSS_CAP = float(
 )
 STARTING_BANKROLL = float(os.getenv("STARTING_BANKROLL", "300.0"))
 BOT_MODE          = os.getenv("BOT_MODE", "PAPER")   # PAPER or LIVE
+HYBRID_VETO_THRESHOLD = float(os.getenv("HYBRID_VETO_THRESHOLD", "0.65"))
 MIN_WIN_RATE      = 60.0  # % threshold — must match paper_trading_bot.py
 OPPORTUNITY_LEDGER_LIMIT = int(os.getenv("OPPORTUNITY_LEDGER_LIMIT", "2500"))
+VETO_COMPARISON_THRESHOLDS = (0.55, 0.60, 0.65, 0.70)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
@@ -637,6 +639,76 @@ def summarize_hybrid_veto(copied_shadow: pd.DataFrame) -> dict:
         "recent_vetoes": recent_vetoes,
         "curve": curve,
         "reason_table": reason_table,
+    }
+
+
+def summarize_veto_threshold_comparison(
+    copied_shadow: pd.DataFrame,
+    thresholds: tuple[float, ...] = VETO_COMPARISON_THRESHOLDS,
+) -> dict:
+    if copied_shadow.empty:
+        return {"table": pd.DataFrame(), "chart": pd.DataFrame(), "best": None}
+
+    working = copied_shadow.copy()
+    working["shadow_model_score"] = pd.to_numeric(working.get("shadow_model_score"), errors="coerce")
+    working["resolved_pnl"] = pd.to_numeric(working.get("resolved_pnl"), errors="coerce")
+    working["is_resolved"] = working["resolution_status"].isin(["WIN", "LOSS"])
+    working["is_win"] = working["resolution_status"].eq("WIN")
+    working = working[working["shadow_model_score"].notna()].copy()
+    if working.empty:
+        return {"table": pd.DataFrame(), "chart": pd.DataFrame(), "best": None}
+
+    resolved = working[working["is_resolved"]].copy()
+    current_pnl = float(resolved["resolved_pnl"].sum()) if not resolved.empty else 0.0
+
+    rows = []
+    for threshold in thresholds:
+        allow_all = working[working["shadow_model_score"] >= threshold].copy()
+        veto_all = working[working["shadow_model_score"] < threshold].copy()
+        allow_resolved = allow_all[allow_all["is_resolved"]].copy()
+        veto_resolved = veto_all[veto_all["is_resolved"]].copy()
+        hybrid_pnl = float(allow_resolved["resolved_pnl"].sum()) if not allow_resolved.empty else 0.0
+        veto_edge = hybrid_pnl - current_pnl
+        allow_wr = allow_resolved["is_win"].mean() * 100.0 if not allow_resolved.empty else None
+        veto_wr = veto_resolved["is_win"].mean() * 100.0 if not veto_resolved.empty else None
+        rows.append({
+            "Threshold": threshold,
+            "Current": abs(threshold - HYBRID_VETO_THRESHOLD) < 1e-9,
+            "Scored Trades": int(len(working)),
+            "ALLOW": int(len(allow_all)),
+            "VETO": int(len(veto_all)),
+            "Veto Rate": (len(veto_all) / len(working) * 100.0) if len(working) else 0.0,
+            "Resolved": int(len(resolved)),
+            "ALLOW WR": allow_wr,
+            "VETO WR": veto_wr,
+            "WR Gap": (allow_wr - veto_wr) if allow_wr is not None and veto_wr is not None else None,
+            "Hybrid PnL": hybrid_pnl,
+            "Net Veto Edge": veto_edge,
+        })
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        return {"table": table, "chart": pd.DataFrame(), "best": None}
+
+    best_row = table.sort_values(
+        by=["Net Veto Edge", "WR Gap", "Veto Rate"],
+        ascending=[False, False, True],
+        na_position="last",
+    ).iloc[0].to_dict()
+
+    display = table.copy()
+    display["Threshold"] = display["Threshold"].map(lambda v: f"{v:.2f}")
+    display["Current"] = display["Current"].map(lambda v: "Yes" if v else "")
+    display["Veto Rate"] = display["Veto Rate"].map(lambda v: f"{v:.1f}%")
+    for col in ["ALLOW WR", "VETO WR", "WR Gap"]:
+        display[col] = display[col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "n/a")
+    for col in ["Hybrid PnL", "Net Veto Edge"]:
+        display[col] = display[col].map(lambda v: f"${v:+.2f}")
+
+    return {
+        "table": display,
+        "chart": table.copy(),
+        "best": best_row,
     }
 
 
@@ -1520,6 +1592,7 @@ with tab_shadow:
 
         copied_shadow = copied_opps.copy()
         veto_analysis = summarize_hybrid_veto(copied_shadow) if not copied_shadow.empty else {}
+        veto_thresholds = summarize_veto_threshold_comparison(copied_shadow) if not copied_shadow.empty else {}
         if not copied_shadow.empty:
             summary = veto_analysis["summary"]
             st.markdown("**Hybrid Veto Behavior**")
@@ -1547,6 +1620,24 @@ with tab_shadow:
                 st.caption("The veto is currently costing money over this window. Treat it as research-only until that reverses.")
             else:
                 st.caption("The veto signal is mixed. Keep monitoring the separation between ALLOW and VETO buckets.")
+
+            threshold_best = veto_thresholds.get("best") if isinstance(veto_thresholds, dict) else None
+            if threshold_best:
+                best_threshold = float(threshold_best.get("Threshold", HYBRID_VETO_THRESHOLD))
+                best_edge = float(threshold_best.get("Net Veto Edge", 0.0) or 0.0)
+                best_veto_rate = float(threshold_best.get("Veto Rate", 0.0) or 0.0)
+                current_edge = float(summary.get("veto_edge", 0.0) or 0.0)
+                edge_delta = best_edge - current_edge
+                if abs(best_threshold - HYBRID_VETO_THRESHOLD) < 1e-9:
+                    st.caption(
+                        f"Current copied-trade threshold `{HYBRID_VETO_THRESHOLD:.2f}` is the best of the tracked set so far "
+                        f"with `{best_veto_rate:.1f}%` veto rate and `{best_edge:+.2f}` edge."
+                    )
+                else:
+                    st.caption(
+                        f"Copied-trade comparison currently favors `p>={best_threshold:.2f}` over the live research setting "
+                        f"`{HYBRID_VETO_THRESHOLD:.2f}` by `{edge_delta:+.2f}` edge."
+                    )
 
         st.markdown("**Automatic evaluation summary**")
         snap_1d = runtime_kv.get("evaluation_snapshot_1d", {}) if isinstance(runtime_kv.get("evaluation_snapshot_1d"), dict) else {}
@@ -1700,6 +1791,51 @@ with tab_shadow:
         if not copied_shadow.empty:
             st.markdown("**Hybrid Veto Outcomes On Heuristic Trades**")
             st.dataframe(veto_analysis["bucket_table"], width="stretch", hide_index=True)
+
+            st.markdown("**Copied-Trade Threshold Comparison**")
+            threshold_table = veto_thresholds.get("table", pd.DataFrame()).copy() if isinstance(veto_thresholds, dict) else pd.DataFrame()
+            if threshold_table.empty:
+                st.info("Not enough copied-trade data yet to compare veto thresholds.")
+            else:
+                st.dataframe(threshold_table, width="stretch", hide_index=True)
+                threshold_chart = veto_thresholds.get("chart", pd.DataFrame()).copy()
+                if not threshold_chart.empty:
+                    fig_thresholds = go.Figure()
+                    fig_thresholds.add_trace(go.Scatter(
+                        x=threshold_chart["Threshold"],
+                        y=threshold_chart["Net Veto Edge"],
+                        mode="lines+markers+text",
+                        name="Net veto edge",
+                        line=dict(color="#00a651", width=3),
+                        text=threshold_chart["Veto Rate"].map(lambda v: f"{v:.1f}% veto"),
+                        textposition="top center",
+                    ))
+                    fig_thresholds.add_trace(go.Scatter(
+                        x=threshold_chart["Threshold"],
+                        y=threshold_chart["Veto Rate"],
+                        mode="lines+markers",
+                        name="Veto rate",
+                        line=dict(color="#ffb000", width=2, dash="dot"),
+                        yaxis="y2",
+                    ))
+                    fig_thresholds.add_vline(
+                        x=HYBRID_VETO_THRESHOLD,
+                        line_color="#888",
+                        line_dash="dash",
+                        annotation_text=f"Current {HYBRID_VETO_THRESHOLD:.2f}",
+                        annotation_position="top right",
+                    )
+                    fig_thresholds.update_layout(
+                        title="Copied-Trade Threshold Edge vs Veto Rate",
+                        template="plotly_dark",
+                        height=320,
+                        margin=dict(l=20, r=20, t=50, b=20),
+                        hovermode="x unified",
+                        xaxis=dict(title="Threshold"),
+                        yaxis=dict(title="Net Veto Edge ($)"),
+                        yaxis2=dict(title="Veto Rate (%)", overlaying="y", side="right"),
+                    )
+                    st.plotly_chart(fig_thresholds, width="stretch")
 
             fig_veto = None
             curve = veto_analysis["curve"]
