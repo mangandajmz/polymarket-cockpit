@@ -78,6 +78,7 @@ ZERO_PRICE_CLOSE_HOURS = 24     # force-close unresolved position if price ≈$0
 ZERO_PRICE_GUARD       = 0.005  # treat anything below this as effectively zero
 MAX_OPEN_HOURS         = 72     # force-close any unresolved position open longer than this
 MAX_API_FAILURES       = 5      # consecutive poll failures before status warning
+HYBRID_VETO_THRESHOLD  = _env_float("HYBRID_VETO_THRESHOLD", 0.65)  # model score needed to paper-allow a copied trade
 SEEN_HASHES_FILE       = "seen_hashes.json"
 INTERACTIVE_MODE       = False  # True only when running manually in terminal
 
@@ -341,7 +342,7 @@ def _shadow_recommendation(bot: PaperBot, opportunity: dict) -> tuple[float, str
 
 
 def _hybrid_veto_fields(bot: PaperBot, opportunity: dict, heuristic_decision: str) -> dict:
-    threshold = 0.70
+    threshold = HYBRID_VETO_THRESHOLD
     score = float(opportunity.get("shadow_model_score") or 0.0)
     if heuristic_decision != "COPIED":
         return {
@@ -366,6 +367,45 @@ def _hybrid_veto_fields(bot: PaperBot, opportunity: dict, heuristic_decision: st
         "hybrid_veto_decision": "VETO",
         "hybrid_veto_reason": "score_below_threshold",
     }
+
+
+def _historical_hybrid_veto_fields(opportunity: dict) -> dict:
+    threshold = HYBRID_VETO_THRESHOLD
+    decision = str(opportunity.get("decision", ""))
+    score = opportunity.get("shadow_model_score")
+    if decision != "COPIED":
+        return {
+            "hybrid_veto_threshold": threshold,
+            "hybrid_veto_decision": "NO_ACTION",
+            "hybrid_veto_reason": "heuristic_not_copied",
+        }
+    if score is None:
+        return {
+            "hybrid_veto_threshold": threshold,
+            "hybrid_veto_decision": "VETO",
+            "hybrid_veto_reason": "missing_shadow_score",
+        }
+    if float(score) >= threshold:
+        return {
+            "hybrid_veto_threshold": threshold,
+            "hybrid_veto_decision": "ALLOW",
+            "hybrid_veto_reason": "score_above_threshold",
+        }
+    return {
+        "hybrid_veto_threshold": threshold,
+        "hybrid_veto_decision": "VETO",
+        "hybrid_veto_reason": "score_below_threshold",
+    }
+
+
+def _needs_hybrid_veto_relabel(row: dict) -> bool:
+    current_threshold = row.get("hybrid_veto_threshold")
+    if not row.get("hybrid_veto_decision") or not row.get("hybrid_veto_reason"):
+        return True
+    try:
+        return abs(float(current_threshold) - HYBRID_VETO_THRESHOLD) > 1e-9
+    except (TypeError, ValueError):
+        return True
 
 
 def _augment_opportunity_with_shadow_signals(bot: PaperBot, opportunity: dict):
@@ -404,31 +444,17 @@ def bootstrap_shadow_model(bot: PaperBot, opportunities: list[dict]):
 def backfill_hybrid_veto_labels(bot: PaperBot, opportunities: list[dict]) -> int:
     updated = 0
     for row in opportunities:
-        if row.get("hybrid_veto_decision"):
+        if not _needs_hybrid_veto_relabel(row):
             continue
         row = dict(row)
-        decision = str(row.get("decision", ""))
-        score = row.get("shadow_model_score")
-        if decision != "COPIED":
-            row["hybrid_veto_threshold"] = 0.70
-            row["hybrid_veto_decision"] = "NO_ACTION"
-            row["hybrid_veto_reason"] = "heuristic_not_copied"
-        elif score is None:
-            row["hybrid_veto_threshold"] = 0.70
-            row["hybrid_veto_decision"] = "VETO"
-            row["hybrid_veto_reason"] = "missing_shadow_score"
-        elif float(score) >= 0.70:
-            row["hybrid_veto_threshold"] = 0.70
-            row["hybrid_veto_decision"] = "ALLOW"
-            row["hybrid_veto_reason"] = "score_above_threshold"
-        else:
-            row["hybrid_veto_threshold"] = 0.70
-            row["hybrid_veto_decision"] = "VETO"
-            row["hybrid_veto_reason"] = "score_below_threshold"
+        row.update(_historical_hybrid_veto_fields(row))
         bot.store.upsert_opportunity(row)
         updated += 1
     if updated:
-        _log(f"[HYBRID] Backfilled hybrid veto labels for {updated} opportunity row(s)")
+        _log(
+            f"[HYBRID] Synced hybrid veto labels for {updated} opportunity row(s) "
+            f"at threshold {HYBRID_VETO_THRESHOLD:.2f}"
+        )
     return updated
 
 

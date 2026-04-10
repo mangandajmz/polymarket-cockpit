@@ -264,7 +264,7 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertIsNotNone(rows[copied_event]["bayes_lower_bound"])
         self.assertIsNotNone(rows[copied_event]["shadow_model_score"])
         self.assertIn(rows[copied_event]["shadow_model_decision"], ("SKIP", "TAKE"))
-        self.assertEqual(rows[copied_event]["hybrid_veto_threshold"], 0.70)
+        self.assertEqual(rows[copied_event]["hybrid_veto_threshold"], botmod.HYBRID_VETO_THRESHOLD)
         self.assertIn(rows[copied_event]["hybrid_veto_decision"], ("ALLOW", "VETO"))
         self.assertIn(rows[copied_event]["hybrid_veto_reason"], ("score_above_threshold", "score_below_threshold", "model_warmup"))
 
@@ -416,6 +416,67 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertEqual(copy_row["hybrid_veto_reason"], "score_above_threshold")
         self.assertEqual(skip_row["hybrid_veto_decision"], "NO_ACTION")
         self.assertEqual(skip_row["hybrid_veto_reason"], "heuristic_not_copied")
+
+    def test_backfill_hybrid_veto_labels_relabels_rows_after_threshold_change(self):
+        bot = botmod.PaperBot()
+        bot.store.upsert_opportunity({
+            "event_id": "hist-veto-threshold",
+            "observed_at_utc": "2026-04-05 00:02:00",
+            "trader": "alice",
+            "market": "Match B Winner",
+            "outcome": "Team B",
+            "whale_side": "BUY",
+            "whale_size_usdc": 1500.0,
+            "price": 0.55,
+            "condition_id": "cond-3",
+            "outcome_index": 0,
+            "transaction_hash": "tx-hist-veto-threshold",
+            "source_timestamp": 0,
+            "opportunity_age_sec": 10,
+            "trader_resolved_count": 20,
+            "trader_win_rate": 70.0,
+            "daily_losses_for_trader": 0,
+            "daily_deploy_for_trader": 0.0,
+            "bankroll": 300.0,
+            "deployed_cap_pct": 0.0,
+            "open_positions_count": 0,
+            "median_whale_size": 1200.0,
+            "conviction": 1.2,
+            "perf_mult": 1.0,
+            "dynamic_max_bet": 20.0,
+            "recommended_size": 12.0,
+            "copied_size_usdc": 12.0,
+            "copy_shares": 20.0,
+            "position_id": "alice|cond-3|0",
+            "decision": "COPIED",
+            "decision_reason": "copied",
+            "is_crypto": 0,
+            "is_spread": 0,
+            "is_futures": 0,
+            "price_capped": 0,
+            "duplicate_game": 0,
+            "base_game": "Match B Winner",
+            "bayes_posterior_mean": 0.62,
+            "bayes_lower_bound": 0.55,
+            "shadow_model_score": 0.68,
+            "shadow_model_decision": "TAKE",
+            "hybrid_veto_threshold": 0.70,
+            "hybrid_veto_decision": "VETO",
+            "hybrid_veto_reason": "score_below_threshold",
+            "resolution_status": None,
+            "resolved_pnl": None,
+            "resolved_at_utc": None,
+        })
+
+        updated = botmod.backfill_hybrid_veto_labels(bot, bot.store.load_runtime_state()["opportunities"])
+        self.assertEqual(updated, 1)
+
+        with bot.store._connect() as conn:
+            row = dict(conn.execute("SELECT * FROM opportunities WHERE event_id = 'hist-veto-threshold'").fetchone())
+
+        self.assertEqual(row["hybrid_veto_threshold"], botmod.HYBRID_VETO_THRESHOLD)
+        self.assertEqual(row["hybrid_veto_decision"], "ALLOW")
+        self.assertEqual(row["hybrid_veto_reason"], "score_above_threshold")
 
     def test_resolve_position_snapshot_marks_win_and_updates_trade_log(self):
         bot = botmod.PaperBot()

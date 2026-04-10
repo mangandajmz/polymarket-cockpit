@@ -68,7 +68,7 @@ Every evaluated trade is recorded to a SQLite database (`bot_state.db` via `stat
 
 **Replay and evaluation** (`opportunity_replay.py`, `daily_evaluation_report.py`): the bot now supports event-driven replay, threshold sweeps, Bayesian comparisons, calibration diagnostics, and automatic 1-day / 7-day evaluation snapshots shown in the dashboard.
 
-**Hybrid veto tracking**: the current rollout candidate is a paper-only hybrid rule where the heuristic still decides what gets copied, while a model threshold (`p >= 0.70`) is tracked as a hypothetical ALLOW / VETO filter. This is logged for analysis only; it does not currently block execution.
+**Hybrid veto tracking**: the current rollout candidate is a paper-only hybrid rule where the heuristic still decides what gets copied, while a model threshold (`p >= 0.65` by default) is tracked as a hypothetical ALLOW / VETO filter. This is logged for analysis only; it does not currently block execution.
 
 ### 7. Trader blocklist
 `TRADER_BLOCKLIST` in `dynamic_watchlist.py` permanently excludes specific traders from the watchlist regardless of their current win rate or PNL ranking. Entries are matched by lowercase name. Use this to exclude traders whose historical performance is misleading or who have been manually reviewed and rejected.
@@ -95,6 +95,7 @@ All values are set at the top of `paper_trading_bot.py`.
 | `MAX_ENTRY_PRICE` | `0.75` | Skip trades priced above this — poor risk/reward near certainty |
 | `MAX_DEPLOY_PCT` | `0.60` | Maximum fraction of bankroll deployed in open positions simultaneously |
 | `MAX_DAILY_DEPLOY_PER_TRADER` | `60.0` | Maximum USD deployed to a single trader per calendar day |
+| `HYBRID_VETO_THRESHOLD` | `0.65` | Model score needed for a copied heuristic trade to be paper-labeled `ALLOW` |
 | `POLL_INTERVAL` | `30` | Seconds between trade polling cycles |
 
 ---
@@ -105,7 +106,7 @@ The current deployed behavior is intentionally staged:
 
 - **Live paper execution**: the rule-based heuristic still decides whether a trade is copied.
 - **Shadow analytics**: Bayesian trader scores, model probabilities, replay results, and threshold sweeps are logged and shown in the dashboard.
-- **Paper-only hybrid veto**: each copied heuristic trade is tagged with whether a `p >= 0.70` model filter would have allowed or vetoed it, but this does not yet affect execution.
+- **Paper-only hybrid veto**: each copied heuristic trade is tagged with whether a `p >= 0.65` model filter would have allowed or vetoed it, but this does not yet affect execution.
 
 This means the dashboard may show a model or hybrid policy outperforming the current heuristic in replay before any live behavior changes. That is expected and is the purpose of the research stack.
 
