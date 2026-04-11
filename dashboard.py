@@ -46,6 +46,8 @@ HYBRID_VETO_THRESHOLD = float(os.getenv("HYBRID_VETO_THRESHOLD", "0.65"))
 MIN_WIN_RATE      = 60.0  # % threshold — must match paper_trading_bot.py
 OPPORTUNITY_LEDGER_LIMIT = int(os.getenv("OPPORTUNITY_LEDGER_LIMIT", "2500"))
 VETO_COMPARISON_THRESHOLDS = (0.55, 0.60, 0.65, 0.70)
+VETO_TRADER_MIN_RESOLVED = int(os.getenv("VETO_TRADER_MIN_RESOLVED", "3"))
+VETO_TRADER_EDGE_ALERT = float(os.getenv("VETO_TRADER_EDGE_ALERT", "10.0"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 DATA_API  = "https://data-api.polymarket.com"
@@ -593,8 +595,14 @@ def summarize_hybrid_veto(copied_shadow: pd.DataFrame) -> dict:
             "ALLOW": int(len(trader_allow)),
             "VETO": int(len(trader_veto)),
             "Veto Rate": (len(trader_veto) / len(grp) * 100.0) if len(grp) else 0.0,
+            "ALLOW Resolved": int(len(trader_allow_resolved)),
+            "VETO Resolved": int(len(trader_veto_resolved)),
+            "Resolved": int(len(trader_allow_resolved) + len(trader_veto_resolved)),
             "ALLOW WR": trader_allow_resolved["is_win"].mean() * 100.0 if not trader_allow_resolved.empty else None,
             "VETO WR": trader_veto_resolved["is_win"].mean() * 100.0 if not trader_veto_resolved.empty else None,
+            "WR Gap": (
+                trader_allow_resolved["is_win"].mean() * 100.0 - trader_veto_resolved["is_win"].mean() * 100.0
+            ) if not trader_allow_resolved.empty and not trader_veto_resolved.empty else None,
             "ALLOW PnL": float(trader_allow_resolved["resolved_pnl"].sum()) if not trader_allow_resolved.empty else 0.0,
             "VETO PnL": float(trader_veto_resolved["resolved_pnl"].sum()) if not trader_veto_resolved.empty else 0.0,
             "Net Veto Edge": -(float(trader_veto_resolved["resolved_pnl"].sum()) if not trader_veto_resolved.empty else 0.0),
@@ -639,6 +647,83 @@ def summarize_hybrid_veto(copied_shadow: pd.DataFrame) -> dict:
         "recent_vetoes": recent_vetoes,
         "curve": curve,
         "reason_table": reason_table,
+    }
+
+
+def summarize_trader_veto_learning(trader_table: pd.DataFrame) -> dict:
+    if trader_table.empty:
+        return {
+            "summary": {},
+            "recommendations": pd.DataFrame(),
+            "top_helped": None,
+            "top_hurt": None,
+        }
+
+    working = trader_table.copy()
+    eligible = working[working["Resolved"] >= VETO_TRADER_MIN_RESOLVED].copy()
+    if eligible.empty:
+        return {
+            "summary": {
+                "eligible_traders": 0,
+                "positive_traders": 0,
+                "negative_traders": 0,
+            },
+            "recommendations": pd.DataFrame(),
+            "top_helped": None,
+            "top_hurt": None,
+        }
+
+    def _confidence(resolved: int) -> str:
+        if resolved >= 6:
+            return "Higher"
+        if resolved >= 4:
+            return "Medium"
+        return "Early"
+
+    def _recommendation(edge: float, wr_gap: float | None) -> str:
+        if edge >= VETO_TRADER_EDGE_ALERT and (wr_gap is None or wr_gap >= 0):
+            return "Lean In"
+        if edge <= -VETO_TRADER_EDGE_ALERT:
+            return "Avoid"
+        if edge > 0:
+            return "Watch Positive"
+        return "Watch Risk"
+
+    recommendations = eligible.copy()
+    recommendations["Confidence"] = recommendations["Resolved"].map(_confidence)
+    recommendations["Recommendation"] = recommendations.apply(
+        lambda row: _recommendation(float(row["Net Veto Edge"]), row["WR Gap"] if pd.notna(row["WR Gap"]) else None),
+        axis=1,
+    )
+    recommendations = recommendations.sort_values(
+        ["Net Veto Edge", "Resolved", "VETO"],
+        ascending=[False, False, False],
+    )
+
+    top_helped = recommendations.iloc[0].to_dict() if not recommendations.empty else None
+    top_hurt = recommendations.sort_values(
+        ["Net Veto Edge", "Resolved"],
+        ascending=[True, False],
+    ).iloc[0].to_dict() if not recommendations.empty else None
+
+    display = recommendations[[
+        "Trader", "Resolved", "Veto Rate", "ALLOW WR", "VETO WR", "WR Gap",
+        "Net Veto Edge", "Confidence", "Recommendation"
+    ]].copy()
+    display["Veto Rate"] = display["Veto Rate"].map(lambda v: f"{v:.1f}%")
+    for col in ["ALLOW WR", "VETO WR", "WR Gap"]:
+        display[col] = display[col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "n/a")
+    display["Net Veto Edge"] = display["Net Veto Edge"].map(lambda v: f"${v:+.2f}")
+
+    return {
+        "summary": {
+            "eligible_traders": int(len(recommendations)),
+            "positive_traders": int((recommendations["Net Veto Edge"] > 0).sum()),
+            "negative_traders": int((recommendations["Net Veto Edge"] < 0).sum()),
+        },
+        "recommendations": display,
+        "top_helped": top_helped,
+        "top_hurt": top_hurt,
     }
 
 
@@ -1593,6 +1678,7 @@ with tab_shadow:
         copied_shadow = copied_opps.copy()
         veto_analysis = summarize_hybrid_veto(copied_shadow) if not copied_shadow.empty else {}
         veto_thresholds = summarize_veto_threshold_comparison(copied_shadow) if not copied_shadow.empty else {}
+        trader_learning = summarize_trader_veto_learning(veto_analysis["trader_table"]) if veto_analysis else {}
         if not copied_shadow.empty:
             summary = veto_analysis["summary"]
             st.markdown("**Hybrid Veto Behavior**")
@@ -1874,6 +1960,41 @@ with tab_shadow:
                 )
                 st.plotly_chart(fig_veto, width="stretch")
 
+            st.markdown("**Trader Veto Learning**")
+            learning_summary = trader_learning.get("summary", {}) if isinstance(trader_learning, dict) else {}
+            top_helped = trader_learning.get("top_helped") if isinstance(trader_learning, dict) else None
+            top_hurt = trader_learning.get("top_hurt") if isinstance(trader_learning, dict) else None
+            learn_cols = st.columns(4)
+            learn_cols[0].metric(
+                "Top Helped Trader",
+                top_helped.get("Trader", "n/a") if top_helped else "n/a",
+                delta=f"${float(top_helped.get('Net Veto Edge', 0.0)):+.2f}" if top_helped else None,
+            )
+            learn_cols[1].metric(
+                "Top Hurt Trader",
+                top_hurt.get("Trader", "n/a") if top_hurt else "n/a",
+                delta=f"${float(top_hurt.get('Net Veto Edge', 0.0)):+.2f}" if top_hurt else None,
+            )
+            learn_cols[2].metric("Traders With Evidence", int(learning_summary.get("eligible_traders", 0)))
+            learn_cols[3].metric(
+                "Net Positive Traders",
+                int(learning_summary.get("positive_traders", 0)),
+                delta=f"{int(learning_summary.get('negative_traders', 0))} negative",
+            )
+
+            recommendations = trader_learning.get("recommendations", pd.DataFrame()).copy() if isinstance(trader_learning, dict) else pd.DataFrame()
+            if recommendations.empty:
+                st.caption(
+                    f"Trader-level veto learning is still early. A trader needs at least `{VETO_TRADER_MIN_RESOLVED}` resolved copied trades "
+                    "before this section makes a recommendation."
+                )
+            else:
+                st.caption(
+                    "This section is for self-improvement, not automation: it highlights where the veto is consistently helping or hurting "
+                    "once there is enough resolved history to matter."
+                )
+                st.dataframe(recommendations.head(12), width="stretch", hide_index=True)
+
             veto_left, veto_right = st.columns(2)
             with veto_left:
                 st.markdown("**Veto By Trader**")
@@ -1881,7 +2002,7 @@ with tab_shadow:
                 if trader_table.empty:
                     st.info("No trader-level veto data yet.")
                 else:
-                    for col in ["Veto Rate", "ALLOW WR", "VETO WR"]:
+                    for col in ["Veto Rate", "ALLOW WR", "VETO WR", "WR Gap"]:
                         trader_table[col] = trader_table[col].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "n/a")
                     for col in ["ALLOW PnL", "VETO PnL", "Net Veto Edge"]:
                         trader_table[col] = trader_table[col].map(lambda v: f"${v:+.2f}")
