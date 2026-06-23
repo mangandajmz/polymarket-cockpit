@@ -1,13 +1,17 @@
-# ── Credentials & secrets ─────────────────────────────────────────────────────
+# Credentials and secrets
 .env
 .github-secrets.env
 
-# ── Live data (stays on VPS, never in repo) ───────────────────────────────────
+# Local runtime data
 paper_trades.csv
 live_trades.csv
 bot.log
+bot_state.db
+bot_state.db-*
+seen_hashes.json
+watchlist_cache.json
 
-# ── Python ────────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -18,14 +22,15 @@ dist/
 build/
 .eggs/
 pip-wheel-metadata/
+.pytest_cache/
 
-# ── Virtual environments ──────────────────────────────────────────────────────
+# Virtual environments
 venv/
 .venv/
 env/
 ENV/
 
-# ── OS / editor junk ──────────────────────────────────────────────────────────
+# OS / editor junk
 .DS_Store
 Thumbs.db
 *.swp

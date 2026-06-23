@@ -1,8 +1,8 @@
 """
-Polymarket Copy Trading Bot — Streamlit Dashboard (Enhanced)
-=============================================================
-Run on VPS:
-  streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0
+Polymarket Copy Trading Bot - Local Streamlit Dashboard
+=======================================================
+Run locally:
+  streamlit run dashboard.py --server.port 8501 --server.address 127.0.0.1
 
 Set .env variables before running (see .env.example).
 """
@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Config from .env ──────────────────────────────────────────────────────────
-PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "changeme")
+PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "").strip()
 # Default paths are absolute relative to this file so the dashboard works
 # regardless of which directory Streamlit is launched from.
 _HERE        = Path(__file__).parent
@@ -36,7 +36,7 @@ LOG_PATH     = Path(os.getenv("LOG_PATH", str(_HERE / "bot.log")))
 STATE_DB_PATH = Path(os.getenv("STATE_DB_PATH", str(_HERE / "bot_state.db")))
 REFRESH_MS   = int(os.getenv("REFRESH_MS", "30000"))
 # Prefer DAILY_LOSS_CAP (new name); fall back to DAILY_CAP / DAILY_BUDGET for
-# VPS .env files that haven't been updated yet.
+# Older local .env files that have not been updated yet.
 DAILY_LOSS_CAP = float(
     os.getenv("DAILY_LOSS_CAP") or os.getenv("DAILY_CAP") or os.getenv("DAILY_BUDGET") or "60.0"
 )
@@ -145,6 +145,9 @@ except ImportError:
 
 # ── Password gate ─────────────────────────────────────────────────────────────
 def check_password() -> bool:
+    if not PASSWORD or PASSWORD == "replace_with_a_local_password":
+        st.error("Set DASHBOARD_PASSWORD in .env before opening the dashboard.")
+        st.stop()
     if st.session_state.get("authenticated"):
         return True
     _, mid, _ = st.columns([1, 2, 1])

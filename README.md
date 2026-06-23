@@ -1,364 +1,258 @@
 # Polymarket Copy Trading Bot
 
-A paper-trading (and eventually live) copy-trading bot for [Polymarket](https://polymarket.com).
-It automatically discovers high-performing traders, mirrors their qualifying BUY trades at a conviction-scaled size, and logs both fills and opportunity-level research data to SQLite.
-A Streamlit dashboard lets you monitor performance from any browser.
+A local-first paper-trading research cockpit for [Polymarket](https://polymarket.com).
+It discovers high-performing traders, simulates copying qualifying BUY trades, records every observed opportunity to SQLite, and provides local analysis tools for improving the strategy.
 
-> **Current mode: PAPER TRADING — no real money, no wallet connected.**
-
----
-
-## Overview
-
-The bot watches the top monthly-PNL traders on Polymarket in real time. When a qualifying whale makes a large BUY, the bot copies it immediately at a conviction-scaled size. All simulated trades, PnL, and market outcomes are logged to `paper_trades.csv`, while every observed candidate trade is also recorded to `bot_state.db` as an opportunity record for offline analysis, shadow modeling, replay, and dashboard diagnostics.
+> Current mode: PAPER TRADING only. No wallet, no private key, no real-money execution.
 
 ---
 
-## How it works
+## Local-First Posture
 
-### 1. Whale discovery (every 6 hours)
-The `WatchlistManager` (`dynamic_watchlist.py`) fetches the top 30 traders from Polymarket's monthly PNL leaderboard, estimates each trader's win rate by sampling their last 10 positions (priced via the Gamma API), and keeps the first 5 traders that pass the 60% win-rate threshold. Qualifying addresses are cached permanently in `watchlist_cache.json` so open positions can still resolve even after a trader drops off the leaderboard.
+This project is intentionally designed to run on your own machine, not as a public VPS service.
 
-### 2. Trade polling (every 30 seconds)
-`poll_once()` fetches the last 50 trades for each watched trader. Any trade timestamped within the last 5 minutes is passed to `process_trade()`.
+The goals are:
+
+- Keep strategy data, logs, trader watchlists, and simulated PnL private.
+- Avoid exposing Streamlit or runtime state to the internet.
+- Preserve a clean paper-trading and research loop before any live-money design exists.
+- Make local operation simple enough that cloud deployment is unnecessary for the current stage.
+
+Do not bind the dashboard to `0.0.0.0`, open firewall ports, or deploy this repo as a public web service unless a future architecture review explicitly approves that change.
+
+---
+
+## What It Does
+
+The bot watches top monthly-PNL Polymarket traders, estimates trader quality, polls their recent trades, and paper-copies qualifying BUY trades using conviction-scaled sizing. Every candidate trade is logged as an opportunity, even when skipped, so the strategy can be replayed and evaluated offline.
+
+High-level loop:
+
+```text
+Polymarket APIs
+    |
+    v
+dynamic_watchlist.py
+    |
+    v
+paper_trading_bot.py
+    |-- filters + sizing
+    |-- simulated positions
+    |-- resolution loop
+    |
+    v
+state_store.py / bot_state.db
+    |
+    +--> dashboard.py
+    +--> opportunity_replay.py
+    +--> daily_evaluation_report.py
+    +--> health_check.py
+```
+
+---
+
+## Core Use Cases
+
+- Run a private local paper-trading session.
+- See which whale trades would be copied or skipped.
+- Inspect why each opportunity was copied, skipped, veto-labeled, or resolved.
+- Review open simulated positions and unrealized PnL.
+- Replay historical opportunities before changing thresholds.
+- Compare heuristic rules against Bayesian ranking and shadow-model scores.
+- Keep all operational state on your own machine.
+
+---
+
+## User Stories
+
+- As the operator, I can start the bot locally and know it is paper-only.
+- As the operator, I can open a localhost dashboard without exposing it to the internet.
+- As the operator, I can stop and restart the bot without losing paper-trade state.
+- As the operator, I can see every decision: copied, skipped, and why.
+- As the operator, I can compare current heuristic performance against shadow-model behavior.
+- As the operator, I can run reports before making strategy changes.
+- As the operator, I can keep strategy data, logs, and runtime state private.
+
+---
+
+## How It Works
+
+### 1. Whale discovery
+
+`WatchlistManager` in `dynamic_watchlist.py` fetches top monthly-PNL traders, estimates each trader's win rate from recent positions, and keeps the top qualifying traders. Addresses are cached locally in `watchlist_cache.json` so prior traders can still be referenced for open position resolution.
+
+### 2. Trade polling
+
+`poll_once()` fetches recent trades for watched traders. Recent trade events are passed to `process_trade()`.
 
 ### 3. Trade filtering
-Each candidate trade must pass every filter before being copied:
 
-| Filter | Value | What it prevents |
-|---|---|---|
-| Side | BUY only | Copying exits / redemptions |
-| Age | ≤ 5 minutes | Stale or replayed trades |
-| Whale size | ≥ $1,000 | Low-conviction noise trades |
-| Entry price | ≤ 0.75 | Near-certainty bets with poor risk/reward |
-| Market type | No crypto / futures keywords | Bitcoin/ETH bets and championship futures |
-| Trader win rate | ≥ 60% after 10 resolved trades | Copying a trader mid-slump |
-| Daily loss limit | ≤ 2 losses/trader/day | Tilt-following a trader on a bad day |
-| Daily cap | ≤ $60/day total | Runaway spending in a volatile session |
-| Bankroll deployment | ≤ 60% simultaneously | Over-concentration in open positions |
+A candidate trade must pass all filters before being paper-copied:
+
+| Filter | Default | Purpose |
+|---|---:|---|
+| Side | BUY only | Avoid copying exits and redemptions |
+| Age | <= 5 minutes | Avoid stale/replayed trades |
+| Whale size | >= $1,000 | Avoid low-conviction noise |
+| Entry price | <= 0.75 | Avoid poor risk/reward near certainty |
+| Market type | no crypto/spread/futures keywords | Avoid unwanted market classes |
+| Trader win rate | >= 60% after 10 resolved trades | Avoid underperforming traders |
+| Trader daily losses | <= 2 losses/day | Avoid following a trader during a bad day |
+| Trader daily deploy | <= $60/day | Avoid over-concentration in one trader |
+| Bankroll deployment | <= 60% open exposure | Avoid over-deploying simulated bankroll |
 
 ### 4. Conviction sizing
-When a trade passes all filters, the bot calculates a conviction score:
 
-```
+```text
 conviction = whale_size_usdc / median(last_30_whale_trade_sizes)
-our_bet    = min(BASE_BET × conviction, MAX_BET, daily_remaining)
+our_bet    = min(BASE_BET * conviction * performance_multiplier, MAX_BET, bankroll * 0.035)
 ```
 
-A trade 2× the median → `$20` bet. A trade 3× the median → `$30` (capped by `MAX_BET`). This means the bot naturally bets more when a whale makes an unusually large move.
+Sizing is still paper-only. It records what the bot would have copied, not an actual order.
 
-### 5. Resolution (every 60 seconds)
-`resolution_loop()` checks the Gamma API for every open position. A market is considered settled when `closed == True` and the winning outcome is priced ≥ 0.99. On settlement, PnL is calculated, the position is marked WIN or LOSS, and the CSV is updated.
+### 5. Resolution
 
-The resolution loop also auto-closes positions in three edge-case scenarios:
+The resolution loop checks CLOB market state by condition ID. When a market is closed, the current token price is used to mark the simulated position as WIN or LOSS and compute PnL.
+
+The loop also handles stale or unresolved positions with guardrails:
 
 | Trigger | Threshold | Action |
-|---|---|---|
-| Stale flag | Open > 30 days | Logged as `STALE` warning |
-| Zero-price | Price ≈ $0 for ≥ 24 hours | Force-closed as LOSS |
-| Max age | Open ≥ 72 hours regardless of price | Force-closed at current price |
+|---|---:|---|
+| Stale flag | > 30 days | Log warning |
+| Zero-price | price near 0 for > 24 hours | Force-close as LOSS |
+| Max age | > 72 hours | Force-close at current price |
 
-### 6. Analytical layer (opportunity logging + Bayesian ranking + shadow model)
+### 6. Research layer
 
-Every evaluated trade is recorded to a SQLite database (`bot_state.db` via `state_store.py`) as an *opportunity record*, regardless of whether it is copied. This enables offline analysis and model training.
-
-**Bayesian trader ranking** (`bayesian_stats.py`): uses a Beta-Binomial model with a pooled empirical prior to rank traders by posterior win-rate, shrinking estimates for traders with few resolved trades toward the group mean.
-
-**Shadow model** (`shadow_model.py`): an online logistic regression that trains on each resolved trade and produces a probability score (`shadow_model_score`) for whether a candidate trade will be profitable. The score is logged but does not gate live trade execution.
-
-**Replay and evaluation** (`opportunity_replay.py`, `daily_evaluation_report.py`): the bot now supports event-driven replay, threshold sweeps, Bayesian comparisons, calibration diagnostics, and automatic 1-day / 7-day evaluation snapshots shown in the dashboard.
-
-**Hybrid veto tracking**: the current rollout candidate is a paper-only hybrid rule where the heuristic still decides what gets copied, while a model threshold (`p >= 0.65` by default) is tracked as a hypothetical ALLOW / VETO filter. This is logged for analysis only; it does not currently block execution.
-
-### 7. Trader blocklist
-`TRADER_BLOCKLIST` in `dynamic_watchlist.py` permanently excludes specific traders from the watchlist regardless of their current win rate or PNL ranking. Entries are matched by lowercase name. Use this to exclude traders whose historical performance is misleading or who have been manually reviewed and rejected.
+- `state_store.py`: SQLite persistence for fills, positions, opportunities, daily risk, trader stats, and runtime health.
+- `bayesian_stats.py`: Beta-Binomial trader ranking.
+- `shadow_model.py`: Online logistic scoring for candidate trades.
+- `opportunity_replay.py`: Offline replay and threshold comparison.
+- `daily_evaluation_report.py`: Daily and rolling evaluation snapshots.
+- `dashboard.py`: Local Streamlit cockpit for monitoring and analysis.
 
 ---
 
 ## Configuration
 
-All values are set at the top of `paper_trading_bot.py`.
+Most strategy constants live near the top of `paper_trading_bot.py`. Environment variables in `.env` are used for local file paths and selected runtime knobs.
 
 | Parameter | Default | Description |
-|---|---|---|
-| `MIN_WHALE_SIZE` | `1000.0` | Minimum USDC size of a whale trade to copy |
-| `BASE_BET` | `10.0` | Base bet size in USD; scales with conviction |
-| `MAX_BET` | `30.0` | Hard cap on a single trade in USD |
-| `DAILY_LOSS_CAP` | `60.0` | Maximum net loss (gross losses − gross wins) per calendar day before new trades are blocked |
-| `STARTING_BANKROLL` | `300.0` | Starting bankroll used for bankroll scaling calculations |
-| `MAX_DAILY_LOSSES_PER_TRADER` | `2` | Max resolved losses from one trader per day before skipping them |
-| `COPY_RATIO` | `0.10` | Legacy ratio (not used for sizing; kept for reference) |
-| `WATCHLIST_TOP_N` | `5` | Number of traders to watch simultaneously |
-| `WATCHLIST_MIN_WR` | `60.0` | Minimum win rate (%) to qualify for the watchlist |
-| `WATCHLIST_REFRESH_H` | `6` | Hours between watchlist refreshes |
-| `MIN_WIN_RATE` | `60.0` | Per-trader win rate (%) below which trades are skipped |
-| `MAX_ENTRY_PRICE` | `0.75` | Skip trades priced above this — poor risk/reward near certainty |
-| `MAX_DEPLOY_PCT` | `0.60` | Maximum fraction of bankroll deployed in open positions simultaneously |
-| `MAX_DAILY_DEPLOY_PER_TRADER` | `60.0` | Maximum USD deployed to a single trader per calendar day |
-| `HYBRID_VETO_THRESHOLD` | `0.65` | Model score needed for a copied heuristic trade to be paper-labeled `ALLOW` |
-| `POLL_INTERVAL` | `30` | Seconds between trade polling cycles |
+|---|---:|---|
+| `MIN_WHALE_SIZE` | `1000.0` | Minimum whale USDC size to copy |
+| `BASE_BET` | `10.0` | Base simulated bet size |
+| `MAX_BET` | `30.0` | Max simulated bet per trade |
+| `DAILY_LOSS_CAP` | `60.0` | Net resolved loss cap before new trades are blocked |
+| `STARTING_BANKROLL` | `300.0` | Simulated bankroll for risk calculations |
+| `MAX_DAILY_LOSSES_PER_TRADER` | `2` | Per-trader daily loss limit |
+| `MAX_DAILY_DEPLOY_PER_TRADER` | `60.0` | Per-trader daily deployment limit |
+| `MAX_ENTRY_PRICE` | `0.75` | Skip entries above this price |
+| `MAX_DEPLOY_PCT` | `0.60` | Max open deployment as fraction of bankroll |
+| `HYBRID_VETO_THRESHOLD` | `0.65` | Shadow veto threshold for copied-trade labels |
+| `POLL_INTERVAL` | `30` | Seconds between polling cycles |
+
+Note: `DAILY_LOSS_CAP` is a net resolved loss cap, not a total daily spend cap.
 
 ---
 
-## What is live vs shadow
+## Local Setup
 
-The current deployed behavior is intentionally staged:
+Tested with Python 3.11.
 
-- **Live paper execution**: the rule-based heuristic still decides whether a trade is copied.
-- **Shadow analytics**: Bayesian trader scores, model probabilities, replay results, and threshold sweeps are logged and shown in the dashboard.
-- **Paper-only hybrid veto**: each copied heuristic trade is tagged with whether a `p >= 0.65` model filter would have allowed or vetoed it, but this does not yet affect execution.
-
-This means the dashboard may show a model or hybrid policy outperforming the current heuristic in replay before any live behavior changes. That is expected and is the purpose of the research stack.
-
----
-
-## Bankroll scaling
-
-As the simulated bankroll grows, bet sizing should grow proportionally. The bot uses a semi-automatic scaling system — when `STARTING_BANKROLL + closed_pnl` crosses a threshold for the first time, the bot prints a prompt in the terminal and waits for confirmation before applying the new settings.
-
-| Bankroll | BASE_BET | MAX_BET | DAILY_LOSS_CAP |
-|---|---|---|---|
-| $150 | $5 | $15 | $30 |
-| $300 | $10 | $30 | $60 |
-| $500 | $15 | $50 | $100 |
-| $1,000 | $25 | $100 | $200 |
-| $2,500 | $40 | $150 | $300 |
-
-**How it works:**
-- After every resolved trade, `_check_bankroll_scale()` evaluates the current bankroll.
-- If a threshold is crossed for the first time this session, the bot logs `SCALE UP AVAILABLE` to `bot.log` and prints the suggested config.
-- You see: `Apply new scaling? (y/n):`
-- Press `y` to apply immediately (updates `BASE_BET`, `MAX_BET`, `DAILY_LOSS_CAP` in memory).
-- Press `n` to decline — that threshold will not prompt again this session.
-- Each threshold only prompts once per session (`bot.milestones_reached` tracks this).
-
-> **Note:** Scaling is applied to the running process only. To make it permanent, update the values in `paper_trading_bot.py` and redeploy.
-
----
-
-## Risk management
-
-The bot has three independent capital protection mechanisms:
-
-### 1. Minimum whale size (`MIN_WHALE_SIZE = $1,000`)
-Only copy trades where the whale committed at least $1,000 USDC. This filters out casual, low-conviction trades and keeps the signal-to-noise ratio high. Raising this value makes the bot more selective; lowering it increases trade frequency but reduces average quality.
-
-### 2. Per-trader daily loss limit (`MAX_DAILY_LOSSES_PER_TRADER = 2`)
-If a specific whale has already produced 2 resolved losses for us today, all further trades from that trader are skipped until midnight UTC. This prevents the bot from following a trader through a bad day — when a whale is on a losing streak, continuing to copy them compounds losses faster than the sizing system can compensate.
-
-### 3. Daily net loss cap (`DAILY_LOSS_CAP = $60`)
-The bot tracks today's gross losses and gross wins from resolved trades. When `gross_losses − gross_wins >= DAILY_LOSS_CAP`, all new trades are blocked until midnight UTC. The key difference from a spend cap: **winning trades reduce the effective cap usage**. On a profitable day the bot can keep placing trades even if gross losses alone exceed $60, as long as wins are offsetting them. Both counters reset at midnight UTC and are restored from the CSV on restart so the cap survives bot restarts.
-
----
-
-## Phase 2 auto-scaling
-
-When `STARTING_BANKROLL + closed_pnl` exceeds `PHASE2_BANKROLL_THRESHOLD` (`$500`), the following config upgrades are suggested:
-
-```python
-WATCHLIST_TOP_N   = 10     # watch more traders
-WATCHLIST_MIN_WR  = 40.0   # relax win-rate entry threshold
-MIN_WHALE_SIZE    = 100.0  # copy smaller whale trades for more signals
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Phase 1 settings are conservative for a small bankroll — fewer, higher-quality signals only. Phase 2 expands the signal universe once there is enough capital to absorb a higher variance of trade quality.
+Edit `.env` if you want custom local paths or dashboard settings.
 
 ---
 
-## Going live — checklist
+## Running Locally
 
-Before switching from paper trading to real money:
+Start the paper bot:
 
-- [ ] **Conviction median is stable**: Check that `bot.whale_sizes` has at least 30 entries (visible in bot logs). The median needs enough history to be meaningful, otherwise early trades use a single-sample median which inflates conviction scores.
-- [ ] **Set `STARTING_BANKROLL`** to your actual deposit amount in USDC.
-- [ ] **Verify `DAILY_LOSS_CAP`** is 15–20% of your bankroll. At $300 bankroll the default $60 cap is 20%. Adjust down if you prefer slower drawdown.
-- [ ] **Run paper mode for ≥ 48 hours** and review `paper_trades.csv` — check that all whale sizes are above $1,000, conviction scores look reasonable (0.5–3.0 range is normal), and no single trader is dominating losses.
-- [ ] **Review the Shadow tab** — confirm model-only remains shadow-only, check the 7-day evaluation card, and compare `ALLOW` vs `VETO` win rates for the paper-only hybrid veto layer.
-- [ ] **Audit the last 20 resolved trades** for market quality — are they politics/sports/finance or noise? Tighten `CRYPTO_KW` if unexpected market types are slipping through.
-- [ ] **Connect wallet and set `LIVE_MODE = True`** on the `live` branch only. Never merge live-mode code to `main`.
-- [ ] Start with `DAILY_LOSS_CAP` at 50% of the paper-mode value for the first 48 hours live.
-
----
-
-## Repository layout
-
+```powershell
+python paper_trading_bot.py
 ```
+
+In a second terminal, start the local dashboard:
+
+```powershell
+python -m streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501
+```
+
+Open the dashboard at:
+
+```text
+http://127.0.0.1:8501
+```
+
+Stop either process with `Ctrl+C`.
+
+---
+
+## Local Monitoring
+
+| Task | Command |
+|---|---|
+| Health summary | `python health_check.py` |
+| Replay opportunities | `python opportunity_replay.py --db bot_state.db` |
+| Daily evaluation | `python daily_evaluation_report.py --db bot_state.db --days 7` |
+| Force-resolve stale position | `python force_resolve.py --help` |
+| Run tests | `python -m pytest -q` |
+
+Runtime files are local-only and ignored by git:
+
+- `bot_state.db`
+- `bot_state.db-*`
+- `paper_trades.csv`
+- `live_trades.csv`
+- `bot.log`
+- `seen_hashes.json`
+- `watchlist_cache.json`
+
+---
+
+## Repository Layout
+
+```text
 .
-├── paper_trading_bot.py      # Copy-trading engine
-├── dynamic_watchlist.py      # Whale discovery and watchlist management
-├── backtest_configs.py       # Backtester for comparing watchlist configs
-├── dashboard.py              # Streamlit monitoring dashboard
-├── api_client.py             # HTTP client with retries and exponential backoff
-├── bayesian_stats.py         # Beta-Binomial posterior ranking for traders
-├── shadow_model.py           # Online logistic regression trade scorer (shadow mode)
-├── state_store.py            # SQLite-backed state persistence (opportunities, daily risk)
-├── opportunity_replay.py     # CLI tool to replay and analyse opportunity records offline
-├── daily_evaluation_report.py# Daily / rolling evaluation summaries from opportunity data
-├── category_utils.py         # Market category classification (Sports, Politics, Finance…)
-├── health_check.py           # One-shot health summary printed to stdout
-├── fix_pnl_history.py        # Utility to repair malformed PnL records in the CSV
-├── force_resolve.py          # Utility to manually force-close a stale open position
-├── test_api_client.py        # Tests for HTTP client
-├── test_bayesian_stats.py    # Tests for Bayesian statistics module
-├── test_bot_robustness.py    # Integration-style robustness tests for the bot
-├── test_category_utils.py    # Tests for market category classifier
-├── test_opportunity_replay.py# Tests for opportunity replay logic
-├── test_shadow_model.py      # Tests for model numeric stability and finite scoring
-├── test_watchlist_hardening.py# Tests for watchlist edge-case hardening
-├── requirements.txt          # Python dependencies
-├── deploy.sh                 # VPS deploy / restart script
-├── .env.example              # Environment variable template
-└── .gitignore
-```
-
-> `paper_trades.csv`, `bot.log`, `watchlist_cache.json`, and `bot_state.db` are **excluded from git** — they live on the VPS only.
-
----
-
-## Fresh VPS deployment
-
-Tested on Ubuntu 22.04 / 24.04 with Python 3.11+.
-
-### 1. Provision the server
-
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y python3 python3-pip python3-venv git
-```
-
-### 2. Clone the repo
-
-```bash
-git clone https://github.com/mangandajmz/polymarket-bot.git
-cd polymarket-bot
-```
-
-### 3. Install dependencies
-
-```bash
-pip3 install -r requirements.txt --no-cache-dir
-```
-
-### 4. Configure environment
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Set at minimum:
-
-```env
-DASHBOARD_PASSWORD=your_strong_password_here
-CSV_PATH=/home/ubuntu/polymarket-bot/paper_trades.csv
-LOG_PATH=/home/ubuntu/polymarket-bot/bot.log
-STATE_DB_PATH=/home/ubuntu/polymarket-bot/bot_state.db
-DAILY_LOSS_CAP=60.0
-STARTING_BANKROLL=300.0
-BOT_MODE=PAPER
-```
-
-### 5. Create systemd service for the bot
-
-```bash
-sudo nano /etc/systemd/system/polymarket-bot.service
-```
-
-```ini
-[Unit]
-Description=Polymarket Copy Trading Bot
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/polymarket-bot
-ExecStart=/usr/bin/python3 paper_trading_bot.py
-Restart=on-failure
-RestartSec=10
-StandardOutput=append:/home/ubuntu/polymarket-bot/bot.log
-StandardError=append:/home/ubuntu/polymarket-bot/bot.log
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable polymarket-bot
-sudo systemctl start polymarket-bot
-sudo systemctl status polymarket-bot
-```
-
-### 6. Create systemd service for the dashboard
-
-```bash
-sudo nano /etc/systemd/system/polymarket-dash.service
-```
-
-```ini
-[Unit]
-Description=Polymarket Dashboard
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/polymarket-bot
-ExecStart=/usr/bin/python3 -m streamlit run dashboard.py \
-    --server.port 8502 \
-    --server.address 0.0.0.0 \
-    --server.headless true
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable polymarket-dash
-sudo systemctl start polymarket-dash
-```
-
-### 7. Open the firewall
-
-```bash
-sudo ufw allow 8502/tcp
-```
-
-Dashboard is now live at: **`http://YOUR_VPS_IP:8502`**
-
----
-
-## Updating the bot
-
-```bash
-ssh ubuntu@YOUR_VPS_IP "cd /home/ubuntu/polymarket-bot && bash deploy.sh"
+|-- paper_trading_bot.py       # Paper-trading engine
+|-- dynamic_watchlist.py       # Trader discovery and watchlist management
+|-- dashboard.py               # Local Streamlit monitoring cockpit
+|-- state_store.py             # SQLite-backed state persistence
+|-- api_client.py              # HTTP client with retries/backoff
+|-- bayesian_stats.py          # Beta-Binomial trader ranking
+|-- shadow_model.py            # Online logistic trade scorer
+|-- opportunity_replay.py      # Offline replay/analysis CLI
+|-- daily_evaluation_report.py # Daily and rolling evaluation reports
+|-- category_utils.py          # Market category classification
+|-- health_check.py            # One-shot local health summary
+|-- force_resolve.py           # Manual stale-position resolution tool
+|-- requirements.txt           # Python dependencies
+|-- .env.example               # Local environment template
+|-- .gitignore                 # Secrets/runtime state exclusions
+`-- test_*.py                  # Unit and integration-style tests
 ```
 
 ---
 
-## Monitoring
+## Paper-Only Boundary
 
-| What | How |
-|---|---|
-| Dashboard | `http://YOUR_VPS_IP:8502` |
-| Bot logs (live) | `sudo journalctl -u polymarket-bot -f` |
-| Trade CSV | `tail -f paper_trades.csv` |
-| Opportunity DB | `sqlite3 bot_state.db "SELECT COUNT(*) FROM opportunities;"` |
-| Daily evaluation | `python3 daily_evaluation_report.py --db bot_state.db --days 7` |
-| Health summary | `python3 health_check.py` |
-| Service status | `sudo systemctl status polymarket-bot polymarket-dash` |
+This repository should stay paper-only until a separate live-trading design is reviewed.
 
----
+Before any live-money work exists, require a fresh architecture review covering:
 
-## Branches
+- wallet custody and key handling
+- order signing and execution safety
+- kill switch behavior
+- dry-run/live separation
+- audit logging
+- maximum loss controls
+- testing and replay against historical data
 
-| Branch | Purpose |
-|---|---|
-| `main` | Stable paper trading — safe to deploy |
-| `live` | Live trading — only merge here when fully tested |
-
-PRs go to `main` first. Only promote to `live` after reviewing real-money implications.
+Do not add live trading as an incremental tweak to the paper bot.
