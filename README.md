@@ -22,6 +22,25 @@ Do not bind the dashboard to `0.0.0.0`, open firewall ports, or deploy this repo
 
 ---
 
+## Holding Company Boundary
+
+This repo is a sovereign property repo under `Claude\Projects`. It should not be imported by `holdco` and should not rely on files from the older `AI Holding Company` workspace.
+
+The only supported holding-company interface is:
+
+```text
+state/status.json
+```
+
+Regenerate it locally with:
+
+```powershell
+python property_status.py
+```
+
+`holdco` may read that JSON contract, but it must not read Polymarket internals, runtime databases, logs, tests, or source files.
+
+---
 ## What It Does
 
 The bot watches top monthly-PNL Polymarket traders, estimates trader quality, polls their recent trades, and paper-copies qualifying BUY trades using conviction-scaled sizing. Every candidate trade is logged as an opportunity, even when skipped, so the strategy can be replayed and evaluated offline.
