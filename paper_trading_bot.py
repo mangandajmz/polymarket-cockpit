@@ -11,7 +11,7 @@ Poll:      every 30 seconds
 """
 
 import csv, hashlib, json, os, re, subprocess, sys, time, threading, statistics
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -323,12 +323,198 @@ def _make_opportunity_record(
     }
 
 
+def _recommendation_expiry(observed_at_utc: str) -> str:
+    try:
+        observed = datetime.strptime(observed_at_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        observed = utc_now()
+    return (observed + timedelta(seconds=MAX_TRADE_AGE)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _recommendation_risk_flags(opportunity: dict) -> list[str]:
+    flags = []
+    if opportunity.get("is_crypto"):
+        flags.append("crypto_market")
+    if opportunity.get("is_spread"):
+        flags.append("spread_market")
+    if opportunity.get("is_futures"):
+        flags.append("futures_market")
+    if opportunity.get("price_capped"):
+        flags.append("entry_price_above_cap")
+    if opportunity.get("duplicate_game"):
+        flags.append("duplicate_open_game")
+    if int(opportunity.get("opportunity_age_sec") or 0) > MAX_TRADE_AGE:
+        flags.append("stale_trade")
+    if int(opportunity.get("trader_resolved_count") or 0) < MIN_TRADES_FOR_CUTOFF:
+        flags.append("limited_trader_history")
+    if opportunity.get("hybrid_veto_decision") == "VETO":
+        flags.append(f"shadow_model_veto:{opportunity.get('hybrid_veto_reason') or 'unknown'}")
+    if opportunity.get("daily_losses_for_trader", 0) >= MAX_DAILY_LOSSES_PER_TRADER:
+        flags.append("trader_daily_loss_limit")
+    if float(opportunity.get("daily_deploy_for_trader") or 0) >= MAX_DAILY_DEPLOY_PER_TRADER:
+        flags.append("trader_daily_deploy_cap")
+    deployed_cap = opportunity.get("deployed_cap_pct")
+    if deployed_cap is not None and float(deployed_cap) >= MAX_DEPLOY_PCT:
+        flags.append("deployment_cap")
+    reason = opportunity.get("decision_reason")
+    if opportunity.get("decision") == "SKIP" and reason and reason not in flags:
+        flags.append(str(reason))
+    return flags
+
+
+def _recommendation_status(opportunity: dict, risk_flags: list[str]) -> str:
+    decision = opportunity.get("decision")
+    reason = opportunity.get("decision_reason")
+    hard_avoid_reasons = {
+        "side_not_buy",
+        "trade_too_old",
+        "crypto_market",
+        "spread_market",
+        "futures_market",
+        "price_cap",
+        "duplicate_game",
+        "trader_win_rate_below_cutoff",
+        "trader_daily_loss_limit",
+        "daily_net_loss_cap",
+        "trader_daily_deploy_cap",
+        "deployment_cap",
+        "copy_size_zero",
+    }
+    if decision == "COPIED":
+        if opportunity.get("hybrid_veto_decision") == "VETO":
+            return "WATCH"
+        return "RECOMMEND"
+    if reason in hard_avoid_reasons:
+        return "AVOID"
+    if any(flag in risk_flags for flag in ["crypto_market", "spread_market", "futures_market"]):
+        return "AVOID"
+    return "WATCH"
+
+
+def _recommendation_score(opportunity: dict, risk_flags: list[str], status: str) -> float:
+    score = 0.35
+    if opportunity.get("decision") == "COPIED":
+        score += 0.25
+    if opportunity.get("shadow_model_decision") == "TAKE":
+        score += 0.12
+    if opportunity.get("hybrid_veto_decision") == "ALLOW":
+        score += 0.08
+    if opportunity.get("hybrid_veto_decision") == "VETO":
+        score -= 0.18
+    bayes_lb = opportunity.get("bayes_lower_bound")
+    if bayes_lb is not None:
+        score += (float(bayes_lb) - 0.50) * 0.40
+    conviction = opportunity.get("conviction")
+    if conviction is not None:
+        score += min(float(conviction), 3.0) * 0.04
+    score -= min(len(risk_flags), 6) * 0.03
+    if status == "AVOID":
+        score = min(score, 0.30)
+    elif status == "WATCH":
+        score = min(score, 0.64)
+    return round(max(0.05, min(score, 0.95)), 3)
+
+
+def _recommendation_evidence(opportunity: dict) -> dict:
+    keys = [
+        "event_id", "observed_at_utc", "trader", "market", "outcome", "whale_side",
+        "whale_size_usdc", "price", "opportunity_age_sec", "trader_resolved_count",
+        "trader_win_rate", "daily_losses_for_trader", "daily_deploy_for_trader",
+        "bankroll", "deployed_cap_pct", "open_positions_count", "median_whale_size",
+        "conviction", "perf_mult", "dynamic_max_bet", "recommended_size",
+        "copied_size_usdc", "copy_shares", "position_id", "decision",
+        "decision_reason", "bayes_posterior_mean", "bayes_lower_bound",
+        "shadow_model_score", "shadow_model_decision", "hybrid_veto_threshold",
+        "hybrid_veto_decision", "hybrid_veto_reason", "condition_id", "outcome_index",
+    ]
+    return {key: opportunity.get(key) for key in keys}
+
+
+def _build_recommendation(opportunity: dict) -> dict:
+    risk_flags = _recommendation_risk_flags(opportunity)
+    status = _recommendation_status(opportunity, risk_flags)
+    score = _recommendation_score(opportunity, risk_flags, status)
+    suggested_size = opportunity.get("recommended_size") or opportunity.get("copied_size_usdc")
+    if suggested_size is not None:
+        suggested_size = float(suggested_size)
+
+    if status == "RECOMMEND":
+        thesis = (
+            "Whale buy signal passed the current paper-trading guardrails with "
+            "supporting trader, sizing, and model evidence."
+        )
+    elif status == "WATCH":
+        thesis = (
+            "Signal is potentially useful, but one or more confidence gates require "
+            "manual review before treating it as actionable."
+        )
+    else:
+        thesis = (
+            "Signal is blocked by a guardrail and should not be manually executed "
+            "without fresh evidence overriding the risk flag."
+        )
+
+    observed = opportunity.get("observed_at_utc", "")
+    expires = _recommendation_expiry(observed)
+    price = float(opportunity.get("price") or 0)
+    whale_size = float(opportunity.get("whale_size_usdc") or 0)
+    trader_wr = opportunity.get("trader_win_rate")
+    trader_wr_text = f"{float(trader_wr):.1f}%" if trader_wr is not None else "not enough resolved history"
+    suggested_text = f"${suggested_size:.2f}" if suggested_size is not None else "no paper size"
+    risk_text = ", ".join(risk_flags) if risk_flags else "none detected"
+    memo = "\n".join([
+        f"Decision: {status}",
+        f"Market: {opportunity.get('market', '')}",
+        f"Outcome: {opportunity.get('outcome', '')} at {price:.3f}",
+        f"Suggested paper size: {suggested_text}",
+        f"Confidence score: {score:.3f}",
+        f"Thesis: {thesis}",
+        "Evidence:",
+        f"- Trader: {opportunity.get('trader', '')}; resolved win rate: {trader_wr_text}",
+        f"- Whale side/size: {opportunity.get('whale_side', '')} ${whale_size:,.0f}",
+        f"- Shadow model: {opportunity.get('shadow_model_decision') or 'unknown'} "
+        f"at score {float(opportunity.get('shadow_model_score') or 0):.3f}",
+        f"- Bayesian lower bound: {float(opportunity.get('bayes_lower_bound') or 0):.3f}",
+        f"Risk flags: {risk_text}",
+        f"Invalidation: stale after {expires} UTC or if market liquidity/price changes materially.",
+        "Execution note: paper recommendation only; human review and manual execution required.",
+    ])
+    evidence = _recommendation_evidence(opportunity)
+    return {
+        "event_id": opportunity.get("event_id", ""),
+        "created_at_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "observed_at_utc": observed,
+        "expires_at_utc": expires,
+        "status": status,
+        "confidence": score,
+        "score": score,
+        "suggested_size": suggested_size,
+        "trader": opportunity.get("trader", ""),
+        "market": opportunity.get("market", ""),
+        "outcome": opportunity.get("outcome", ""),
+        "price": price,
+        "position_id": opportunity.get("position_id"),
+        "thesis": thesis,
+        "memo": memo,
+        "evidence_json": json.dumps(evidence, sort_keys=True),
+        "risk_flags_json": json.dumps(risk_flags, sort_keys=True),
+        "operator_action": "NOT_REVIEWED",
+        "resolution_status": opportunity.get("resolution_status"),
+        "resolved_pnl": opportunity.get("resolved_pnl"),
+        "resolved_at_utc": opportunity.get("resolved_at_utc"),
+    }
+
+
 def _finalize_opportunity(bot: PaperBot, record: dict, decision: str, reason: str, **updates):
     record["decision"] = decision
     record["decision_reason"] = reason
     record.update(updates)
     record.update(_hybrid_veto_fields(bot, record, decision))
     bot.store.upsert_opportunity(record)
+    try:
+        bot.store.upsert_recommendation(_build_recommendation(record))
+    except Exception as exc:
+        _log(f"Warning: could not persist recommendation for {record.get('event_id', '')}: {exc}")
 
 
 def _posterior_map(bot: PaperBot) -> dict[str, object]:

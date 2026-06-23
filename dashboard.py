@@ -311,6 +311,58 @@ def load_opportunities(limit: int = OPPORTUNITY_LEDGER_LIMIT) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=30)
+def load_recommendations(limit: int = 100) -> pd.DataFrame:
+    if not STATE_DB_PATH.exists():
+        return pd.DataFrame()
+    try:
+        with sqlite3.connect(STATE_DB_PATH) as conn:
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    event_id,
+                    created_at_utc,
+                    observed_at_utc,
+                    expires_at_utc,
+                    status,
+                    confidence,
+                    score,
+                    suggested_size,
+                    trader,
+                    market,
+                    outcome,
+                    price,
+                    position_id,
+                    thesis,
+                    memo,
+                    evidence_json,
+                    risk_flags_json,
+                    operator_action,
+                    operator_notes,
+                    acted_at_utc,
+                    resolution_status,
+                    resolved_pnl,
+                    resolved_at_utc
+                FROM recommendations
+                ORDER BY created_at_utc DESC
+                LIMIT ?
+                """,
+                conn,
+                params=(limit,),
+            )
+    except Exception as exc:
+        if "no such table" not in str(exc).lower():
+            st.error(f"Could not read recommendations from state database: {exc}")
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for col in ["confidence", "score", "suggested_size", "price", "resolved_pnl"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["created_at_utc", "observed_at_utc", "expires_at_utc", "acted_at_utc", "resolved_at_utc"]:
+        df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=30)
 def load_opportunity_metrics() -> dict:
     if not STATE_DB_PATH.exists():
         return {}
@@ -1354,6 +1406,7 @@ df    = load_trades()
 runtime_kv = load_runtime_kv()
 opp_metrics = load_opportunity_metrics()
 opps  = load_opportunities()
+trade_recommendations = load_recommendations()
 copied_opps = load_copied_opportunities()
 position_history = load_position_history()
 stats = compute_stats(df) if not df.empty else {
@@ -1373,8 +1426,9 @@ week_ago = now_utc - timedelta(days=7)
 day_ago  = now_utc - timedelta(days=1)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_ov, tab_pos, tab_hist, tab_shadow, tab_traders, tab_perf, tab_analytics, tab_markets, tab_risk, tab_logs = st.tabs([
+tab_ov, tab_recs, tab_pos, tab_hist, tab_shadow, tab_traders, tab_perf, tab_analytics, tab_markets, tab_risk, tab_logs = st.tabs([
     "📊 Overview",
+    "Recommendations",
     "💼 Positions",
     "📜 Trade History",
     "🧠 Shadow",
@@ -1538,6 +1592,53 @@ with tab_ov:
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Recommendations
+with tab_recs:
+    st.subheader("Trade Recommendations")
+    if trade_recommendations.empty:
+        st.info("No recommendations recorded yet.")
+    else:
+        recs = trade_recommendations.copy()
+        open_recs = recs[recs["resolution_status"].isna()]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Recommend", int((open_recs["status"] == "RECOMMEND").sum()))
+        m2.metric("Watch", int((open_recs["status"] == "WATCH").sum()))
+        m3.metric("Avoid", int((open_recs["status"] == "AVOID").sum()))
+        m4.metric("Resolved", int(recs["resolution_status"].isin(["WIN", "LOSS"]).sum()))
+
+        table = recs.copy()
+        table["Created"] = table["created_at_utc"].dt.strftime("%Y-%m-%d %H:%M")
+        table["Expires"] = table["expires_at_utc"].dt.strftime("%H:%M UTC")
+        table["Score"] = table["score"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "-")
+        table["Paper Size"] = table["suggested_size"].map(lambda v: f"${v:.2f}" if pd.notna(v) else "-")
+        table["Entry"] = table["price"].map(lambda v: f"{v:.3f}" if pd.notna(v) else "-")
+        st.dataframe(
+            table[[
+                "Created", "status", "trader", "market", "outcome", "Entry",
+                "Paper Size", "Score", "resolution_status", "Expires",
+            ]].head(50).rename(columns={
+                "status": "Recommendation",
+                "trader": "Trader",
+                "market": "Market",
+                "outcome": "Outcome",
+                "resolution_status": "Outcome Label",
+            }),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("Recommendation Memos")
+        for _, row in recs.head(5).iterrows():
+            label = f"{row['status']} | {str(row['market'])[:90]}"
+            with st.expander(label):
+                st.code(row.get("memo", ""), language=None)
+                try:
+                    flags = json.loads(row.get("risk_flags_json") or "[]")
+                except Exception:
+                    flags = []
+                if flags:
+                    st.caption("Risk flags: " + ", ".join(str(flag) for flag in flags))
+                st.caption(f"Event: {row.get('event_id', '')}")
 # TAB 2 — ACTIVE POSITIONS
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_pos:

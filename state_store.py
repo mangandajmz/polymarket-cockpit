@@ -126,6 +126,32 @@ class StateStore:
                     resolved_at_utc TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS recommendations (
+                    event_id TEXT PRIMARY KEY,
+                    created_at_utc TEXT NOT NULL,
+                    observed_at_utc TEXT NOT NULL,
+                    expires_at_utc TEXT,
+                    status TEXT NOT NULL,
+                    confidence REAL,
+                    score REAL,
+                    suggested_size REAL,
+                    trader TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    position_id TEXT,
+                    thesis TEXT NOT NULL,
+                    memo TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    risk_flags_json TEXT NOT NULL,
+                    operator_action TEXT,
+                    operator_notes TEXT,
+                    acted_at_utc TEXT,
+                    resolution_status TEXT,
+                    resolved_pnl REAL,
+                    resolved_at_utc TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_fills_position_id
                     ON copied_fills(position_id);
                 CREATE INDEX IF NOT EXISTS idx_fills_timestamp
@@ -138,6 +164,12 @@ class StateStore:
                     ON opportunities(position_id);
                 CREATE INDEX IF NOT EXISTS idx_opportunities_resolution_observed
                     ON opportunities(resolution_status, observed_at_utc);
+                CREATE INDEX IF NOT EXISTS idx_recommendations_created
+                    ON recommendations(created_at_utc);
+                CREATE INDEX IF NOT EXISTS idx_recommendations_status
+                    ON recommendations(status);
+                CREATE INDEX IF NOT EXISTS idx_recommendations_position_id
+                    ON recommendations(position_id);
                 """
             )
         self._ensure_opportunity_columns()
@@ -478,6 +510,104 @@ class StateStore:
                 payload,
             )
 
+    def upsert_recommendation(self, record: dict):
+        payload = {
+            "event_id": record.get("event_id", ""),
+            "created_at_utc": record.get("created_at_utc", ""),
+            "observed_at_utc": record.get("observed_at_utc", ""),
+            "expires_at_utc": record.get("expires_at_utc"),
+            "status": record.get("status", "WATCH"),
+            "confidence": (
+                float(record.get("confidence"))
+                if record.get("confidence") is not None
+                else None
+            ),
+            "score": (
+                float(record.get("score"))
+                if record.get("score") is not None
+                else None
+            ),
+            "suggested_size": (
+                float(record.get("suggested_size"))
+                if record.get("suggested_size") is not None
+                else None
+            ),
+            "trader": record.get("trader", ""),
+            "market": record.get("market", ""),
+            "outcome": record.get("outcome", ""),
+            "price": float(record.get("price", 0) or 0),
+            "position_id": record.get("position_id"),
+            "thesis": record.get("thesis", ""),
+            "memo": record.get("memo", ""),
+            "evidence_json": record.get("evidence_json", "{}"),
+            "risk_flags_json": record.get("risk_flags_json", "[]"),
+            "operator_action": record.get("operator_action", "NOT_REVIEWED"),
+            "operator_notes": record.get("operator_notes"),
+            "acted_at_utc": record.get("acted_at_utc"),
+            "resolution_status": record.get("resolution_status"),
+            "resolved_pnl": (
+                float(record.get("resolved_pnl"))
+                if record.get("resolved_pnl") is not None
+                else None
+            ),
+            "resolved_at_utc": record.get("resolved_at_utc"),
+        }
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO recommendations (
+                    event_id, created_at_utc, observed_at_utc, expires_at_utc,
+                    status, confidence, score, suggested_size, trader, market,
+                    outcome, price, position_id, thesis, memo, evidence_json,
+                    risk_flags_json, operator_action, operator_notes, acted_at_utc,
+                    resolution_status, resolved_pnl, resolved_at_utc
+                ) VALUES (
+                    :event_id, :created_at_utc, :observed_at_utc, :expires_at_utc,
+                    :status, :confidence, :score, :suggested_size, :trader, :market,
+                    :outcome, :price, :position_id, :thesis, :memo, :evidence_json,
+                    :risk_flags_json, :operator_action, :operator_notes, :acted_at_utc,
+                    :resolution_status, :resolved_pnl, :resolved_at_utc
+                )
+                ON CONFLICT(event_id) DO UPDATE SET
+                    created_at_utc=excluded.created_at_utc,
+                    observed_at_utc=excluded.observed_at_utc,
+                    expires_at_utc=excluded.expires_at_utc,
+                    status=excluded.status,
+                    confidence=excluded.confidence,
+                    score=excluded.score,
+                    suggested_size=excluded.suggested_size,
+                    trader=excluded.trader,
+                    market=excluded.market,
+                    outcome=excluded.outcome,
+                    price=excluded.price,
+                    position_id=excluded.position_id,
+                    thesis=excluded.thesis,
+                    memo=excluded.memo,
+                    evidence_json=excluded.evidence_json,
+                    risk_flags_json=excluded.risk_flags_json,
+                    operator_action=COALESCE(recommendations.operator_action, excluded.operator_action),
+                    operator_notes=COALESCE(recommendations.operator_notes, excluded.operator_notes),
+                    acted_at_utc=COALESCE(recommendations.acted_at_utc, excluded.acted_at_utc),
+                    resolution_status=excluded.resolution_status,
+                    resolved_pnl=excluded.resolved_pnl,
+                    resolved_at_utc=excluded.resolved_at_utc
+                """,
+                payload,
+            )
+
+    def load_recommendations(self, limit: int = 100) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM recommendations
+                ORDER BY created_at_utc DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def load_opportunities_for_position(self, position_id: str) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -512,10 +642,30 @@ class StateStore:
                     """,
                     (status, pnl, resolved_at_utc, event_id),
                 )
+                conn.execute(
+                    """
+                    UPDATE recommendations
+                       SET resolution_status = ?,
+                           resolved_pnl = ?,
+                           resolved_at_utc = ?
+                     WHERE event_id = ?
+                    """,
+                    (status, pnl, resolved_at_utc, event_id),
+                )
             elif position_id:
                 conn.execute(
                     """
                     UPDATE opportunities
+                       SET resolution_status = ?,
+                           resolved_pnl = ?,
+                           resolved_at_utc = ?
+                     WHERE position_id = ?
+                    """,
+                    (status, pnl, resolved_at_utc, position_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE recommendations
                        SET resolution_status = ?,
                            resolved_pnl = ?,
                            resolved_at_utc = ?
@@ -619,12 +769,18 @@ class StateStore:
                     "SELECT * FROM opportunities ORDER BY observed_at_utc"
                 ).fetchall()
             ]
+            recommendations = [
+                dict(row) for row in conn.execute(
+                    "SELECT * FROM recommendations ORDER BY created_at_utc"
+                ).fetchall()
+            ]
         return {
             "positions": positions,
             "trader_stats": trader_stats,
             "daily_risk": daily_rows,
             "fills": fills,
             "opportunities": opportunities,
+            "recommendations": recommendations,
             "closed_pnl": float(self.get_value("closed_pnl", 0.0) or 0.0),
             "wins": int(self.get_value("wins", 0) or 0),
             "losses": int(self.get_value("losses", 0) or 0),

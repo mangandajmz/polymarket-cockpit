@@ -1,5 +1,6 @@
 import csv
 import gc
+import json
 import tempfile
 import unittest
 from datetime import date
@@ -253,6 +254,12 @@ class BotRobustnessTests(unittest.TestCase):
                     "SELECT * FROM opportunities ORDER BY observed_at_utc"
                 ).fetchall()
             }
+            recs = {
+                row["event_id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM recommendations ORDER BY created_at_utc"
+                ).fetchall()
+            }
 
         self.assertEqual(rows[skipped_event]["decision"], "SKIP")
         self.assertEqual(rows[skipped_event]["decision_reason"], "crypto_market")
@@ -268,6 +275,16 @@ class BotRobustnessTests(unittest.TestCase):
         self.assertIn(rows[copied_event]["hybrid_veto_decision"], ("ALLOW", "VETO"))
         self.assertIn(rows[copied_event]["hybrid_veto_reason"], ("score_above_threshold", "score_below_threshold", "model_warmup"))
 
+        self.assertEqual(recs[skipped_event]["status"], "AVOID")
+        self.assertIn("crypto_market", json.loads(recs[skipped_event]["risk_flags_json"]))
+        self.assertIn(recs[copied_event]["status"], ("RECOMMEND", "WATCH"))
+        self.assertIn("Decision:", recs[copied_event]["memo"])
+        self.assertIn("paper recommendation only", recs[copied_event]["memo"])
+        copied_evidence = json.loads(recs[copied_event]["evidence_json"])
+        self.assertEqual(copied_evidence["trader"], "alice")
+        self.assertEqual(copied_evidence["market"], "Match A Winner")
+        self.assertEqual(copied_evidence["decision"], "COPIED")
+
         key = ("alice", "cond-1", 0)
         pos = bot.positions[key]
         botmod.resolve_position_snapshot(bot, key, px=1.0, resolved=True, now_ts=pos["opened_at"] + 3600)
@@ -279,9 +296,17 @@ class BotRobustnessTests(unittest.TestCase):
                     (copied_event,),
                 ).fetchone()
             )
+            resolved_rec = dict(
+                conn.execute(
+                    "SELECT * FROM recommendations WHERE event_id = ?",
+                    (copied_event,),
+                ).fetchone()
+            )
 
         self.assertEqual(resolved_row["resolution_status"], "WIN")
         self.assertGreater(float(resolved_row["resolved_pnl"]), 0.0)
+        self.assertEqual(resolved_rec["resolution_status"], "WIN")
+        self.assertGreater(float(resolved_rec["resolved_pnl"]), 0.0)
 
     def test_resolve_logged_opportunities_labels_skipped_trade(self):
         bot = botmod.PaperBot()
