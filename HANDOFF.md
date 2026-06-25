@@ -4,7 +4,8 @@
 
 - Date: 2026-06-24 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `8f40493 Add local state initializer`
+- Last commit reviewed: `a822148 Update handoff after initializer commit`
+- Current change ready to commit: initialized local paper state and refreshed status contract.
 - Latest push attempt: blocked because no git remote is configured.
 - Mode: local-first, paper-only recommendation cockpit
 
@@ -25,22 +26,21 @@ is a later addition to a proven system, not part of the current development loop
 
 ## Current Operational State
 
-- `init_state.py` is committed. It creates local SQLite state without starting
-  the network-dependent paper bot.
-- `test_init_state.py` is committed. It verifies schema/default health creation
-  and preservation of existing runtime values.
-- `state/status.json` still reports `RED` until a real local `bot_state.db` is
-  initialized in the workspace and `property_status.py` is regenerated.
+- Local ignored `bot_state.db` exists and was created with `python init_state.py`.
+- `python health_check.py` reads the database successfully.
+- Health status is `Initialized; paper bot has not started polling yet.`
+- `state/status.json` is refreshed to `GREEN` with `state_db_present: 1`, 0 open
+  recommendations, and 0 open paper positions.
 - Runtime files such as `.env`, `bot_state.db`, logs, and watchlist cache remain
   ignored and should not be committed.
 
 ## Next Recommended Work
 
 1. Configure a git remote so commits can be pushed.
-2. Run `python init_state.py` to create the ignored local `bot_state.db`.
-3. Run `python health_check.py` to confirm the schema and default health surface.
-4. Run `python property_status.py` to refresh `state/status.json`.
-5. Start a short paper-bot observation run once network/API behavior is ready to test.
+2. Start a short paper-bot observation run once network/API behavior is ready to test.
+3. Re-run `python health_check.py` after the bot has polled at least once.
+4. Inspect the dashboard against the initialized database.
+5. Decide the first evidence-gathering window: smoke duration, one session, or full day.
 
 ## Open Questions
 
@@ -52,7 +52,9 @@ is a later addition to a proven system, not part of the current development loop
 
 ## Last Verification
 
-- `python -m pytest -q` passed before `8f40493`: 49 tests in 3.53s.
-- `git push` after `8f40493` failed: no configured push destination.
-- This handoff-only follow-up needs diff review; tests are not rerun because no
-  code changed after the passing suite.
+- `python init_state.py` created ignored local `bot_state.db`.
+- `python health_check.py` passed and reported 0 open positions, 0 closed positions,
+  no trader stats, and no invariant issues.
+- `python property_status.py` refreshed `state/status.json` to `GREEN`.
+- `python -m pytest -q` passed: 49 tests in 2.90s.
+- Push remains blocked until a git remote is configured.
