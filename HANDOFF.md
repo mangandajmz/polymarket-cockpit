@@ -4,9 +4,9 @@
 
 - Date: 2026-06-24 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `a822148 Update handoff after initializer commit`
-- Current change ready to commit: initialized local paper state and refreshed status contract.
-- Latest push attempt: blocked because no git remote is configured.
+- Last commit reviewed: `b4124d7 Initialize local paper state`
+- Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
+- Latest push: `main` pushed and set to track `origin/main`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -22,7 +22,8 @@ is a later addition to a proven system, not part of the current development loop
 - Stage only intentional files.
 - Keep unrelated local changes out of commits.
 - For code changes, run relevant tests or record why they could not be run.
-- Push is currently blocked until a git remote is configured; `git remote -v` is empty.
+- Push uses `git -c http.sslBackend=schannel push` on this Windows machine if
+  plain `git push` hits local issuer certificate errors.
 
 ## Current Operational State
 
@@ -36,19 +37,20 @@ is a later addition to a proven system, not part of the current development loop
 
 ## Next Recommended Work
 
-1. Configure a git remote so commits can be pushed.
-2. Start a short paper-bot observation run once network/API behavior is ready to test.
-3. Re-run `python health_check.py` after the bot has polled at least once.
-4. Inspect the dashboard against the initialized database.
-5. Decide the first evidence-gathering window: smoke duration, one session, or full day.
+1. Start a short paper-bot observation run once network/API behavior is ready to test.
+2. Re-run `python health_check.py` after the bot has polled at least once.
+3. Inspect the dashboard against the initialized database.
+4. Decide the first evidence-gathering window: smoke duration, one session, or full day.
+5. Archive the legacy `mangandajmz/polymarket-bot` repo after confirming the new repo is complete.
 
 ## Open Questions
 
-- Which remote should this repository push to?
 - How long should the first paper-observation run last before we judge the runtime
   state path: smoke duration, one trading session, or a full day?
 - Should the dashboard require a real local password immediately, or can initial
   development focus on bot/database health first?
+- Do we archive the old `mangandajmz/polymarket-bot` repo now or after one successful
+  paper-observation session in the new repo?
 
 ## Last Verification
 
@@ -56,5 +58,5 @@ is a later addition to a proven system, not part of the current development loop
 - `python health_check.py` passed and reported 0 open positions, 0 closed positions,
   no trader stats, and no invariant issues.
 - `python property_status.py` refreshed `state/status.json` to `GREEN`.
-- `python -m pytest -q` passed: 49 tests in 2.90s.
-- Push remains blocked until a git remote is configured.
+- `python -m pytest -q` passed before `b4124d7`: 49 tests in 2.90s.
+- `git -c http.sslBackend=schannel push -u origin main` succeeded.
