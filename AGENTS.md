@@ -17,10 +17,11 @@ Every intentional project change must be followed by review and commit.
 Required workflow:
 
 1. Make the smallest coherent change.
-2. Review the diff adversarially.
-3. Run verification appropriate to the risk.
-4. Stage only intentional files.
-5. Commit the reviewed change.
+2. Update `HANDOFF.md` with the new state, verification, and next action.
+3. Review the diff adversarially.
+4. Run verification appropriate to the risk.
+5. Stage only intentional files.
+6. Commit the reviewed change.
 
 Documentation-only changes still require a diff review. Code changes require the
 relevant tests, or a clear note if tests could not be run.

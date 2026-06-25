@@ -17,6 +17,7 @@ and has produced enough paper evidence to justify an execution layer.
 
 Every intentional project change must end with a review and a commit.
 
+- Update HANDOFF.md with the new state, verification, and next action.
 - Review the diff after each change before committing.
 - Run the smallest verification that matches the risk of the change.
 - Do not leave intentional work uncommitted at the end of a work session.
