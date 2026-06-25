@@ -1,6 +1,6 @@
 {
   "approvals_pending": [],
-  "as_of": "2026-06-23T14:40:59.483493+00:00",
+  "as_of": "2026-06-25T01:41:31.580510+00:00",
   "display_name": "Polymarket Recommendation Cockpit",
   "evidence_ref": "README.md",
   "headline": "Polymarket cockpit migrated, but no local paper-trading state database exists in the new repo yet.",

@@ -5,6 +5,8 @@ It discovers high-performing traders, simulates copying qualifying BUY trades, r
 
 > Current mode: PAPER TRADING only. No wallet, no private key, no real-money execution.
 
+Current product goal: build a recommendation cockpit first, explore paper evidence until there are meaningful results, and treat automation as a later addition to a working system. See [ROADMAP.md](ROADMAP.md).
+
 ---
 
 ## Local-First Posture
