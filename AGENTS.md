@@ -12,7 +12,7 @@ This repository is a local-first, paper-only Polymarket recommendation cockpit.
 
 ## Change Discipline
 
-Every intentional project change must be followed by review and commit.
+Every intentional project change must be followed by review, commit, and push.
 
 Required workflow:
 
@@ -22,6 +22,7 @@ Required workflow:
 4. Run verification appropriate to the risk.
 5. Stage only intentional files.
 6. Commit the reviewed change.
+7. Push the commit to the configured remote.
 
 Documentation-only changes still require a diff review. Code changes require the
 relevant tests, or a clear note if tests could not be run.

@@ -220,6 +220,7 @@ Stop either process with `Ctrl+C`.
 
 | Task | Command |
 |---|---|
+| Initialize state DB | `python init_state.py` |
 | Health summary | `python health_check.py` |
 | Replay opportunities | `python opportunity_replay.py --db bot_state.db` |
 | Daily evaluation | `python daily_evaluation_report.py --db bot_state.db --days 7` |

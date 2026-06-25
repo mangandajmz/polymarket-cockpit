@@ -4,9 +4,9 @@
 
 - Date: 2026-06-24 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `10969a0 Document recommendation cockpit roadmap`
+- Last commit reviewed: `ea33af3 Add project handoff workflow`
+- Current change ready to commit: add local state initializer and commit/push discipline.
 - Mode: local-first, paper-only recommendation cockpit
-- Working tree at handoff creation: clean before this change
 
 ## Product Direction
 
@@ -16,26 +16,31 @@ is a later addition to a proven system, not part of the current development loop
 
 ## Hard Rules
 
-- Every intentional project change must be reviewed and committed.
+- Every intentional project change must be reviewed, committed, and pushed.
 - Update this handoff before every commit.
 - Stage only intentional files.
 - Keep unrelated local changes out of commits.
 - For code changes, run relevant tests or record why they could not be run.
+- Push is currently blocked until a git remote is configured; `git remote -v` is empty.
 
 ## Current Operational State
 
-- Test baseline: `python -m pytest -q` passed with 47 tests on the previous commit.
-- `state/status.json` reports `RED` because no local `bot_state.db` exists yet.
-- `health_check.py` currently fails for the expected missing state database.
-- Next development phase starts with establishing trustworthy local runtime state.
+- Added `init_state.py` development slice to create local SQLite state without
+  starting the network-dependent paper bot.
+- Added tests proving initialization creates the schema/default health keys and
+  preserves existing runtime values.
+- `state/status.json` still reports `RED` until a real local `bot_state.db` is
+  initialized in the workspace and `property_status.py` is regenerated.
+- Runtime files such as `.env`, `bot_state.db`, logs, and watchlist cache remain
+  ignored and should not be committed.
 
 ## Next Recommended Work
 
-1. Create local `.env` from `.env.example` if it is not already present.
-2. Start the paper bot long enough to initialize or populate `bot_state.db`.
-3. Run `python health_check.py` and `python property_status.py`.
-4. Confirm the dashboard, health check, and status contract agree.
-5. Commit the resulting reviewed development change, excluding ignored runtime data.
+1. Run `python init_state.py` to create the ignored local `bot_state.db`.
+2. Run `python health_check.py` to confirm the schema and default health surface.
+3. Run `python property_status.py` to refresh `state/status.json`.
+4. Configure a git remote so commits can be pushed.
+5. Start a short paper-bot observation run once network/API behavior is ready to test.
 
 ## Open Questions
 
@@ -43,9 +48,12 @@ is a later addition to a proven system, not part of the current development loop
   state path: smoke duration, one trading session, or a full day?
 - Should the dashboard require a real local password immediately, or can initial
   development focus on bot/database health first?
+- Which remote should this repository push to?
 
 ## Last Verification
 
-- Diff reviewed for `AGENTS.md`, `README.md`, `ROADMAP.md`, and `HANDOFF.md`.
-- `python -m pytest -q` passed: 47 tests in 3.01s.
-- Next action: initialize local runtime state and validate `bot_state.db` health.
+- Diff reviewed for `init_state.py`, `test_init_state.py`, `README.md`, `AGENTS.md`,
+  `ROADMAP.md`, and `HANDOFF.md`.
+- `python -m pytest -q` passed: 49 tests in 3.53s.
+- Push check: `git remote -v` returned no configured remotes, so push will be blocked
+  until a remote is added.

@@ -15,13 +15,14 @@ and has produced enough paper evidence to justify an execution layer.
 
 ## Hard Operating Rules
 
-Every intentional project change must end with a review and a commit.
+Every intentional project change must end with a review, a commit, and a push.
 
 - Update HANDOFF.md with the new state, verification, and next action.
 - Review the diff after each change before committing.
 - Run the smallest verification that matches the risk of the change.
 - Do not leave intentional work uncommitted at the end of a work session.
 - Commit only reviewed, intentional files.
+- Push the commit to the configured remote before stopping.
 - Keep unrelated local changes out of the commit.
 
 For documentation-only changes, the review may be an adversarial document review
