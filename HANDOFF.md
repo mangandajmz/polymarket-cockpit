@@ -2,9 +2,9 @@
 
 ## Current Snapshot
 
-- Date: 2026-06-24 America/Vancouver
+- Date: 2026-06-25 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `c59945b Fix Polymarket API smoke connectivity`
+- Last commit reviewed: `bd8137b Record overnight bot run handoff`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
 - Latest push: `main` tracks `origin/main`.
 - Mode: local-first, paper-only recommendation cockpit
@@ -27,35 +27,41 @@ is a later addition to a proven system, not part of the current development loop
 
 ## Current Operational State
 
-- Overnight paper-bot run is active via Windows scheduled task:
+- Overnight paper-bot run remains active via Windows scheduled task:
   `Polymarket Cockpit Bot Overnight`.
-- Thread wake-up automation created: `polymarket-overnight-check-in` for tomorrow
-  around this time.
-- Latest health check after scheduled-task launch reports build `c59945b`, heartbeat
-  at `2026-06-25 02:59:49 UTC`, active watchlist 5, API failures 0, and no invariant issues.
+- Thread wake-up automation `polymarket-overnight-check-in` completed and was deleted
+  after the check-in.
+- Latest health check reports build `bd8137b`, heartbeat at
+  `2026-06-25 19:46:32 UTC`, active watchlist 5, API failures 0, and no invariant issues.
 - Active watchlist: GRIMDRIP, endlessFate, fishalive, frostrizz, mintblade.
+- Recommendations, opportunities, positions, copied fills, and trader stats are still
+  all at 0 rows after the overnight run.
 - Local ignored `bot_state.db` is the live state store for the overnight run.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed.
 
 ## Next Recommended Work
 
-1. Tomorrow around this time, read this handoff and run `python health_check.py`.
-2. Run `python opportunity_replay.py --db bot_state.db`.
-3. Run `python daily_evaluation_report.py --db bot_state.db --days 7`.
+1. Continue the evidence window long enough to see whether qualified opportunities appear
+   without loosening filters prematurely.
+2. Add or inspect skip-reason telemetry if the bot remains healthy but still captures no
+   opportunities.
+3. Run `python opportunity_replay.py --db bot_state.db` and
+   `python daily_evaluation_report.py --db bot_state.db --days 7` again after more live time.
 4. Run `python property_status.py`, then review/commit/push any tracked status update.
-5. Decide whether to continue the evidence window, tune filters, inspect dashboard, or archive the legacy repo.
+5. Decide whether to tune filters, inspect dashboard views, or archive the legacy repo.
 
 ## Open Questions
 
-- Did the overnight run capture any recommendations, skipped opportunities, or failures?
+- How many otherwise-interesting trades are being rejected by the current filters, and why?
 - Should the dashboard require a real local password immediately, or can initial
   development focus on bot/database health first?
 - Do we archive the old `mangandajmz/polymarket-bot` repo after the overnight check passes?
 
 ## Last Verification
 
-- Windows scheduled task `Polymarket Cockpit Bot Overnight` created and started.
-- `python health_check.py` after startup passed: active watchlist 5, last poll recorded,
+- `python health_check.py` passed during the check-in: active watchlist 5, fresh heartbeat,
   API failures 0, no invariant issues.
-- No code changed in this handoff update, so tests were not rerun after `c59945b`.
+- `python opportunity_replay.py --db bot_state.db` returned no opportunities.
+- `python daily_evaluation_report.py --db bot_state.db --days 7` returned no opportunities.
+- Scheduled task and Python process were confirmed running.
