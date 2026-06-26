@@ -2,9 +2,9 @@
 
 ## Current Snapshot
 
-- Date: 2026-06-25 America/Vancouver
+- Date: 2026-06-26 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `bd8137b Record overnight bot run handoff`
+- Last commit reviewed: `1803b58 Record overnight bot check-in`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
 - Latest push: `main` tracks `origin/main`.
 - Mode: local-first, paper-only recommendation cockpit
@@ -31,37 +31,46 @@ is a later addition to a proven system, not part of the current development loop
   `Polymarket Cockpit Bot Overnight`.
 - Thread wake-up automation `polymarket-overnight-check-in` completed and was deleted
   after the check-in.
-- Latest health check reports build `bd8137b`, heartbeat at
-  `2026-06-25 19:46:32 UTC`, active watchlist 5, API failures 0, and no invariant issues.
+- Latest health check before poll-funnel restart reports build `1803b58`, heartbeat at
+  `2026-06-26 23:26:54 UTC`, active watchlist 5, API failures 0, and no invariant issues.
 - Active watchlist: GRIMDRIP, endlessFate, fishalive, frostrizz, mintblade.
 - Recommendations, opportunities, positions, copied fills, and trader stats are still
-  all at 0 rows after the overnight run.
+  all at 0 rows.
+- Live Data API probe answered the current decision funnel: all 5 active wallets fetched
+  50 trade rows each, but 0 rows were fresh within the bot's 5-minute polling window;
+  therefore no trades reached BUY/size/risk/recommendation filtering during the check.
+- This change adds persisted `poll_funnel` telemetry so future `health_check.py` runs show
+  fetched rows, fresh trades, fresh BUYs, min-whale BUYs, processed rows, and latest trade
+  age per watched trader.
 - Local ignored `bot_state.db` is the live state store for the overnight run.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed.
 
 ## Next Recommended Work
 
-1. Continue the evidence window long enough to see whether qualified opportunities appear
-   without loosening filters prematurely.
-2. Add or inspect skip-reason telemetry if the bot remains healthy but still captures no
-   opportunities.
-3. Run `python opportunity_replay.py --db bot_state.db` and
-   `python daily_evaluation_report.py --db bot_state.db --days 7` again after more live time.
-4. Run `python property_status.py`, then review/commit/push any tracked status update.
-5. Decide whether to tune filters, inspect dashboard views, or archive the legacy repo.
+1. Commit and push the poll-funnel telemetry, then restart the scheduled task so the live
+   bot process writes the new `poll_funnel` state.
+2. Re-run `python health_check.py`; the Poll Funnel section should show whether the bot is
+   seeing fresh watched trades, fresh BUYs, and min-whale BUYs.
+3. Continue the evidence window if fresh watched trades remain at 0; tune watchlist breadth
+   only after the funnel shows a sustained data-volume problem.
+4. Run `python opportunity_replay.py --db bot_state.db` and
+   `python daily_evaluation_report.py --db bot_state.db --days 7` again after opportunities appear.
+5. Decide whether to inspect dashboard views or archive the legacy repo.
 
 ## Open Questions
 
-- How many otherwise-interesting trades are being rejected by the current filters, and why?
+- If poll-funnel telemetry keeps showing 0 fresh watched trades, should Phase 1 widen watchlist breadth before loosening risk filters?
 - Should the dashboard require a real local password immediately, or can initial
   development focus on bot/database health first?
 - Do we archive the old `mangandajmz/polymarket-bot` repo after the overnight check passes?
 
 ## Last Verification
 
-- `python health_check.py` passed during the check-in: active watchlist 5, fresh heartbeat,
-  API failures 0, no invariant issues.
-- `python opportunity_replay.py --db bot_state.db` returned no opportunities.
-- `python daily_evaluation_report.py --db bot_state.db --days 7` returned no opportunities.
-- Scheduled task and Python process were confirmed running.
+- `python health_check.py` passed before restart: active watchlist 5, fresh heartbeat,
+  API failures 0, no invariant issues, no poll-funnel telemetry yet.
+- Live Data API probe for the active watchlist showed 250 fetched trade rows, 250 trade rows,
+  0 fresh rows within 5 minutes, 0 fresh BUYs, and 0 fresh BUYs above the $1,000 whale threshold.
+- `python -m pytest -q` passed: 53 tests.
+- Adversarial review: the absence of recommendations is currently explained by watched-trader
+  inactivity/staleness, not by downstream BUY, market, price, risk, or recommendation filters.

@@ -37,6 +37,20 @@ def _fmt_ts_age(ts_str: str) -> str:
         return ts_str
 
 
+
+def _fmt_age_seconds(value) -> str:
+    try:
+        seconds = int(value)
+    except Exception:
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{hours}h {minutes}m"
+
 def main():
     parser = argparse.ArgumentParser(description="Inspect bot health from the canonical state DB.")
     parser.add_argument(
@@ -93,6 +107,7 @@ def main():
 
     health = kv.get("health", {}) if isinstance(kv.get("health"), dict) else {}
     watchlist = kv.get("watchlist_health", {}) if isinstance(kv.get("watchlist_health"), dict) else {}
+    poll_funnel = kv.get("poll_funnel", {}) if isinstance(kv.get("poll_funnel"), dict) else {}
     invariant_issues = kv.get("invariant_issues", []) or []
 
     print("Polymarket Bot Health")
@@ -127,6 +142,35 @@ def main():
         print(f"Active names: {', '.join(active_names)}")
     print()
 
+    print("Poll Funnel")
+    print("-----------")
+    if not poll_funnel:
+        print("No poll-funnel telemetry yet. Restart or let the bot complete a poll on the latest build.")
+    else:
+        totals = poll_funnel.get("totals", {}) or {}
+        print(f"Updated: {_fmt_ts_age(poll_funnel.get('updated_at_utc', ''))}")
+        print(
+            f"Trader fetches: {poll_funnel.get('successful_trader_fetches', 0)}/"
+            f"{poll_funnel.get('active_trader_count', 0)} | "
+            f"API success: {poll_funnel.get('api_success')}"
+        )
+        print(
+            f"Rows: fetched {totals.get('fetched_rows', 0)}, "
+            f"trade {totals.get('trade_rows', 0)}, "
+            f"fresh {totals.get('fresh_trade_rows', 0)}, "
+            f"fresh BUY {totals.get('fresh_buy_rows', 0)}, "
+            f"fresh BUY >= min whale {totals.get('fresh_buy_ge_min_whale', 0)}, "
+            f"processed {totals.get('processed_rows', 0)}"
+        )
+        for trader in (poll_funnel.get("traders", []) or [])[:5]:
+            print(
+                f"- {trader.get('trader')}: fresh {trader.get('fresh_trade_rows', 0)}, "
+                f"fresh BUY {trader.get('fresh_buy_rows', 0)}, "
+                f"latest {_fmt_age_seconds(trader.get('latest_trade_age_sec'))} ago "
+                f"{trader.get('latest_trade_side') or ''} "
+                f"${float(trader.get('latest_trade_usdc') or 0):,.0f}"
+            )
+    print()
     print("Top Open Positions")
     print("------------------")
     if not positions:

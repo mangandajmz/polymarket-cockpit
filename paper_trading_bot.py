@@ -1997,8 +1997,94 @@ def make_dashboard(bot: PaperBot):
 
 
 # ── Polling ───────────────────────────────────────────────────────────────────
+def _summarize_trader_poll(
+    trader_name: str,
+    rows: list,
+    *,
+    now_ts: int | None = None,
+    max_trade_age: int = MAX_TRADE_AGE,
+    min_whale_size: float = MIN_WHALE_SIZE,
+) -> tuple[dict, list[dict]]:
+    now_ts = int(time.time()) if now_ts is None else now_ts
+    summary = {
+        "trader": trader_name,
+        "fetched_rows": len(rows) if isinstance(rows, list) else 0,
+        "trade_rows": 0,
+        "non_trade_rows": 0,
+        "fresh_trade_rows": 0,
+        "fresh_buy_rows": 0,
+        "fresh_buy_ge_min_whale": 0,
+        "stale_trade_rows": 0,
+        "processed_rows": 0,
+        "latest_trade_age_sec": None,
+        "latest_trade_side": None,
+        "latest_trade_usdc": None,
+        "latest_trade_title": None,
+    }
+    fresh_trades: list[dict] = []
+    latest_ts = None
+
+    for trade in rows if isinstance(rows, list) else []:
+        if not isinstance(trade, dict):
+            continue
+        if trade.get("type", "TRADE") != "TRADE":
+            summary["non_trade_rows"] += 1
+            continue
+
+        summary["trade_rows"] += 1
+        ts = int(trade.get("timestamp", 0) or 0)
+        age = now_ts - ts
+        side = str(trade.get("side", "")).upper()
+        usdc = float(trade.get("usdcSize") or trade.get("size") or 0)
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+            summary["latest_trade_age_sec"] = age
+            summary["latest_trade_side"] = side
+            summary["latest_trade_usdc"] = usdc
+            summary["latest_trade_title"] = trade.get("title")
+
+        if age <= max_trade_age:
+            summary["fresh_trade_rows"] += 1
+            summary["processed_rows"] += 1
+            fresh_trades.append(trade)
+            if side == "BUY":
+                summary["fresh_buy_rows"] += 1
+                if usdc >= min_whale_size:
+                    summary["fresh_buy_ge_min_whale"] += 1
+        else:
+            summary["stale_trade_rows"] += 1
+
+    return summary, fresh_trades
+
+
+def _aggregate_poll_funnel(summaries: list[dict], active_trader_count: int, any_success: bool) -> dict:
+    count_keys = [
+        "fetched_rows",
+        "trade_rows",
+        "non_trade_rows",
+        "fresh_trade_rows",
+        "fresh_buy_rows",
+        "fresh_buy_ge_min_whale",
+        "stale_trade_rows",
+        "processed_rows",
+    ]
+    totals = {key: sum(int(row.get(key, 0) or 0) for row in summaries) for key in count_keys}
+    return {
+        "updated_at_utc": utc_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active_trader_count": active_trader_count,
+        "successful_trader_fetches": len(summaries),
+        "api_success": bool(any_success),
+        "max_trade_age_sec": MAX_TRADE_AGE,
+        "min_whale_size": MIN_WHALE_SIZE,
+        "totals": totals,
+        "traders": summaries,
+    }
+
+
 def poll_once(bot: PaperBot):
     any_success = False
+    poll_summaries = []
+    now_ts = int(time.time())
     with bot.lock:
         addrs = dict(bot.trader_addrs)
     for name, addr in addrs.items():
@@ -2008,12 +2094,10 @@ def poll_once(bot: PaperBot):
         if not data or not isinstance(data, list):
             continue
         any_success = True
-        cutoff = int(time.time()) - MAX_TRADE_AGE   # look back exactly MAX_TRADE_AGE (5 min)
-        for trade in data:
-            if trade.get("type", "TRADE") != "TRADE":
-                continue  # skip REDEEM, YIELD and other non-trade events
-            if int(trade.get("timestamp", 0)) >= cutoff:
-                process_trade(bot, name, trade)
+        summary, fresh_trades = _summarize_trader_poll(name, data, now_ts=now_ts)
+        poll_summaries.append(summary)
+        for trade in fresh_trades:
+            process_trade(bot, name, trade)
         time.sleep(0.3)
 
     with bot.lock:
@@ -2023,13 +2107,17 @@ def poll_once(bot: PaperBot):
             bot.api_fail_count += 1
             if bot.api_fail_count >= MAX_API_FAILURES:
                 bot.status_msg = (
-                    f"[WARN] API unreachable — {bot.api_fail_count} consecutive failures"
+                    f"[WARN] API unreachable - {bot.api_fail_count} consecutive failures"
                 )
         bot.last_poll = utc_now().strftime("%H:%M:%S UTC")
+        bot.store.set_value(
+            "poll_funnel",
+            _aggregate_poll_funnel(poll_summaries, len(addrs), any_success),
+        )
         _sync_health(bot)
 
 
-# ── Plain-text fallback dashboard ─────────────────────────────────────────────
+# Plain-text fallback dashboard
 def print_plain_dashboard(bot: PaperBot):
     os.system("cls" if os.name == "nt" else "clear")
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")

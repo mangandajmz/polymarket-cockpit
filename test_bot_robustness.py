@@ -59,6 +59,52 @@ class BotRobustnessTests(unittest.TestCase):
             "type": "TRADE",
         }
 
+    def test_poll_funnel_summarizes_fresh_and_stale_activity(self):
+        now = 1_800_000_000
+        rows = [
+            {"type": "REDEEM", "timestamp": now, "side": "BUY", "usdcSize": 5000},
+            {"type": "TRADE", "timestamp": now - 10, "side": "SELL", "usdcSize": 1200, "title": "Fresh sell"},
+            {"type": "TRADE", "timestamp": now - 20, "side": "BUY", "usdcSize": 999, "title": "Small buy"},
+            {"type": "TRADE", "timestamp": now - 30, "side": "BUY", "usdcSize": 1500, "title": "Whale buy"},
+            {"type": "TRADE", "timestamp": now - 301, "side": "BUY", "usdcSize": 5000, "title": "Stale buy"},
+        ]
+
+        summary, fresh = botmod._summarize_trader_poll(
+            "alice",
+            rows,
+            now_ts=now,
+            max_trade_age=300,
+            min_whale_size=1000,
+        )
+
+        self.assertEqual(summary["fetched_rows"], 5)
+        self.assertEqual(summary["non_trade_rows"], 1)
+        self.assertEqual(summary["trade_rows"], 4)
+        self.assertEqual(summary["fresh_trade_rows"], 3)
+        self.assertEqual(summary["fresh_buy_rows"], 2)
+        self.assertEqual(summary["fresh_buy_ge_min_whale"], 1)
+        self.assertEqual(summary["stale_trade_rows"], 1)
+        self.assertEqual(summary["processed_rows"], 3)
+        self.assertEqual(len(fresh), 3)
+        self.assertEqual(summary["latest_trade_title"], "Fresh sell")
+
+    def test_poll_funnel_aggregates_trader_summaries(self):
+        payload = botmod._aggregate_poll_funnel(
+            [
+                {"fetched_rows": 2, "trade_rows": 2, "fresh_trade_rows": 1, "fresh_buy_rows": 1, "fresh_buy_ge_min_whale": 0, "non_trade_rows": 0, "stale_trade_rows": 1, "processed_rows": 1},
+                {"fetched_rows": 3, "trade_rows": 1, "fresh_trade_rows": 0, "fresh_buy_rows": 0, "fresh_buy_ge_min_whale": 0, "non_trade_rows": 2, "stale_trade_rows": 1, "processed_rows": 0},
+            ],
+            active_trader_count=5,
+            any_success=True,
+        )
+
+        self.assertTrue(payload["api_success"])
+        self.assertEqual(payload["active_trader_count"], 5)
+        self.assertEqual(payload["successful_trader_fetches"], 2)
+        self.assertEqual(payload["totals"]["fetched_rows"], 5)
+        self.assertEqual(payload["totals"]["fresh_trade_rows"], 1)
+        self.assertEqual(payload["totals"]["processed_rows"], 1)
+
     def test_positions_are_isolated_per_trader(self):
         bot = botmod.PaperBot()
 
