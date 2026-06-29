@@ -23,6 +23,7 @@ Win rate estimation:
 """
 
 import json
+import os
 import time
 import threading
 from datetime import datetime, timezone
@@ -36,6 +37,18 @@ _DATA_API   = "https://data-api.polymarket.com/v1"
 _CLOB_API   = "https://clob.polymarket.com"
 _WR_SAMPLE  = 10    # positions to price per candidate (speed vs accuracy trade-off)
 _REQ_PAUSE  = 0.25  # seconds between CLOB API calls during WR estimation
+_LEADERBOARD_HEADROOM_MULT = 12
+_MIN_LEADERBOARD_CANDIDATES = 60
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+_RECENT_ACTIVITY_HOURS = _env_float("WATCHLIST_RECENT_ACTIVITY_HOURS", 24.0)
 
 CACHE_FILE  = Path("watchlist_cache.json")
 
@@ -70,6 +83,50 @@ def _fetch_market_price(condition_id: str, outcome_index: int) -> float | None:
         return float(tokens[outcome_index].get("price", 0.0))
     except (TypeError, ValueError):
         return None
+
+
+def _latest_trade_summary(address: str, now_ts: int | None = None) -> dict:
+    now_ts = int(time.time()) if now_ts is None else now_ts
+    data = _req(_DATA_API + "/trades", {
+        "user": address, "limit": 50, "offset": 0, "takerOnly": "false"
+    })
+    summary = {
+        "latest_trade_ts": 0,
+        "latest_trade_age_h": None,
+        "latest_trade_side": None,
+        "latest_trade_usdc": None,
+        "latest_trade_title": None,
+    }
+    if not isinstance(data, list):
+        return summary
+
+    latest = None
+    latest_ts = 0
+    for trade in data:
+        try:
+            ts = int(trade.get("timestamp", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts > latest_ts:
+            latest_ts = ts
+            latest = trade
+
+    if latest is None:
+        return summary
+
+    try:
+        usdc = float(latest.get("usdcSize") or latest.get("size") or 0)
+    except (TypeError, ValueError):
+        usdc = 0.0
+
+    summary.update({
+        "latest_trade_ts": latest_ts,
+        "latest_trade_age_h": max(0.0, (now_ts - latest_ts) / 3600),
+        "latest_trade_side": latest.get("side"),
+        "latest_trade_usdc": usdc,
+        "latest_trade_title": latest.get("title"),
+    })
+    return summary
 
 
 # ── Permanent address cache ───────────────────────────────────────────────────
@@ -255,14 +312,12 @@ class WatchlistManager:
     Maintains a live, auto-refreshing list of traders to copy.
 
     Trader selection (each refresh):
-      1. Fetch top (top_n × 6) traders from monthly PNL leaderboard.
-      2. Walk them in PNL order, estimating win rate for each.
-      3. Keep the first top_n traders whose win rate >= min_wr.
-      4. Cache all qualifying addresses permanently (append-only).
-      5. Push the new active list to bot.trader_addrs.
-
-    Early exit: stops evaluating candidates once top_n are found, so
-    we only check as many traders as needed — typically 5–15 for a 60% threshold.
+      1. Fetch top monthly-PNL traders with enough headroom for activity skips.
+      2. Skip traders whose latest trade is older than the recent-activity gate.
+      3. Walk active traders in PNL order, estimating win rate for each.
+      4. Keep the first top_n traders whose win rate >= min_wr.
+      5. Cache all qualifying addresses permanently (append-only).
+      6. Push the new active list to bot.trader_addrs.
     """
 
     def __init__(
@@ -346,10 +401,12 @@ class WatchlistManager:
             )
 
     def _do_refresh_inner(self):
-        # Fetch leaderboard — 6× headroom so we find top_n even with tight WR filter
+        # Fetch extra headroom so inactive top-PNL wallets do not crowd out
+        # active traders who can produce paper evidence today.
+        limit = max(_MIN_LEADERBOARD_CANDIDATES, self.top_n * _LEADERBOARD_HEADROOM_MULT)
         data = _req(_DATA_API + "/leaderboard", {
             "timePeriod": "MONTH", "orderBy": "PNL",
-            "limit": self.top_n * 6,
+            "limit": limit,
         })
         if not data:
             self._write_health(last_error="leaderboard_fetch_failed")
@@ -390,11 +447,26 @@ class WatchlistManager:
 
         qualified = []
         checked   = 0
+        skipped_inactive = 0
+        now_ts = int(time.time())
         for c in candidates:
             if c.get("name", "").lower() in TRADER_BLOCKLIST:
                 continue  # permanently blocked
             if len(qualified) >= self.top_n:
                 break
+            activity = _latest_trade_summary(c["addr"], now_ts=now_ts)
+            c.update(activity)
+            age_h = c.get("latest_trade_age_h")
+            if age_h is None or age_h > _RECENT_ACTIVITY_HOURS:
+                skipped_inactive += 1
+                age_text = "never" if age_h is None else f"{age_h:.1f}h"
+                self._log(
+                    f"  [Watchlist]   {c['name']:<28}  "
+                    f"PNL ${c['pnl']:>10,.0f}  "
+                    f"latest {age_text:>8}  inactive"
+                )
+                time.sleep(0.2)
+                continue
             checked += 1
             wr = _estimate_win_rate(c["addr"])
             c["win_rate"] = wr
@@ -402,6 +474,7 @@ class WatchlistManager:
             self._log(
                 f"  [Watchlist]   {c['name']:<28}  "
                 f"PNL ${c['pnl']:>10,.0f}  "
+                f"latest {age_h:>5.1f}h  "
                 f"WR {wr:5.1f}%  "
                 f"{'PASS' if passed else 'skip'}"
             )
@@ -413,7 +486,7 @@ class WatchlistManager:
             self._write_health(last_error="no_qualified_traders")
             self._log(
                 f"  [Watchlist] No traders passed {self.min_wr}% WR filter "
-                f"(checked {checked}) — keeping existing list "
+                f"(checked {checked}, skipped inactive {skipped_inactive}) — keeping existing list "
                 f"(last successful: {self.cache.get_last_successful_refresh()})"
             )
             return
@@ -426,6 +499,8 @@ class WatchlistManager:
                 last_error="insufficient_qualified_traders",
                 qualified_count=len(qualified),
                 min_required=min_required,
+                skipped_inactive=skipped_inactive,
+                recent_activity_hours=_RECENT_ACTIVITY_HOURS,
             )
             self._log(
                 f"  [Watchlist] Only {len(qualified)} qualified trader(s); "

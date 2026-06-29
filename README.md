@@ -171,6 +171,7 @@ Most strategy constants live near the top of `paper_trading_bot.py`. Environment
 | `MAX_DEPLOY_PCT` | `0.60` | Max open deployment as fraction of bankroll |
 | `HYBRID_VETO_THRESHOLD` | `0.65` | Shadow veto threshold for copied-trade labels |
 | `POLL_INTERVAL` | `30` | Seconds between polling cycles |
+| `WATCHLIST_RECENT_ACTIVITY_HOURS` | `24` | Maximum latest-trade age for dynamic watchlist candidates |
 
 Note: `DAILY_LOSS_CAP` is a net resolved loss cap, not a total daily spend cap.
 
@@ -198,6 +199,12 @@ Start the paper bot:
 
 ```powershell
 python paper_trading_bot.py
+```
+
+Install or refresh the local Windows scheduled task:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install_paper_bot_task.ps1
 ```
 
 In a second terminal, start the local dashboard:

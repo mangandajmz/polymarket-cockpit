@@ -6,6 +6,7 @@
 paper_trades.csv
 live_trades.csv
 bot.log
+logs/
 bot_state.db
 bot_state.db-*
 seen_hashes.json
