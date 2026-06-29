@@ -1,4 +1,4 @@
-# Polymarket Copy Trading Bot
+﻿# Polymarket Copy Trading Bot
 
 A local-first paper-trading research cockpit for [Polymarket](https://polymarket.com).
 It discovers high-performing traders, simulates copying qualifying BUY trades, records every observed opportunity to SQLite, and provides local analysis tools for improving the strategy.
@@ -232,6 +232,7 @@ Stop either process with `Ctrl+C`.
 |---|---|
 | Initialize state DB | `python init_state.py` |
 | Health summary | `python health_check.py` |
+| World Cup API spike | `python worldcup_api_spike.py --limit 25 --sample-price-count 3` |
 | Replay opportunities | `python opportunity_replay.py --db bot_state.db` |
 | Daily evaluation | `python daily_evaluation_report.py --db bot_state.db --days 7` |
 | Force-resolve stale position | `python force_resolve.py --help` |
@@ -265,6 +266,7 @@ Runtime files are local-only and ignored by git:
 |-- category_utils.py          # Market category classification
 |-- health_check.py            # One-shot local health summary
 |-- force_resolve.py           # Manual stale-position resolution tool
+|-- worldcup_api_spike.py      # Read-only World Cup market/API discovery spike
 |-- requirements.txt           # Python dependencies
 |-- .env.example               # Local environment template
 |-- .gitignore                 # Secrets/runtime state exclusions

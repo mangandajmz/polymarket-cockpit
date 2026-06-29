@@ -1,12 +1,12 @@
-# Handoff
+﻿# Handoff
 
 ## Current Snapshot
 
-- Date: 2026-06-28 America/Vancouver
+- Date: 2026-06-29 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `858f042 Record active Polymarket bot restart`
+- Last commit reviewed: `3aa4cc8 Make local dashboard password optional`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
-- Latest push: `main` tracks `origin/main` at `858f042`.
+- Latest push: `main` tracks `origin/main` at `3aa4cc8`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -60,6 +60,14 @@ is a later addition to a proven system, not part of the current development loop
 - Dashboard operator flow is being simplified: blank/default `DASHBOARD_PASSWORD`
   now means passwordless localhost access. Setting a real `DASHBOARD_PASSWORD`
   still enables the login gate.
+- World Cup assistant work has started with a read-only API spike in
+  `worldcup_api_spike.py`. It uses Gamma public search/markets and CLOB books,
+  does not use wallet auth, does not sign anything, and does not attempt RFQ
+  quote acceptance.
+- Live spike on `2026 FIFA World Cup` found 5 event groups, 12 active winner
+  markets, 24 CLOB token IDs, and 3 sampled books with midpoints. A
+  `World Cup combo` query still found 0 combo candidates, so combo/RFQ support
+  remains unproven and should not drive the next product slice yet.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed.
 
@@ -67,12 +75,14 @@ is a later addition to a proven system, not part of the current development loop
 
 1. Keep the new scheduled task running and check `python health_check.py` after
    more market activity.
-2. Inspect the 9 fresh skipped opportunities in the dashboard or with
+2. For the World Cup assistant, turn the spike into a persisted market snapshot:
+   store event/market/token/book rows in SQLite and expose a small odds table.
+3. Inspect the 9 fresh skipped opportunities in the dashboard or with
    `python opportunity_replay.py --db bot_state.db` to decide whether the `$1,000`
    whale threshold is too strict for the newly active watchlist.
-3. Run `python daily_evaluation_report.py --db bot_state.db --days 7` after more
+4. Run `python daily_evaluation_report.py --db bot_state.db --days 7` after more
    opportunities resolve.
-4. If fresh BUYs continue but all stay below the whale threshold, tune watchlist
+5. If fresh BUYs continue but all stay below the whale threshold, tune watchlist
    quality/size thresholds before loosening copy/risk rules.
 
 ## Open Questions
@@ -100,3 +110,10 @@ is a later addition to a proven system, not part of the current development loop
   total, 8 open recommendations, 0 open paper positions.
 - `python -m py_compile dashboard.py` passed after the passwordless dashboard change.
 - `python -m pytest -q` passed after the passwordless dashboard change: 54 tests.
+- `python -m pytest test_worldcup_api_spike.py -q` passed: 4 tests.
+- `python worldcup_api_spike.py --limit 25 --sample-price-count 3` live check
+  passed: 5 event groups, 12 markets, 24 tokens, 3 sampled books.
+- `python worldcup_api_spike.py --query "World Cup combo" --limit 25
+  --sample-price-count 3` live check passed but found 0 combo candidates.
+- `python -m py_compile worldcup_api_spike.py` passed.
+- `python -m pytest -q` passed after the World Cup spike: 58 tests.
