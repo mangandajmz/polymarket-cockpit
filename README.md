@@ -213,6 +213,9 @@ In a second terminal, start the local dashboard:
 python -m streamlit run dashboard.py --server.address 127.0.0.1 --server.port 8501
 ```
 
+By default, the localhost dashboard opens without a password. Set
+`DASHBOARD_PASSWORD` in `.env` only if you want a local login gate.
+
 Open the dashboard at:
 
 ```text

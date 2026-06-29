@@ -4,9 +4,9 @@
 
 - Date: 2026-06-28 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `c373632 Keep Polymarket paper bot active`
+- Last commit reviewed: `858f042 Record active Polymarket bot restart`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
-- Latest push: `main` tracks `origin/main` at `c373632`.
+- Latest push: `main` tracks `origin/main` at `858f042`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -57,6 +57,9 @@ is a later addition to a proven system, not part of the current development loop
   1 AVOID recommendation, 0 open paper positions, 0 copied fills. The new rows
   were skipped because the observed BreakTheBank trades were below the `$1,000`
   whale-size threshold.
+- Dashboard operator flow is being simplified: blank/default `DASHBOARD_PASSWORD`
+  now means passwordless localhost access. Setting a real `DASHBOARD_PASSWORD`
+  still enables the login gate.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed.
 
@@ -78,8 +81,8 @@ is a later addition to a proven system, not part of the current development loop
   recent traders, e.g. 6-12 hours?
 - Should watchlist ranking evolve from filter-by-recency to a weighted PNL / WR /
   freshness score after initial evidence arrives?
-- Should the dashboard require a real local password immediately, or can initial
-  development focus on bot/database health first?
+- If the dashboard is ever bound beyond `127.0.0.1`, restore a real password gate
+  before exposing it.
 
 ## Last Verification
 
@@ -95,3 +98,5 @@ is a later addition to a proven system, not part of the current development loop
   API failures 0, no invariant issues.
 - `python property_status.py` regenerated `state/status.json`: 9 recommendations
   total, 8 open recommendations, 0 open paper positions.
+- `python -m py_compile dashboard.py` passed after the passwordless dashboard change.
+- `python -m pytest -q` passed after the passwordless dashboard change: 54 tests.
