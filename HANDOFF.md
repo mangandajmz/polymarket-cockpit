@@ -4,9 +4,9 @@
 
 - Date: 2026-06-29 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `3aa4cc8 Make local dashboard password optional`
+- Last commit reviewed: `a4ea441 Add read-only World Cup API spike`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
-- Latest push: `main` tracks `origin/main` at `3aa4cc8`.
+- Latest push: `main` tracks `origin/main` at `a4ea441`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -68,15 +68,21 @@ is a later addition to a proven system, not part of the current development loop
   markets, 24 CLOB token IDs, and 3 sampled books with midpoints. A
   `World Cup combo` query still found 0 combo candidates, so combo/RFQ support
   remains unproven and should not drive the next product slice yet.
+- World Cup snapshots are now persisted separately from the paper bot runtime in
+  ignored `worldcup_markets.db`. `worldcup_snapshot.py` stores snapshot runs,
+  events, markets, tokens, and sampled CLOB books, then prints a compact local
+  odds table with bid/ask/mid/spread.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
-  watchlist cache remain ignored and should not be committed.
+  watchlist cache remain ignored and should not be committed. World Cup snapshot
+  runtime files `worldcup_markets.db` and `worldcup_markets.db-*` are also
+  ignored.
 
 ## Next Recommended Work
 
 1. Keep the new scheduled task running and check `python health_check.py` after
    more market activity.
-2. For the World Cup assistant, turn the spike into a persisted market snapshot:
-   store event/market/token/book rows in SQLite and expose a small odds table.
+2. For the World Cup assistant, add operator probability inputs and a first edge
+   board over the persisted odds table.
 3. Inspect the 9 fresh skipped opportunities in the dashboard or with
    `python opportunity_replay.py --db bot_state.db` to decide whether the `$1,000`
    whale threshold is too strict for the newly active watchlist.
@@ -117,3 +123,10 @@ is a later addition to a proven system, not part of the current development loop
   --sample-price-count 3` live check passed but found 0 combo candidates.
 - `python -m py_compile worldcup_api_spike.py` passed.
 - `python -m pytest -q` passed after the World Cup spike: 58 tests.
+- `python -m py_compile worldcup_snapshot.py worldcup_api_spike.py` passed.
+- `python -m pytest test_worldcup_snapshot.py test_worldcup_api_spike.py -q`
+  passed: 7 tests.
+- `python worldcup_snapshot.py --limit 25 --sample-price-count 5 --odds-limit 5`
+  live check passed: saved 12 markets, 24 tokens, 5 sampled books, and printed
+  an odds table.
+- `python -m pytest -q` passed after the World Cup snapshot: 61 tests.

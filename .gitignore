@@ -9,6 +9,8 @@ bot.log
 logs/
 bot_state.db
 bot_state.db-*
+worldcup_markets.db
+worldcup_markets.db-*
 seen_hashes.json
 watchlist_cache.json
 
