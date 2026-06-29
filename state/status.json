@@ -1,16 +1,16 @@
 {
   "approvals_pending": [],
-  "as_of": "2026-06-25T02:46:18.251308+00:00",
+  "as_of": "2026-06-29T04:29:59.811660+00:00",
   "display_name": "Polymarket Recommendation Cockpit",
   "evidence_ref": "README.md",
-  "headline": "Paper cockpit ready: 0 open recommendations, 0 open paper positions.",
+  "headline": "Paper cockpit ready: 8 open recommendations, 0 open paper positions.",
   "kpis": {
-    "avoid_recommendations": 0,
+    "avoid_recommendations": 1,
     "open_positions": 0,
-    "open_recommendations": 0,
-    "recommendations_total": 0,
+    "open_recommendations": 8,
+    "recommendations_total": 9,
     "state_db_present": 1,
-    "unresolved_opportunities": 0
+    "unresolved_opportunities": 9
   },
   "property_id": "polymarket_cockpit",
   "schema_version": "property_status.v1",
