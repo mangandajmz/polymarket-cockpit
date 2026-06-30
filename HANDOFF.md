@@ -4,9 +4,9 @@
 
 - Date: 2026-06-30 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `9cbb43d Persist World Cup market snapshots`
+- Last commit reviewed: `3986ec1 Add World Cup probability edge board`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
-- Latest push: `main` tracks `origin/main` at `9cbb43d`.
+- Latest push: `main` tracks `origin/main` at `3986ec1`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -77,6 +77,10 @@ is a later addition to a proven system, not part of the current development loop
   persisted odds, and ranks `user_probability - midpoint` while supporting spread
   and minimum-edge filters. The default operator CSV `worldcup_probabilities.csv`
   is ignored so private assumptions do not get committed.
+- World Cup paper recommendation tracking now saves selected edge-board rows into
+  ignored `worldcup_markets.db` with thesis, status, entry midpoint, operator
+  probability, edge, spread, and captured odds context. It remains paper-only and
+  does not introduce wallet, signing, or live execution paths.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed. World Cup snapshot
   runtime files `worldcup_markets.db` and `worldcup_markets.db-*` are also
@@ -86,8 +90,9 @@ is a later addition to a proven system, not part of the current development loop
 
 1. Keep the new scheduled task running and check `python health_check.py` after
    more market activity.
-2. For the World Cup assistant, add paper recommendation tracking from edge
-   board rows, including thesis, entry midpoint, and later resolution fields.
+2. For the World Cup assistant, add recommendation resolution/evaluation so
+   saved World Cup paper recommendations can be reviewed against outcomes and
+   probability error over time.
 3. Inspect the 9 fresh skipped opportunities in the dashboard or with
    `python opportunity_replay.py --db bot_state.db` to decide whether the `$1,000`
    whale threshold is too strict for the newly active watchlist.
@@ -140,3 +145,8 @@ is a later addition to a proven system, not part of the current development loop
 - `python -m pytest test_worldcup_edge.py test_worldcup_snapshot.py test_worldcup_api_spike.py -q` passed: 10 tests.
 - `python worldcup_edge.py --probabilities <temp-smoke-csv> --max-spread 0.05 --limit 5` passed against local `worldcup_markets.db` and printed an edge row.
 - `python -m pytest -q` passed after the World Cup edge board: 64 tests.
+- `python -m pytest test_worldcup_recommendations.py -q` passed: 3 tests.
+- `python -m py_compile worldcup_recommendations.py worldcup_edge.py worldcup_snapshot.py worldcup_api_spike.py` passed.
+- `python -m pytest test_worldcup_recommendations.py test_worldcup_edge.py test_worldcup_snapshot.py test_worldcup_api_spike.py -q` passed: 13 tests.
+- `python worldcup_recommendations.py --probabilities <temp-smoke-csv> --token-id <sampled-token> --status WATCH --thesis "smoke recommendation from edge row"` passed against local ignored `worldcup_markets.db` and listed the saved paper recommendation.
+- `python -m pytest -q` passed after World Cup paper recommendation tracking: 67 tests.
