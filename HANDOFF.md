@@ -2,11 +2,11 @@
 
 ## Current Snapshot
 
-- Date: 2026-06-29 America/Vancouver
+- Date: 2026-06-30 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `a4ea441 Add read-only World Cup API spike`
+- Last commit reviewed: `9cbb43d Persist World Cup market snapshots`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
-- Latest push: `main` tracks `origin/main` at `a4ea441`.
+- Latest push: `main` tracks `origin/main` at `9cbb43d`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -72,6 +72,11 @@ is a later addition to a proven system, not part of the current development loop
   ignored `worldcup_markets.db`. `worldcup_snapshot.py` stores snapshot runs,
   events, markets, tokens, and sampled CLOB books, then prints a compact local
   odds table with bid/ask/mid/spread.
+- The first World Cup edge board is available. `worldcup_edge.py` reads a
+  local operator CSV of `token_id,user_probability,note`, joins it to the latest
+  persisted odds, and ranks `user_probability - midpoint` while supporting spread
+  and minimum-edge filters. The default operator CSV `worldcup_probabilities.csv`
+  is ignored so private assumptions do not get committed.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed. World Cup snapshot
   runtime files `worldcup_markets.db` and `worldcup_markets.db-*` are also
@@ -81,8 +86,8 @@ is a later addition to a proven system, not part of the current development loop
 
 1. Keep the new scheduled task running and check `python health_check.py` after
    more market activity.
-2. For the World Cup assistant, add operator probability inputs and a first edge
-   board over the persisted odds table.
+2. For the World Cup assistant, add paper recommendation tracking from edge
+   board rows, including thesis, entry midpoint, and later resolution fields.
 3. Inspect the 9 fresh skipped opportunities in the dashboard or with
    `python opportunity_replay.py --db bot_state.db` to decide whether the `$1,000`
    whale threshold is too strict for the newly active watchlist.
@@ -130,3 +135,8 @@ is a later addition to a proven system, not part of the current development loop
   live check passed: saved 12 markets, 24 tokens, 5 sampled books, and printed
   an odds table.
 - `python -m pytest -q` passed after the World Cup snapshot: 61 tests.
+- `python -m pytest test_worldcup_edge.py -q` passed: 3 tests.
+- `python -m py_compile worldcup_edge.py worldcup_snapshot.py worldcup_api_spike.py` passed.
+- `python -m pytest test_worldcup_edge.py test_worldcup_snapshot.py test_worldcup_api_spike.py -q` passed: 10 tests.
+- `python worldcup_edge.py --probabilities <temp-smoke-csv> --max-spread 0.05 --limit 5` passed against local `worldcup_markets.db` and printed an edge row.
+- `python -m pytest -q` passed after the World Cup edge board: 64 tests.

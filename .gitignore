@@ -11,6 +11,7 @@ bot_state.db
 bot_state.db-*
 worldcup_markets.db
 worldcup_markets.db-*
+worldcup_probabilities.csv
 seen_hashes.json
 watchlist_cache.json
 

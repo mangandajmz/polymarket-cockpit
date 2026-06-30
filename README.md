@@ -234,6 +234,7 @@ Stop either process with `Ctrl+C`.
 | Health summary | `python health_check.py` |
 | World Cup API spike | `python worldcup_api_spike.py --limit 25 --sample-price-count 3` |
 | World Cup snapshot | `python worldcup_snapshot.py --limit 25 --sample-price-count 10` |
+| World Cup edge board | `python worldcup_edge.py --probabilities worldcup_probabilities.csv --max-spread 0.01` |
 | Replay opportunities | `python opportunity_replay.py --db bot_state.db` |
 | Daily evaluation | `python daily_evaluation_report.py --db bot_state.db --days 7` |
 | Force-resolve stale position | `python force_resolve.py --help` |
@@ -269,6 +270,7 @@ Runtime files are local-only and ignored by git:
 |-- force_resolve.py           # Manual stale-position resolution tool
 |-- worldcup_api_spike.py      # Read-only World Cup market/API discovery spike
 |-- worldcup_snapshot.py       # SQLite snapshot store and odds-table CLI
+|-- worldcup_edge.py           # User-probability edge board CLI
 |-- requirements.txt           # Python dependencies
 |-- .env.example               # Local environment template
 |-- .gitignore                 # Secrets/runtime state exclusions
