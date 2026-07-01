@@ -116,6 +116,8 @@ class WorldCupRecommendationTests(unittest.TestCase):
                 "midpoint": 0.111,
                 "edge": 0.029,
                 "thesis": "Brazil price underrates squad depth.",
+                "resolution_result": "WON",
+                "brier_score": 0.7396,
             }
         ]
 
@@ -125,7 +127,55 @@ class WorldCupRecommendationTests(unittest.TestCase):
         self.assertIn("WATCH", table)
         self.assertIn("Brazil", table)
         self.assertIn("+0.029", table)
+        self.assertIn("WON", table)
+        self.assertIn("0.740", table)
         self.assertIn("squad depth", table)
+
+    def test_resolve_recommendation_records_probability_metrics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "worldcup.db"
+            WorldCupSnapshotStore(db_path).save_result(
+                _sample_result(),
+                captured_at_utc="2026-06-30 12:00:00",
+                snapshot_id="snap-1",
+            )
+            recommend_from_edge(
+                db_path=db_path,
+                probabilities={"token-brazil-yes": 0.14},
+                token_id="token-brazil-yes",
+                thesis="Brazil price underrates squad depth.",
+                recommendation_id="rec-1",
+                created_at_utc="2026-06-30 12:05:00",
+            )
+            store = WorldCupRecommendationStore(db_path)
+
+            resolved = store.resolve_recommendation(
+                "rec-1",
+                result="WON",
+                resolved_at_utc="2026-07-20 20:00:00",
+                note="settled by market result",
+            )
+            rows = store.load_recommendations()
+            summary = store.load_evaluation_summary()
+
+        self.assertEqual(resolved["resolution_result"], "WON")
+        self.assertEqual(resolved["resolved_probability"], 1.0)
+        self.assertAlmostEqual(resolved["brier_score"], 0.7396)
+        self.assertAlmostEqual(resolved["market_brier_score"], 0.790321)
+        self.assertAlmostEqual(resolved["brier_edge"], 0.050721)
+        self.assertEqual(rows[0]["resolution_result"], "WON")
+        self.assertEqual(rows[0]["resolution_note"], "settled by market result")
+        self.assertEqual(summary["resolved_count"], 1)
+        self.assertAlmostEqual(summary["average_brier_score"], 0.7396)
+        self.assertAlmostEqual(summary["average_market_brier_score"], 0.790321)
+        self.assertAlmostEqual(summary["average_brier_edge"], 0.050721)
+
+    def test_resolve_recommendation_rejects_invalid_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = WorldCupRecommendationStore(Path(tmpdir) / "worldcup.db")
+
+            with self.assertRaises(ValueError):
+                store.resolve_recommendation("missing", result="MAYBE")
 
 
 if __name__ == "__main__":

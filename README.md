@@ -236,6 +236,8 @@ Stop either process with `Ctrl+C`.
 | World Cup snapshot | `python worldcup_snapshot.py --limit 25 --sample-price-count 10` |
 | World Cup edge board | `python worldcup_edge.py --probabilities worldcup_probabilities.csv --max-spread 0.01` |
 | World Cup paper recommendation | `python worldcup_recommendations.py --probabilities worldcup_probabilities.csv --token-id <token_id> --thesis "model edge plus injury/schedule thesis"` |
+| World Cup recommendation resolution | `python worldcup_recommendations.py --resolve <recommendation_id> --result WON --resolution-note "settled by market result"` |
+| World Cup evaluation summary | `python worldcup_recommendations.py --summary` |
 | Replay opportunities | `python opportunity_replay.py --db bot_state.db` |
 | Daily evaluation | `python daily_evaluation_report.py --db bot_state.db --days 7` |
 | Force-resolve stale position | `python force_resolve.py --help` |
@@ -272,7 +274,7 @@ Runtime files are local-only and ignored by git:
 |-- worldcup_api_spike.py      # Read-only World Cup market/API discovery spike
 |-- worldcup_snapshot.py       # SQLite snapshot store and odds-table CLI
 |-- worldcup_edge.py           # User-probability edge board CLI
-|-- worldcup_recommendations.py # Paper recommendation tracker for World Cup edges
+|-- worldcup_recommendations.py # Paper recommendation tracker/evaluator for World Cup edges
 |-- requirements.txt           # Python dependencies
 |-- .env.example               # Local environment template
 |-- .gitignore                 # Secrets/runtime state exclusions

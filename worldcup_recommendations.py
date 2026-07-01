@@ -19,6 +19,7 @@ from worldcup_snapshot import DEFAULT_DB_PATH, WorldCupSnapshotStore, utc_now_st
 
 
 VALID_STATUSES = {"WATCH", "RECOMMEND", "AVOID"}
+RESOLUTION_RESULTS = {"WON": 1.0, "LOST": 0.0, "VOID": None}
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,14 @@ class WorldCupRecommendationStore:
                     best_ask REAL,
                     thesis TEXT NOT NULL,
                     note TEXT NOT NULL,
-                    captured_at_utc TEXT NOT NULL
+                    captured_at_utc TEXT NOT NULL,
+                    resolved_at_utc TEXT,
+                    resolution_result TEXT,
+                    resolved_probability REAL,
+                    brier_score REAL,
+                    market_brier_score REAL,
+                    brier_edge REAL,
+                    resolution_note TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_worldcup_recommendations_created
@@ -91,6 +99,25 @@ class WorldCupRecommendationStore:
                     ON worldcup_recommendations(token_id);
                 """
             )
+            self._ensure_resolution_columns(conn)
+
+    def _ensure_resolution_columns(self, conn: sqlite3.Connection) -> None:
+        existing = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(worldcup_recommendations)").fetchall()
+        }
+        columns = {
+            "resolved_at_utc": "TEXT",
+            "resolution_result": "TEXT",
+            "resolved_probability": "REAL",
+            "brier_score": "REAL",
+            "market_brier_score": "REAL",
+            "brier_edge": "REAL",
+            "resolution_note": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE worldcup_recommendations ADD COLUMN {name} {ddl}")
 
     def save_recommendation(self, record: RecommendationRecord) -> RecommendationRecord:
         with self._connection() as conn:
@@ -137,14 +164,87 @@ class WorldCupRecommendationStore:
             )
         return record
 
+    def resolve_recommendation(
+        self,
+        recommendation_id: str,
+        *,
+        result: str,
+        resolved_at_utc: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        result = result.upper()
+        if result not in RESOLUTION_RESULTS:
+            raise ValueError(f"result must be one of {', '.join(sorted(RESOLUTION_RESULTS))}")
+
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT recommendation_id, user_probability, midpoint
+                FROM worldcup_recommendations
+                WHERE recommendation_id = ?
+                """,
+                (recommendation_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"recommendation_id {recommendation_id!r} was not found")
+
+            resolved_probability = RESOLUTION_RESULTS[result]
+            brier_score = None
+            market_brier_score = None
+            brier_edge = None
+            if resolved_probability is not None:
+                user_probability = float(row["user_probability"])
+                midpoint = float(row["midpoint"])
+                brier_score = round((user_probability - resolved_probability) ** 2, 6)
+                market_brier_score = round((midpoint - resolved_probability) ** 2, 6)
+                brier_edge = round(market_brier_score - brier_score, 6)
+
+            conn.execute(
+                """
+                UPDATE worldcup_recommendations
+                SET resolved_at_utc = ?,
+                    resolution_result = ?,
+                    resolved_probability = ?,
+                    brier_score = ?,
+                    market_brier_score = ?,
+                    brier_edge = ?,
+                    resolution_note = ?
+                WHERE recommendation_id = ?
+                """,
+                (
+                    resolved_at_utc or utc_now_str(),
+                    result,
+                    resolved_probability,
+                    brier_score,
+                    market_brier_score,
+                    brier_edge,
+                    note.strip(),
+                    recommendation_id,
+                ),
+            )
+            updated = self._load_recommendation(conn, recommendation_id)
+        return updated
+
+    def _load_recommendation(
+        self, conn: sqlite3.Connection, recommendation_id: str
+    ) -> dict[str, Any]:
+        row = conn.execute(
+            f"""
+            SELECT {', '.join(_recommendation_columns())}
+            FROM worldcup_recommendations
+            WHERE recommendation_id = ?
+            """,
+            (recommendation_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"recommendation_id {recommendation_id!r} was not found")
+        return dict(row)
+
     def load_recommendations(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._connection() as conn:
             rows = conn.execute(
-                """
-                SELECT
-                    recommendation_id, created_at_utc, status, token_id, question,
-                    outcome, user_probability, midpoint, edge, spread, best_bid,
-                    best_ask, thesis, note, captured_at_utc
+                f"""
+                SELECT {', '.join(_recommendation_columns())}
                 FROM worldcup_recommendations
                 ORDER BY created_at_utc DESC, recommendation_id DESC
                 LIMIT ?
@@ -152,6 +252,49 @@ class WorldCupRecommendationStore:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def load_evaluation_summary(self) -> dict[str, Any]:
+        with self._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS resolved_count,
+                    AVG(brier_score) AS average_brier_score,
+                    AVG(market_brier_score) AS average_market_brier_score,
+                    AVG(brier_edge) AS average_brier_edge
+                FROM worldcup_recommendations
+                WHERE resolution_result IN ('WON', 'LOST')
+                    AND brier_score IS NOT NULL
+                """
+            ).fetchone()
+        return dict(row)
+
+
+def _recommendation_columns() -> list[str]:
+    return [
+        "recommendation_id",
+        "created_at_utc",
+        "status",
+        "token_id",
+        "question",
+        "outcome",
+        "user_probability",
+        "midpoint",
+        "edge",
+        "spread",
+        "best_bid",
+        "best_ask",
+        "thesis",
+        "note",
+        "captured_at_utc",
+        "resolved_at_utc",
+        "resolution_result",
+        "resolved_probability",
+        "brier_score",
+        "market_brier_score",
+        "brier_edge",
+        "resolution_note",
+    ]
 
 
 def make_recommendation_record(
@@ -229,6 +372,8 @@ def _fmt_price(value: Any) -> str:
 
 
 def _fmt_edge(value: Any) -> str:
+    if value is None:
+        return "-"
     return f"{float(value):+.3f}"
 
 
@@ -240,8 +385,19 @@ def format_recommendations_table(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "No World Cup paper recommendations have been saved."
 
-    headers = ["Created UTC", "Status", "Question", "Outcome", "User P", "Mid", "Edge", "Thesis"]
-    widths = [19, 9, 38, 8, 7, 7, 7, 36]
+    headers = [
+        "Created UTC",
+        "Status",
+        "Question",
+        "Outcome",
+        "User P",
+        "Mid",
+        "Edge",
+        "Result",
+        "Brier",
+        "Thesis",
+    ]
+    widths = [19, 9, 34, 7, 7, 7, 7, 7, 7, 40]
     lines = [
         " | ".join(header.ljust(width) for header, width in zip(headers, widths)),
         "-+-".join("-" * width for width in widths),
@@ -255,15 +411,28 @@ def format_recommendations_table(rows: list[dict[str, Any]]) -> str:
             _fmt_price(row.get("user_probability")).rjust(widths[4]),
             _fmt_price(row.get("midpoint")).rjust(widths[5]),
             _fmt_edge(row.get("edge")).rjust(widths[6]),
-            _clip(str(row.get("thesis") or ""), widths[7]).ljust(widths[7]),
+            str(row.get("resolution_result") or "-").ljust(widths[7]),
+            _fmt_price(row.get("brier_score")).rjust(widths[8]),
+            _clip(str(row.get("thesis") or ""), widths[9]).ljust(widths[9]),
         ]
         lines.append(" | ".join(values))
     return "\n".join(lines)
 
 
+def format_evaluation_summary(summary: dict[str, Any]) -> str:
+    if not summary.get("resolved_count"):
+        return "No resolved World Cup paper recommendations yet."
+    return (
+        f"Resolved: {summary['resolved_count']} | "
+        f"Avg Brier: {_fmt_price(summary.get('average_brier_score'))} | "
+        f"Avg Market Brier: {_fmt_price(summary.get('average_market_brier_score'))} | "
+        f"Avg Brier Edge: {_fmt_edge(summary.get('average_brier_edge'))}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Save and list paper-only World Cup recommendations from edge-board rows."
+        description="Save, resolve, and list paper-only World Cup recommendations."
     )
     parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--probabilities", default=str(DEFAULT_PROBABILITY_PATH))
@@ -272,17 +441,42 @@ def main() -> None:
     parser.add_argument("--status", choices=sorted(VALID_STATUSES), default="WATCH")
     parser.add_argument("--max-spread", type=float, default=None)
     parser.add_argument("--min-edge", type=float, default=None)
+    parser.add_argument("--resolve")
+    parser.add_argument("--result", choices=sorted(RESOLUTION_RESULTS))
+    parser.add_argument("--resolved-at")
+    parser.add_argument("--resolution-note", default="")
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--summary", action="store_true")
     parser.add_argument("--limit", type=int, default=25)
     args = parser.parse_args()
 
     recommendation_store = WorldCupRecommendationStore(args.db)
+    if args.summary:
+        print(format_evaluation_summary(recommendation_store.load_evaluation_summary()))
+        return
+
     if args.list:
         print(format_recommendations_table(recommendation_store.load_recommendations(limit=args.limit)))
         return
 
+    if args.resolve:
+        if not args.result:
+            parser.error("--result is required with --resolve")
+        record = recommendation_store.resolve_recommendation(
+            args.resolve,
+            result=args.result,
+            resolved_at_utc=args.resolved_at,
+            note=args.resolution_note,
+        )
+        print(f"Resolved World Cup paper recommendation {record['recommendation_id']}.")
+        print()
+        print(format_recommendations_table([record]))
+        print()
+        print(format_evaluation_summary(recommendation_store.load_evaluation_summary()))
+        return
+
     if not args.token_id or not args.thesis:
-        parser.error("--token-id and --thesis are required unless --list is used")
+        parser.error("--token-id and --thesis are required unless --list, --summary, or --resolve is used")
 
     probabilities = load_probability_file(args.probabilities)
     record = recommend_from_edge(
