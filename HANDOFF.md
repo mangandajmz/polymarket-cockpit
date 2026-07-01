@@ -2,11 +2,11 @@
 
 ## Current Snapshot
 
-- Date: 2026-06-30 America/Vancouver
+- Date: 2026-07-01 America/Vancouver
 - Branch: `main`
-- Last commit reviewed: `2af1231 Track World Cup paper recommendations`
+- Last commit reviewed: `f8f048e Evaluate World Cup paper recommendations`
 - Remote: `origin` -> `https://github.com/mangandajmz/polymarket-cockpit.git`
-- Latest push: `main` tracks `origin/main` at `2af1231`.
+- Latest push: `main` tracks `origin/main` at `f8f048e`.
 - Mode: local-first, paper-only recommendation cockpit
 
 ## Product Direction
@@ -84,6 +84,10 @@ is a later addition to a proven system, not part of the current development loop
 - World Cup recommendation resolution/evaluation is now manual and local: saved
   recommendations can be marked `WON`, `LOST`, or `VOID`, with Brier score,
   market-midpoint Brier score, and Brier edge persisted for calibration review.
+- A static local World Cup HTML report can now be generated with
+  `worldcup_report.py`. It summarizes saved/open/resolved recommendations,
+  calibration metrics, and recommendation rows without starting a web server.
+  The default output `worldcup_report.html` is ignored.
 - Runtime files such as `.env`, `bot_state.db`, `paper_trades.csv`, logs, and
   watchlist cache remain ignored and should not be committed. World Cup snapshot
   runtime files `worldcup_markets.db` and `worldcup_markets.db-*` are also
@@ -93,9 +97,8 @@ is a later addition to a proven system, not part of the current development loop
 
 1. Keep the new scheduled task running and check `python health_check.py` after
    more market activity.
-2. For the World Cup assistant, add a local dashboard/report view for saved and
-   resolved recommendations so edge quality can be reviewed without reading CLI
-   tables.
+2. For the World Cup assistant, add current-price refresh/evidence capture for
+   saved recommendations so open paper calls can be monitored after entry.
 3. Inspect the 9 fresh skipped opportunities in the dashboard or with
    `python opportunity_replay.py --db bot_state.db` to decide whether the `$1,000`
    whale threshold is too strict for the newly active watchlist.
@@ -158,3 +161,8 @@ is a later addition to a proven system, not part of the current development loop
 - `python -m pytest test_worldcup_recommendations.py test_worldcup_edge.py test_worldcup_snapshot.py test_worldcup_api_spike.py -q` passed after manual resolution/evaluation: 15 tests.
 - `python worldcup_recommendations.py --probabilities <temp-smoke-csv> --token-id <sampled-token> --thesis "resolution smoke recommendation"`, `--resolve <saved-id> --result LOST`, and `--summary` passed against local ignored `worldcup_markets.db`.
 - `python -m pytest -q` passed after World Cup recommendation resolution/evaluation: 69 tests.
+- `python -m pytest test_worldcup_report.py -q` passed for the static HTML report: 2 tests.
+- `python -m py_compile worldcup_report.py worldcup_recommendations.py worldcup_edge.py worldcup_snapshot.py worldcup_api_spike.py` passed.
+- `python -m pytest test_worldcup_report.py test_worldcup_recommendations.py test_worldcup_edge.py test_worldcup_snapshot.py test_worldcup_api_spike.py -q` passed: 17 tests.
+- `python worldcup_report.py --output worldcup_report.html --limit 10` passed against local ignored `worldcup_markets.db` and wrote ignored `worldcup_report.html`.
+- `python -m pytest -q` passed after World Cup static report generation: 71 tests.

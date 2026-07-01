@@ -238,6 +238,7 @@ Stop either process with `Ctrl+C`.
 | World Cup paper recommendation | `python worldcup_recommendations.py --probabilities worldcup_probabilities.csv --token-id <token_id> --thesis "model edge plus injury/schedule thesis"` |
 | World Cup recommendation resolution | `python worldcup_recommendations.py --resolve <recommendation_id> --result WON --resolution-note "settled by market result"` |
 | World Cup evaluation summary | `python worldcup_recommendations.py --summary` |
+| World Cup HTML report | `python worldcup_report.py --output worldcup_report.html` |
 | Replay opportunities | `python opportunity_replay.py --db bot_state.db` |
 | Daily evaluation | `python daily_evaluation_report.py --db bot_state.db --days 7` |
 | Force-resolve stale position | `python force_resolve.py --help` |
@@ -252,6 +253,10 @@ Runtime files are local-only and ignored by git:
 - `bot.log`
 - `seen_hashes.json`
 - `watchlist_cache.json`
+- `worldcup_markets.db`
+- `worldcup_markets.db-*`
+- `worldcup_probabilities.csv`
+- `worldcup_report.html`
 
 ---
 
@@ -275,6 +280,7 @@ Runtime files are local-only and ignored by git:
 |-- worldcup_snapshot.py       # SQLite snapshot store and odds-table CLI
 |-- worldcup_edge.py           # User-probability edge board CLI
 |-- worldcup_recommendations.py # Paper recommendation tracker/evaluator for World Cup edges
+|-- worldcup_report.py       # Static HTML report for World Cup recommendations
 |-- requirements.txt           # Python dependencies
 |-- .env.example               # Local environment template
 |-- .gitignore                 # Secrets/runtime state exclusions
